@@ -12,6 +12,9 @@ export interface VideoRecord {
   hasEmbeddedIndonesianSubtitle: boolean;
   likeCount: number;
   durationSeconds?: number;
+  /** Pixel dimensions measured with ffprobe against the real source file. */
+  width?: number;
+  height?: number;
 }
 
 export interface VideoResponseDto {
@@ -29,4 +32,6 @@ export interface VideoResponseDto {
   hasEmbeddedIndonesianSubtitle: boolean;
   likeCount: number;
   durationSeconds?: number;
+  width?: number;
+  height?: number;
 }

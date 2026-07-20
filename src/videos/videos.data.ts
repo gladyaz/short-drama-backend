@@ -15,6 +15,10 @@ interface SeriesEpisodesInput {
   folderName: string;
   fileNames: string[];
   baseLikeCount: number;
+  /** Pixel dimensions measured with ffprobe against episode 1; assumed
+   * uniform across the series' episodes (same source encode). */
+  width: number;
+  height: number;
 }
 
 function buildSeriesEpisodes(input: SeriesEpisodesInput): VideoRecord[] {
@@ -32,6 +36,8 @@ function buildSeriesEpisodes(input: SeriesEpisodesInput): VideoRecord[] {
       sourceLanguage: 'zh',
       hasEmbeddedIndonesianSubtitle: true,
       likeCount: input.baseLikeCount + (input.fileNames.length - index) * 2,
+      width: input.width,
+      height: input.height,
     };
   });
 }
@@ -43,6 +49,8 @@ export const VIDEOS: VideoRecord[] = [
     title: 'Malapetaka Datang: Benteng Bergerakku',
     channelName: 'VideoDracin Originals',
     category: 'action',
+    width: 720,
+    height: 1280,
     folderName: 'Series 104',
     fileNames: [
       '1_subtitled.mp4',
@@ -64,6 +72,8 @@ export const VIDEOS: VideoRecord[] = [
     title: 'Kue Gulung Kaya Raya: Kedaiku Menembus Waktu',
     channelName: 'VideoDracin Originals',
     category: 'comedy',
+    width: 1280,
+    height: 720,
     folderName: 'Series-10',
     fileNames: [
       '1_subtitled.mp4',
@@ -85,6 +95,8 @@ export const VIDEOS: VideoRecord[] = [
     title: 'Hidup Bahagiaku Bersama Sang Permaisuri',
     channelName: 'VideoDracin Originals',
     category: 'romance',
+    width: 720,
+    height: 1280,
     folderName: 'Series-101',
     fileNames: [
       '第1集_subtitled.mp4',
@@ -106,6 +118,8 @@ export const VIDEOS: VideoRecord[] = [
     title: 'Hati Yin yang Jahat: Antagonis Serang Habis-habisan',
     channelName: 'VideoDracin Originals',
     category: 'drama',
+    width: 1280,
+    height: 720,
     folderName: 'Series-105',
     fileNames: [
       '1_subtitled.mp4',

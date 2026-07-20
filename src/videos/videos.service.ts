@@ -76,6 +76,8 @@ export class VideosService {
       hasEmbeddedIndonesianSubtitle: record.hasEmbeddedIndonesianSubtitle,
       likeCount: record.likeCount,
       durationSeconds: record.durationSeconds,
+      width: record.width,
+      height: record.height,
     };
   }
 }

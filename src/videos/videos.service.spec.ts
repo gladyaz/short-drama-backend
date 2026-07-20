@@ -55,7 +55,7 @@ describe('VideosService', () => {
 
   describe('findById', () => {
     it('returns the matching video for a known id', () => {
-      expect(service.findById('video-001').id).toBe('video-001');
+      expect(service.findById('video-104-01').id).toBe('video-104-01');
     });
 
     it('throws VIDEO_NOT_FOUND for an unknown id', () => {
@@ -79,7 +79,7 @@ describe('VideosService', () => {
         size: 4096,
       } as unknown as fs.Stats);
 
-      const result = service.resolveStreamableFile('video-001');
+      const result = service.resolveStreamableFile('video-104-01');
 
       expect(result.fileSize).toBe(4096);
       expect(result.absolutePath.startsWith(TEST_APP_CONFIG.storageRoot)).toBe(
@@ -92,7 +92,7 @@ describe('VideosService', () => {
 
       let caught: unknown;
       try {
-        service.resolveStreamableFile('video-001');
+        service.resolveStreamableFile('video-104-01');
       } catch (error) {
         caught = error;
       }

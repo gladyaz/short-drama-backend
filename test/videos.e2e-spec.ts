@@ -60,11 +60,11 @@ describe('Videos (e2e)', () => {
 
   it('GET /videos/:id returns the matching video', async () => {
     const response = await request(app.getHttpServer())
-      .get('/videos/video-001')
+      .get('/videos/video-104-01')
       .expect(HttpStatus.OK);
 
     const video = response.body as VideoResponseDto;
-    expect(video.id).toBe('video-001');
+    expect(video.id).toBe('video-104-01');
   });
 
   it('GET /videos/:id returns a structured 404 for an unknown id', async () => {
@@ -81,7 +81,7 @@ describe('Videos (e2e)', () => {
 
   it('GET /videos/:id/stream returns 206 Partial Content for a Range request', async () => {
     const response = await request(app.getHttpServer())
-      .get('/videos/video-001/stream')
+      .get('/videos/video-104-01/stream')
       .set('Range', 'bytes=0-1023')
       .expect(HttpStatus.PARTIAL_CONTENT);
 

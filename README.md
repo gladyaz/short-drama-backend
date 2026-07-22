@@ -9,6 +9,10 @@ Phase 8 added a real SQLite database (via Prisma) and a JWT-based `/auth/*`
 module (register/login/refresh/logout/me) — see "Auth API" and "Database"
 below.
 
+Phase 9 added per-user Like/Save state and per-user watch progress, backed by
+two new Prisma tables (`UserVideoInteraction`, `WatchProgress`) — see
+"Interactions & Progress API" below.
+
 ## Architecture
 
 ```
@@ -35,8 +39,13 @@ mobile app (Expo/React Native)  -->  NestJS backend  -->  local company storage 
   values.
 - As of Phase 8, the backend also has a real user database (`User`,
   `Session` tables) and JWT-based authentication (`/auth/*`). Company video
-  streaming (`/videos/*`) does **not** currently require authentication —
-  no work unit has wired a guard onto those routes yet.
+  catalog/streaming (`GET /videos/feed`, `GET /videos/:id`,
+  `GET /videos/:id/stream`) does **not** require authentication. As of Phase
+  9, the new per-video Like/Save routes (`POST`/`DELETE /videos/:id/like`,
+  `POST`/`DELETE /videos/:id/save`) and the new per-user routes
+  (`GET /users/me/interactions`, `PUT /series/:id/progress`,
+  `GET /users/me/progress`) **do** require a valid `Authorization: Bearer
+  <accessToken>` header — see "Interactions & Progress API" below.
 
 ## Environment variables
 
@@ -245,6 +254,102 @@ copy, not a general-purpose profile endpoint.
   looking the user up explicitly. This tradeoff was noted during the 8-B6
   review and accepted for this phase to keep per-request auth cheap.
 
+## Interactions & Progress API (Phase 9)
+
+Backed by two new Prisma tables added in work unit 9-B1:
+`UserVideoInteraction` (per-`(userId, videoId)` `isLiked`/`isSaved` state) and
+`WatchProgress` (per-`(userId, seriesId)` watch position). Both tables enforce
+their unique key at the database level, so each user always has at most one
+row per video/series, and different users' rows for the same shared
+video/series are always independent (verified explicitly in this work unit's
+test suite — see "Testing" below).
+
+All seven routes below require `Authorization: Bearer <accessToken>` (the
+same `JwtAuthGuard` used by `GET /auth/me`). A missing/malformed header or an
+expired/invalid token returns `401 INVALID_ACCESS_TOKEN`, matching the Auth
+API's existing convention. Every route that takes a `videoId` (path or body)
+explicitly checks that the video exists first — there is no database-level
+foreign key from these tables to `Video` — and returns the same structured
+`404 VIDEO_NOT_FOUND` used by `GET /videos/:id` if it doesn't:
+
+```json
+{ "statusCode": 404, "code": "VIDEO_NOT_FOUND", "message": "Video not found" }
+```
+
+**`Video.likeCount` is now a real, mutable counter**, not a static seeded
+display value: `POST /videos/:id/like` increments it and `DELETE
+/videos/:id/like` decrements it (floored at 0, never negative), scoped so
+concurrent/duplicate calls from the same user never double-count. Liking is
+idempotent — liking an already-liked video (by that same user) does not
+increment the counter again; unliking a video that isn't currently liked by
+that user leaves it untouched.
+
+### `POST /videos/:id/like` / `DELETE /videos/:id/like`
+
+Returns `201` (`POST`) / `200` (`DELETE`) with `LikeResponseDto`:
+
+```json
+{ "videoId": "video-104-01", "isLiked": true, "likeCount": 43 }
+```
+
+### `POST /videos/:id/save` / `DELETE /videos/:id/save`
+
+Returns `201` (`POST`) / `200` (`DELETE`) with `SaveResponseDto`:
+
+```json
+{ "videoId": "video-104-01", "isSaved": true }
+```
+
+### `GET /users/me/interactions`
+
+Returns `200` with every `UserVideoInteraction` row belonging to the
+authenticated user only, as `UserInteractionDto[]`:
+
+```json
+[{ "videoId": "video-104-01", "isLiked": true, "isSaved": false }]
+```
+
+### `PUT /series/:id/progress`
+
+Body (`UpsertProgressDto`):
+
+```json
+{
+  "videoId": "video-104-01",
+  "episodeNumber": 1,
+  "positionSeconds": 42,
+  "durationSeconds": 300
+}
+```
+
+- `videoId`: string, required — must reference an existing `Video`.
+- `episodeNumber`, `positionSeconds`: integers, required, `>= 0`.
+- `durationSeconds`: integer, optional, `>= 0`.
+
+A genuine upsert keyed on `(userId, seriesId)`: the first call for a given
+user+series creates the row, every subsequent call overwrites it in place
+(there is never more than one progress row per user per series). Returns
+`200` with `ProgressResponseDto`:
+
+```json
+{
+  "seriesId": "series-104",
+  "videoId": "video-104-01",
+  "episodeNumber": 1,
+  "positionSeconds": 42,
+  "durationSeconds": 300
+}
+```
+
+Note: the `:id` path param (series id) is not itself validated against a
+`Series` table — there is no `Series` entity in this schema (see "Database"
+below) — only the body's `videoId` is checked against `Video`.
+
+### `GET /users/me/progress`
+
+Returns `200` with every `WatchProgress` row belonging to the authenticated
+user only, as `ProgressResponseDto[]`.
+
 ## Testing
 
 ```bash
@@ -280,7 +385,7 @@ relies on Range requests) works.
 ## Database (Phase 8)
 
 The backend uses Prisma with a local SQLite file (`DATABASE_URL`) as its
-database, added in Phase 8. Three models:
+database, added in Phase 8 and extended in Phase 9. Five models:
 
 - `User` — registered accounts (`email`, bcrypt `passwordHash`, optional
   `displayName`).
@@ -289,6 +394,15 @@ database, added in Phase 8. Three models:
 - `Video` — the video catalog previously hardcoded in `videos.data.ts`, now
   seeded into this table (`prisma/seed.ts`) and read by `VideosService` at
   request time.
+- `UserVideoInteraction` (Phase 9) — per-`(userId, videoId)` `isLiked`/
+  `isSaved` state, backing the Like/Save endpoints. `videoId` is a plain
+  string, not a `@relation` FK to `Video.id` — existence is checked explicitly
+  at the service layer instead (see "Interactions & Progress API" above).
+- `WatchProgress` (Phase 9) — per-`(userId, seriesId)` watch position
+  (`lastWatchedVideoId`, `lastWatchedEpisodeNumber`, `positionSeconds`,
+  `durationSeconds`), backing the watch-progress endpoints. Like
+  `UserVideoInteraction`, `seriesId`/`lastWatchedVideoId` are plain strings
+  with no DB-level FK — there is no separate `Series` entity in this schema.
 
 Any database or schema decision for this project is recorded in the control
 workspace's `DECISIONS.md` (outside this repo), not silently chosen.
@@ -306,8 +420,11 @@ metadata (relative `storageKey` values, titles, captions) are tracked in git.
 
 Phase 5B connected the mobile app (Expo/React Native) to this backend,
 replacing the temporary Python HTTP server and wiring `storageKey` /
-`playbackUrl` through the existing video service layer. Phase 8 (this
-backend's most recent phase) added the SQLite database and `/auth/*` module
-described above. Known gaps carried forward for a future phase: no rate
-limiting on `/auth/login` / `/auth/register`, and `/videos/*` routes are not
-yet guarded by authentication (see "Known gaps in the Auth API").
+`playbackUrl` through the existing video service layer. Phase 8 added the
+SQLite database and `/auth/*` module described above. Phase 9 (this backend's
+most recent phase) added per-user Like/Save and watch-progress endpoints
+described in "Interactions & Progress API" above. Known gaps carried forward
+for a future phase: no rate limiting on `/auth/login` / `/auth/register`, and
+the video catalog/streaming routes (`GET /videos/feed`, `GET /videos/:id`,
+`GET /videos/:id/stream`) remain unauthenticated (see "Known gaps in the Auth
+API").

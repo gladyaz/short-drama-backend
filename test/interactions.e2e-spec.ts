@@ -29,6 +29,8 @@ describe('Interactions (e2e)', () => {
   let prisma: PrismaService;
   let accessToken: string;
   let userId: string;
+  let otherAccessToken: string;
+  let otherUserId: string;
 
   const emailPrefix = 'interactions-e2e-spec+9b2';
   const seededVideoId = 'video-104-01';
@@ -61,10 +63,22 @@ describe('Interactions (e2e)', () => {
     const body = registerResponse.body as AuthResponseDto;
     accessToken = body.accessToken;
     userId = body.user.id;
+
+    const otherRegisterResponse = await request(app.getHttpServer())
+      .post('/auth/register')
+      .send({ email: uniqueEmail('other'), password: 'correct-horse-battery' })
+      .expect(HttpStatus.CREATED);
+
+    const otherBody = otherRegisterResponse.body as AuthResponseDto;
+    otherAccessToken = otherBody.accessToken;
+    otherUserId = otherBody.user.id;
   });
 
   afterAll(async () => {
     await prisma.userVideoInteraction.deleteMany({ where: { userId } });
+    await prisma.userVideoInteraction.deleteMany({
+      where: { userId: otherUserId },
+    });
     await prisma.session.deleteMany({
       where: { user: { email: { contains: emailPrefix } } },
     });
@@ -210,6 +224,59 @@ describe('Interactions (e2e)', () => {
       await request(app.getHttpServer())
         .delete(`/videos/${seededVideoId}/save`)
         .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.OK);
+    });
+
+    it('keeps two users like/save state on the same shared video independent', async () => {
+      // The main user likes-and-saves the seeded video; the other user only
+      // saves it. Each user's own GET /users/me/interactions view must
+      // reflect exactly their own isLiked/isSaved state for that same
+      // video, not the other user's.
+      await request(app.getHttpServer())
+        .post(`/videos/${seededVideoId}/like`)
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.CREATED);
+      await request(app.getHttpServer())
+        .post(`/videos/${seededVideoId}/save`)
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.CREATED);
+
+      await request(app.getHttpServer())
+        .post(`/videos/${seededVideoId}/save`)
+        .set('Authorization', `Bearer ${otherAccessToken}`)
+        .expect(HttpStatus.CREATED);
+
+      const mainResponse = await request(app.getHttpServer())
+        .get('/users/me/interactions')
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.OK);
+      const otherResponse = await request(app.getHttpServer())
+        .get('/users/me/interactions')
+        .set('Authorization', `Bearer ${otherAccessToken}`)
+        .expect(HttpStatus.OK);
+
+      expect(mainResponse.body as UserInteractionDto[]).toContainEqual({
+        videoId: seededVideoId,
+        isLiked: true,
+        isSaved: true,
+      });
+      expect(otherResponse.body as UserInteractionDto[]).toContainEqual({
+        videoId: seededVideoId,
+        isLiked: false,
+        isSaved: true,
+      });
+
+      await request(app.getHttpServer())
+        .delete(`/videos/${seededVideoId}/like`)
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.OK);
+      await request(app.getHttpServer())
+        .delete(`/videos/${seededVideoId}/save`)
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.OK);
+      await request(app.getHttpServer())
+        .delete(`/videos/${seededVideoId}/save`)
+        .set('Authorization', `Bearer ${otherAccessToken}`)
         .expect(HttpStatus.OK);
     });
   });

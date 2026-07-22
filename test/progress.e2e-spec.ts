@@ -25,6 +25,8 @@ describe('Progress (e2e)', () => {
   let prisma: PrismaService;
   let accessToken: string;
   let userId: string;
+  let otherAccessToken: string;
+  let otherUserId: string;
 
   const emailPrefix = 'progress-e2e-spec+9b2';
   const seededVideoId = 'video-104-01';
@@ -58,10 +60,20 @@ describe('Progress (e2e)', () => {
     const body = registerResponse.body as AuthResponseDto;
     accessToken = body.accessToken;
     userId = body.user.id;
+
+    const otherRegisterResponse = await request(app.getHttpServer())
+      .post('/auth/register')
+      .send({ email: uniqueEmail('other'), password: 'correct-horse-battery' })
+      .expect(HttpStatus.CREATED);
+
+    const otherBody = otherRegisterResponse.body as AuthResponseDto;
+    otherAccessToken = otherBody.accessToken;
+    otherUserId = otherBody.user.id;
   });
 
   afterAll(async () => {
     await prisma.watchProgress.deleteMany({ where: { userId } });
+    await prisma.watchProgress.deleteMany({ where: { userId: otherUserId } });
     await prisma.session.deleteMany({
       where: { user: { email: { contains: emailPrefix } } },
     });
@@ -188,6 +200,54 @@ describe('Progress (e2e)', () => {
         episodeNumber: 1,
         positionSeconds: 42,
         durationSeconds: 300,
+      });
+    });
+
+    it('keeps two users watch progress on the same shared series independent', async () => {
+      // Both users progress through the same seeded series but stop at
+      // different episodes/positions. Each user's own GET /users/me/progress
+      // view must reflect only their own row, not the other user's.
+      await request(app.getHttpServer())
+        .put(`/series/${seededSeriesId}/progress`)
+        .set('Authorization', `Bearer ${accessToken}`)
+        .send({
+          videoId: seededVideoId,
+          episodeNumber: 1,
+          positionSeconds: 42,
+        })
+        .expect(HttpStatus.OK);
+
+      await request(app.getHttpServer())
+        .put(`/series/${seededSeriesId}/progress`)
+        .set('Authorization', `Bearer ${otherAccessToken}`)
+        .send({
+          videoId: seededVideoId,
+          episodeNumber: 3,
+          positionSeconds: 123,
+        })
+        .expect(HttpStatus.OK);
+
+      const mainResponse = await request(app.getHttpServer())
+        .get('/users/me/progress')
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.OK);
+      const otherResponse = await request(app.getHttpServer())
+        .get('/users/me/progress')
+        .set('Authorization', `Bearer ${otherAccessToken}`)
+        .expect(HttpStatus.OK);
+
+      expect(mainResponse.body as ProgressResponseDto[]).toContainEqual({
+        seriesId: seededSeriesId,
+        videoId: seededVideoId,
+        episodeNumber: 1,
+        positionSeconds: 42,
+        durationSeconds: 300,
+      });
+      expect(otherResponse.body as ProgressResponseDto[]).toContainEqual({
+        seriesId: seededSeriesId,
+        videoId: seededVideoId,
+        episodeNumber: 3,
+        positionSeconds: 123,
       });
     });
   });

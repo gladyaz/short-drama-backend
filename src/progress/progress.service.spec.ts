@@ -15,6 +15,7 @@ describe('ProgressService', () => {
 
   const testIdPrefix = 'progress-service-spec';
   let userId: string;
+  let otherUserId: string;
   let videoId: string;
   let secondVideoId: string;
   const seriesId = `${testIdPrefix}-series`;
@@ -35,6 +36,14 @@ describe('ProgressService', () => {
       },
     });
     userId = user.id;
+
+    const otherUser = await prisma.user.create({
+      data: {
+        email: `${testIdPrefix}-other-${Date.now()}-${Math.random().toString(36).slice(2)}@example.test`,
+        passwordHash: 'irrelevant-for-this-spec',
+      },
+    });
+    otherUserId = otherUser.id;
 
     const makeVideo = async (suffix: string) =>
       prisma.video.create({
@@ -114,6 +123,46 @@ describe('ProgressService', () => {
         where: { userId, seriesId },
       });
       expect(rows).toHaveLength(1);
+    });
+
+    it('keeps two users watch progress on the same series fully independent', async () => {
+      // Both users progress through the exact same series, but each stops
+      // at a different episode/position. Neither upsert should affect the
+      // other's row (enforced by the (userId, seriesId) unique constraint),
+      // and each user's own listForUser view must reflect only their own
+      // progress, not the other user's.
+      await service.upsertProgress(userId, seriesId, {
+        videoId,
+        episodeNumber: 1,
+        positionSeconds: 30,
+      });
+      await service.upsertProgress(otherUserId, seriesId, {
+        videoId: secondVideoId,
+        episodeNumber: 2,
+        positionSeconds: 90,
+      });
+
+      const userRows = await service.listForUser(userId);
+      const otherUserRows = await service.listForUser(otherUserId);
+
+      expect(userRows).toEqual([
+        {
+          seriesId,
+          videoId,
+          episodeNumber: 1,
+          positionSeconds: 30,
+          durationSeconds: undefined,
+        },
+      ]);
+      expect(otherUserRows).toEqual([
+        {
+          seriesId,
+          videoId: secondVideoId,
+          episodeNumber: 2,
+          positionSeconds: 90,
+          durationSeconds: undefined,
+        },
+      ]);
     });
 
     it('rejects with VIDEO_NOT_FOUND when the body videoId does not exist', async () => {

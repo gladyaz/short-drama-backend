@@ -139,6 +139,22 @@ describe('InteractionsService', () => {
       expect(otherResult.likeCount).toBe(11);
     });
 
+    it('keeps two users isLiked state on the same video fully independent', async () => {
+      // userId likes the video; otherUserId never interacts with it. Each
+      // user's own view (via listForUser) must reflect only their own state,
+      // not leak the other user's isLiked value for the same shared video.
+      await service.like(userId, videoId);
+      await service.save(otherUserId, videoId);
+
+      const userRows = await service.listForUser(userId);
+      const otherUserRows = await service.listForUser(otherUserId);
+
+      expect(userRows).toEqual([{ videoId, isLiked: true, isSaved: false }]);
+      expect(otherUserRows).toEqual([
+        { videoId, isLiked: false, isSaved: true },
+      ]);
+    });
+
     it('rejects like with VIDEO_NOT_FOUND when the video does not exist', async () => {
       await expect(
         service.like(userId, 'nonexistent-video-id'),

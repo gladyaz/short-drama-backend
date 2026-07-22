@@ -16,6 +16,12 @@ import { JwtAuthGuard } from './guards/jwt-auth.guard';
   imports: [JwtModule.register({})],
   controllers: [AuthController],
   providers: [AuthService, JwtAuthGuard],
-  exports: [JwtAuthGuard],
+  // `JwtModule` is re-exported alongside `JwtAuthGuard` so that any module
+  // importing `AuthModule` purely to reuse `JwtAuthGuard` (e.g. Phase 9's
+  // `InteractionsModule`/`ProgressModule`) also has `JwtService` available
+  // in its own container — otherwise Nest cannot resolve `JwtAuthGuard`'s
+  // constructor dependency when the guard is referenced by class in a
+  // different module's `@UseGuards()`.
+  exports: [JwtAuthGuard, JwtModule],
 })
 export class AuthModule {}

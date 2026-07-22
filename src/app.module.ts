@@ -5,6 +5,7 @@ import { AppService } from './app.service';
 import configuration from './config/configuration';
 import { validateEnv } from './config/env.validation';
 import { HealthModule } from './health/health.module';
+import { PrismaModule } from './prisma/prisma.module';
 import { VideosModule } from './videos/videos.module';
 
 @Module({
@@ -14,6 +15,7 @@ import { VideosModule } from './videos/videos.module';
       load: [configuration],
       validate: validateEnv,
     }),
+    PrismaModule,
     HealthModule,
     VideosModule,
   ],

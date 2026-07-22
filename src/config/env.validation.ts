@@ -5,6 +5,7 @@ const REQUIRED_KEYS = [
   'PUBLIC_BASE_URL',
   'STORAGE_ROOT',
   'CORS_ORIGINS',
+  'DATABASE_URL',
 ] as const;
 
 export function validateEnv(

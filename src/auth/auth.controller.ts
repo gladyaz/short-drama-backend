@@ -1,9 +1,20 @@
-import { Body, Controller, HttpCode, HttpStatus, Post } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  HttpCode,
+  HttpStatus,
+  Post,
+  UseGuards,
+} from '@nestjs/common';
 import { AuthService } from './auth.service';
-import { AuthResponseDto } from './auth.types';
+import { AuthResponseDto, AuthUserDto } from './auth.types';
+import { CurrentUser } from './decorators/current-user.decorator';
 import { LoginDto } from './dto/login.dto';
 import { RefreshTokenDto } from './dto/refresh-token.dto';
 import { RegisterDto } from './dto/register.dto';
+import { JwtAuthGuard } from './guards/jwt-auth.guard';
+import type { AuthenticatedUser } from './guards/jwt-auth.guard';
 
 @Controller('auth')
 export class AuthController {
@@ -31,5 +42,18 @@ export class AuthController {
   async logout(@Body() dto: RefreshTokenDto): Promise<{ success: true }> {
     await this.authService.logout(dto.refreshToken);
     return { success: true };
+  }
+
+  /**
+   * Minimal, concrete proof that `JwtAuthGuard` actually protects a route
+   * end-to-end (Phase 8, work unit 8-B6). Not a general-purpose "profile"
+   * endpoint — just the smallest possible authenticated route so future work
+   * units have a working, tested example of `@UseGuards(JwtAuthGuard)` plus
+   * `@CurrentUser()` to copy.
+   */
+  @Get('me')
+  @UseGuards(JwtAuthGuard)
+  async me(@CurrentUser() user: AuthenticatedUser): Promise<AuthUserDto> {
+    return this.authService.getUserById(user.id);
   }
 }

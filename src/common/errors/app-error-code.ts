@@ -15,4 +15,15 @@ export enum AppErrorCode {
    */
   INVALID_CREDENTIALS = 'INVALID_CREDENTIALS',
   INVALID_REFRESH_TOKEN = 'INVALID_REFRESH_TOKEN',
+  // Phase 8, work unit 8-B6 (access-token verification guard)
+  /**
+   * Deliberately generic, matching the `INVALID_CREDENTIALS` /
+   * `INVALID_REFRESH_TOKEN` precedent above: used for a missing/malformed
+   * `Authorization` header, an expired access token, and an invalid-signature
+   * (tampered or forged) access token alike. Never split this into more
+   * specific codes — doing so would let a caller distinguish "you forgot the
+   * header" from "your token's signature is wrong" from "your token expired",
+   * which leaks unnecessary detail about why authentication failed.
+   */
+  INVALID_ACCESS_TOKEN = 'INVALID_ACCESS_TOKEN',
 }

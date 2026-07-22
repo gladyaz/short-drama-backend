@@ -1,11 +1,14 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { HttpStatus, INestApplication, ValidationPipe } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { JwtService } from '@nestjs/jwt';
 import request from 'supertest';
 import { App } from 'supertest/types';
 import { AppModule } from './../src/app.module';
 import { AppExceptionFilter } from './../src/common/filters/app-exception.filter';
 import { PrismaService } from './../src/prisma/prisma.service';
 import type { AuthResponseDto } from './../src/auth/auth.types';
+import type { RootConfig } from './../src/config/configuration';
 
 interface ErrorResponseBody {
   statusCode: number;
@@ -23,6 +26,8 @@ interface ErrorResponseBody {
 describe('Auth (e2e)', () => {
   let app: INestApplication<App>;
   let prisma: PrismaService;
+  let jwtService: JwtService;
+  let configService: ConfigService<RootConfig>;
 
   const emailPrefix = 'auth-e2e-spec+8b5';
   const uniqueEmail = (label: string): string =>
@@ -45,6 +50,8 @@ describe('Auth (e2e)', () => {
     await app.init();
 
     prisma = moduleFixture.get<PrismaService>(PrismaService);
+    jwtService = moduleFixture.get<JwtService>(JwtService);
+    configService = moduleFixture.get<ConfigService<RootConfig>>(ConfigService);
   });
 
   afterAll(async () => {
@@ -207,5 +214,84 @@ describe('Auth (e2e)', () => {
       .post('/auth/refresh')
       .send({ refreshToken })
       .expect(HttpStatus.UNAUTHORIZED);
+  });
+
+  /**
+   * `GET /auth/me` (Phase 8, work unit 8-B6): the concrete, end-to-end proof
+   * that `JwtAuthGuard` actually protects a route, using a real access token
+   * from the real register flow rather than a mock.
+   */
+  describe('GET /auth/me', () => {
+    it('rejects a request with no Authorization header', async () => {
+      const response = await request(app.getHttpServer())
+        .get('/auth/me')
+        .expect(HttpStatus.UNAUTHORIZED);
+
+      expect((response.body as ErrorResponseBody).code).toBe(
+        'INVALID_ACCESS_TOKEN',
+      );
+    });
+
+    it('returns the authenticated user for a valid access token', async () => {
+      const email = uniqueEmail('me-valid');
+      const registerResponse = await request(app.getHttpServer())
+        .post('/auth/register')
+        .send({
+          email,
+          password: 'correct-horse-battery',
+          displayName: 'Me Route User',
+        })
+        .expect(HttpStatus.CREATED);
+
+      const { accessToken } = registerResponse.body as AuthResponseDto;
+
+      const response = await request(app.getHttpServer())
+        .get('/auth/me')
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.OK);
+
+      expect(response.body).toMatchObject({
+        email,
+        displayName: 'Me Route User',
+      });
+      expect(JSON.stringify(response.body)).not.toMatch(
+        /passwordHash|\$2[aby]\$/,
+      );
+    });
+
+    it('rejects an expired access token', async () => {
+      const email = uniqueEmail('me-expired');
+      await request(app.getHttpServer())
+        .post('/auth/register')
+        .send({ email, password: 'correct-horse-battery' })
+        .expect(HttpStatus.CREATED);
+
+      const authConfig = configService.get('auth', { infer: true })!;
+      const expiredToken = await jwtService.signAsync(
+        { sub: 'irrelevant-for-this-check' },
+        { secret: authConfig.jwtAccessSecret, expiresIn: '0s' },
+      );
+      await new Promise((resolve) => setTimeout(resolve, 1100));
+
+      const response = await request(app.getHttpServer())
+        .get('/auth/me')
+        .set('Authorization', `Bearer ${expiredToken}`)
+        .expect(HttpStatus.UNAUTHORIZED);
+
+      expect((response.body as ErrorResponseBody).code).toBe(
+        'INVALID_ACCESS_TOKEN',
+      );
+    }, 10000);
+
+    it('rejects a token with an invalid signature', async () => {
+      const response = await request(app.getHttpServer())
+        .get('/auth/me')
+        .set('Authorization', 'Bearer not.a.valid.jwt.signature')
+        .expect(HttpStatus.UNAUTHORIZED);
+
+      expect((response.body as ErrorResponseBody).code).toBe(
+        'INVALID_ACCESS_TOKEN',
+      );
+    });
   });
 });

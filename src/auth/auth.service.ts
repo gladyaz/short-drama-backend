@@ -15,7 +15,7 @@ import {
   REFRESH_TOKEN_BYTES,
   REFRESH_TOKEN_TTL_MS,
 } from './auth.constants';
-import { AuthResponseDto } from './auth.types';
+import { AuthResponseDto, AuthUserDto } from './auth.types';
 import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
 
@@ -191,6 +191,33 @@ export class AuthService {
       where: { id: session.id },
       data: { revokedAt: new Date() },
     });
+  }
+
+  /**
+   * Looks up a user by id for `GET /auth/me` (Phase 8, work unit 8-B6),
+   * called with the `sub` from an already-verified access token
+   * (`JwtAuthGuard`). If the user no longer exists (e.g. deleted after the
+   * token was issued, since the guard itself does not hit the database),
+   * this reuses the same generic invalid-access-token error rather than a
+   * distinct "user not found" — the caller presented a token that no longer
+   * corresponds to a valid session either way.
+   */
+  async getUserById(userId: string): Promise<AuthUserDto> {
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+
+    if (!user) {
+      throw new AppException(
+        AppErrorCode.INVALID_ACCESS_TOKEN,
+        'Invalid or expired access token',
+        HttpStatus.UNAUTHORIZED,
+      );
+    }
+
+    return {
+      id: user.id,
+      email: user.email,
+      displayName: user.displayName ?? undefined,
+    };
   }
 
   private async issueTokensAndSession(

@@ -293,5 +293,36 @@ describe('Auth (e2e)', () => {
         'INVALID_ACCESS_TOKEN',
       );
     });
+
+    /**
+     * Work unit 8-B7: closes the gap flagged (LOW, non-blocking) during
+     * 8-B6's review — this exact path ("user deleted after token issuance,
+     * then calls /auth/me") had been verified correct by code inspection
+     * only, with no automated test. `JwtAuthGuard` only verifies the token
+     * itself (see its doc comment), so a still-valid access token for a
+     * since-deleted user reaches `AuthService.getUserById`, which is
+     * expected to translate the missing row into the same generic 401.
+     */
+    it('rejects a still-valid access token whose user has since been deleted', async () => {
+      const email = uniqueEmail('me-deleted-user');
+      const registerResponse = await request(app.getHttpServer())
+        .post('/auth/register')
+        .send({ email, password: 'correct-horse-battery' })
+        .expect(HttpStatus.CREATED);
+
+      const { accessToken, user } = registerResponse.body as AuthResponseDto;
+
+      await prisma.session.deleteMany({ where: { userId: user.id } });
+      await prisma.user.delete({ where: { id: user.id } });
+
+      const response = await request(app.getHttpServer())
+        .get('/auth/me')
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.UNAUTHORIZED);
+
+      expect((response.body as ErrorResponseBody).code).toBe(
+        'INVALID_ACCESS_TOKEN',
+      );
+    });
   });
 });

@@ -395,4 +395,51 @@ describe('AuthService', () => {
       ).resolves.toBeUndefined();
     });
   });
+
+  /**
+   * Work unit 8-B7: closes the gap flagged (LOW, non-blocking) during 8-B6's
+   * review — `getUserById` (used by `GET /auth/me`) had no direct unit
+   * coverage at all, success or failure. The "user deleted after token
+   * issuance" 401 path in particular had only been verified by code
+   * inspection, never exercised by a test.
+   */
+  describe('getUserById', () => {
+    it('returns the user without the password hash', async () => {
+      const email = uniqueEmail('get-user-by-id');
+      const registered = await service.register({
+        email,
+        password: 'correct-horse-battery',
+        displayName: 'Lookup User',
+      });
+
+      const user = await service.getUserById(registered.user.id);
+
+      expect(user).toEqual({
+        id: registered.user.id,
+        email,
+        displayName: 'Lookup User',
+      });
+      expect(JSON.stringify(user)).not.toMatch(/passwordHash|\$2[aby]\$/);
+    });
+
+    it('rejects with INVALID_ACCESS_TOKEN when the user id does not exist (e.g. deleted after token issuance)', async () => {
+      const email = uniqueEmail('get-user-by-id-deleted');
+      const registered = await service.register({
+        email,
+        password: 'correct-horse-battery',
+      });
+
+      await prisma.session.deleteMany({
+        where: { userId: registered.user.id },
+      });
+      await prisma.user.delete({ where: { id: registered.user.id } });
+
+      await expect(
+        service.getUserById(registered.user.id),
+      ).rejects.toMatchObject({
+        code: AppErrorCode.INVALID_ACCESS_TOKEN,
+        status: HttpStatus.UNAUTHORIZED,
+      } as Partial<AppException>);
+    });
+  });
 });

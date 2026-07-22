@@ -31,3 +31,40 @@ model Session {
 
   @@index([userId])
 }
+
+// Phase 8, work unit 8-B4: flat mirror of `VideoRecord`
+// (src/videos/video.types.ts). `id` intentionally has no @default — the
+// existing 40 records carry meaningful, pre-assigned ids (e.g.
+// "video-104-01") that must be preserved exactly via the seed script, not
+// regenerated. `seriesId` is a plain string, not a relation: there is no
+// separate Series entity today (episodes are grouped client-side from the
+// flat feed response), and introducing one is out of scope for this work
+// unit.
+model Video {
+  id                            String  @id
+  seriesId                      String
+  title                         String
+  episodeNumber                 Int
+  channelName                   String
+  caption                       String
+  category                      String
+  storageKey                    String
+  sourceLanguage                String
+  hasEmbeddedIndonesianSubtitle Boolean
+  likeCount                     Int
+  durationSeconds               Int?
+  width                         Int?
+  height                        Int?
+  /// Work unit 8-B4 fix cycle 1: explicit, deterministic feed ordering.
+  /// `seriesId`/`episodeNumber` ordering does NOT reproduce the original
+  /// curated order in `videos.data.ts` (series-104 first, then series-010,
+  /// series-101, series-105 — not alphabetical by seriesId), so a plain
+  /// column carrying that intent is used instead. Defaults to 0 so existing
+  /// callers (e.g. `seed.ts`, `videos.service.spec.ts`) that create/update
+  /// `Video` rows without specifying it keep compiling; the additive
+  /// migration backfills the correct value for the 40 pre-existing rows.
+  sortOrder                     Int     @default(0)
+
+  @@index([seriesId])
+  @@index([sortOrder])
+}

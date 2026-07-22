@@ -10,18 +10,18 @@ export class VideosController {
   constructor(private readonly videosService: VideosService) {}
 
   @Get('feed')
-  getFeed(): VideoResponseDto[] {
+  getFeed(): Promise<VideoResponseDto[]> {
     return this.videosService.findAll();
   }
 
   @Get(':id/stream')
-  streamVideo(
+  async streamVideo(
     @Param('id') id: string,
     @Req() req: Request,
     @Res() res: Response,
-  ): void {
+  ): Promise<void> {
     const { absolutePath, fileSize } =
-      this.videosService.resolveStreamableFile(id);
+      await this.videosService.resolveStreamableFile(id);
     const range = parseRangeHeader(req.headers.range, fileSize);
 
     res.setHeader('Accept-Ranges', 'bytes');
@@ -45,7 +45,7 @@ export class VideosController {
   }
 
   @Get(':id')
-  getById(@Param('id') id: string): VideoResponseDto {
+  getById(@Param('id') id: string): Promise<VideoResponseDto> {
     return this.videosService.findById(id);
   }
 }

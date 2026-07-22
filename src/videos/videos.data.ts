@@ -4,6 +4,12 @@ import { VideoRecord } from './video.types';
  * Hardcoded metadata for the Phase 5A POC. storageKey values are relative to
  * STORAGE_ROOT and were verified to point at real, playable company MP4 files
  * during read-only inspection of the storage folder.
+ *
+ * As of Phase 8 (work unit 8-B4), `VideosService` no longer reads this array
+ * directly at runtime — the live source of truth is the `Video` table via
+ * Prisma. This array is now consumed by `prisma/seed.ts` to populate that
+ * table, so it remains the single source of truth for the catalog's *seed*
+ * data (avoiding a second, hand-retyped copy that could drift).
  */
 
 interface SeriesEpisodesInput {

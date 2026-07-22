@@ -8,6 +8,7 @@ import { validateEnv } from './config/env.validation';
 import { HealthModule } from './health/health.module';
 import { InteractionsModule } from './interactions/interactions.module';
 import { PrismaModule } from './prisma/prisma.module';
+import { ProgressModule } from './progress/progress.module';
 import { VideosModule } from './videos/videos.module';
 
 @Module({
@@ -22,6 +23,7 @@ import { VideosModule } from './videos/videos.module';
     VideosModule,
     AuthModule,
     InteractionsModule,
+    ProgressModule,
   ],
   controllers: [AppController],
   providers: [AppService],

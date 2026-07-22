@@ -6,6 +6,7 @@ import { AuthModule } from './auth/auth.module';
 import configuration from './config/configuration';
 import { validateEnv } from './config/env.validation';
 import { HealthModule } from './health/health.module';
+import { InteractionsModule } from './interactions/interactions.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { VideosModule } from './videos/videos.module';
 
@@ -20,6 +21,7 @@ import { VideosModule } from './videos/videos.module';
     HealthModule,
     VideosModule,
     AuthModule,
+    InteractionsModule,
   ],
   controllers: [AppController],
   providers: [AppService],

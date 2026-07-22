@@ -6,6 +6,8 @@ const REQUIRED_KEYS = [
   'STORAGE_ROOT',
   'CORS_ORIGINS',
   'DATABASE_URL',
+  'JWT_ACCESS_SECRET',
+  'JWT_REFRESH_SECRET',
 ] as const;
 
 export function validateEnv(

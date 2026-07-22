@@ -5,8 +5,16 @@ export interface AppConfig {
   corsOrigins: string[];
 }
 
+export interface AuthConfig {
+  /** Signing secret for short-lived access tokens. Never logged. */
+  jwtAccessSecret: string;
+  /** Signing secret for the (separately, DB-hashed) refresh token. Never logged. */
+  jwtRefreshSecret: string;
+}
+
 export interface RootConfig {
   app: AppConfig;
+  auth: AuthConfig;
 }
 
 export default (): RootConfig => ({
@@ -18,5 +26,9 @@ export default (): RootConfig => ({
       .split(',')
       .map((origin) => origin.trim())
       .filter((origin) => origin.length > 0),
+  },
+  auth: {
+    jwtAccessSecret: process.env.JWT_ACCESS_SECRET ?? '',
+    jwtRefreshSecret: process.env.JWT_REFRESH_SECRET ?? '',
   },
 });

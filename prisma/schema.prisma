@@ -11,13 +11,15 @@ datasource db {
 }
 
 model User {
-  id           String    @id @default(cuid())
-  email        String    @unique
-  passwordHash String
-  displayName  String?
-  createdAt    DateTime  @default(now())
-  updatedAt    DateTime  @updatedAt
-  sessions     Session[]
+  id                String                 @id @default(cuid())
+  email             String                 @unique
+  passwordHash      String
+  displayName       String?
+  createdAt         DateTime               @default(now())
+  updatedAt         DateTime               @updatedAt
+  sessions          Session[]
+  videoInteractions UserVideoInteraction[]
+  watchProgress     WatchProgress[]
 }
 
 model Session {
@@ -67,4 +69,55 @@ model Video {
 
   @@index([seriesId])
   @@index([sortOrder])
+}
+
+// Phase 9, work unit 9-B1: per-user Like/Save state for a video, mirroring
+// mobile's local `VideoInteraction` shape (`video-interactions.tsx`) exactly
+// so the sync layer added in 9-B2/mobile is a near-direct mapping. `videoId`
+// is intentionally a plain string, NOT a `@relation` FK to `Video.id` —
+// consistent with how `Video.seriesId` above is already a plain string with
+// no relation, and it keeps referential-integrity enforcement (does this
+// video exist?) as an explicit application-level check in the 9-B2 endpoint
+// layer rather than a DB constraint. That is deliberate: a like/save action
+// failing loudly with a DB-level foreign key violation is a worse failure
+// mode for this MVP than the endpoint returning a clear
+// `AppException`/404-style error after checking `Video` existence itself,
+// and it avoids having to pick an `onDelete` cascade/restrict policy for
+// `Video` deletion (no delete-video endpoint exists yet) as a side effect of
+// this schema-only work unit.
+model UserVideoInteraction {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  videoId   String
+  isLiked   Boolean  @default(false)
+  isSaved   Boolean  @default(false)
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, videoId])
+  @@index([userId])
+}
+
+// Phase 9, work unit 9-B1: per-user, per-series watch progress, mirroring
+// mobile's local `SeriesProgress` shape (`series-progress.tsx`) exactly.
+// `seriesId` and `lastWatchedVideoId` are plain strings for the same reason
+// as `UserVideoInteraction.videoId` above (no DB-level FK to `Video`;
+// existence is an application-level concern for the 9-B2 endpoint).
+// `positionSeconds`/`durationSeconds` use `Int`/`Int?` for consistency with
+// the existing `Video.durationSeconds Int?` convention in this schema
+// (seconds-as-integer), even though mobile's local `SeriesProgress` type
+// uses a plain `number` that would also fit a `Float`.
+model WatchProgress {
+  id                       String   @id @default(cuid())
+  userId                   String
+  user                     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  seriesId                 String
+  lastWatchedVideoId       String
+  lastWatchedEpisodeNumber Int
+  positionSeconds          Int
+  durationSeconds          Int?
+  updatedAt                DateTime @updatedAt
+
+  @@unique([userId, seriesId])
+  @@index([userId])
 }

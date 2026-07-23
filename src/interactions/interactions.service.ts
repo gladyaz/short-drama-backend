@@ -91,17 +91,24 @@ export class InteractionsService {
         data: { isLiked: false },
       });
 
-      const current = await tx.video.findUniqueOrThrow({
-        where: { id: videoId },
-      });
-      const flooredLikeCount = Math.max(0, current.likeCount - 1);
+      // Phase 9, work unit 9-M3: this must be a single atomic SQL statement,
+      // not a JS-level read-then-write (`findUniqueOrThrow` followed by
+      // `update`). The read-then-write form was confirmed to lose updates
+      // under real concurrent unlikes on the same video — each concurrent
+      // transaction reads the same pre-decrement `likeCount` under
+      // Postgres's `READ COMMITTED` isolation, computes the same
+      // `current - 1`, and the last write wins, silently dropping the
+      // others. `GREATEST(... , 0)` keeps the existing floor-at-0 behavior
+      // in the same atomic statement.
+      const rows = await tx.$queryRaw<{ likeCount: number }[]>`
+        UPDATE "Video"
+        SET "likeCount" = GREATEST("likeCount" - 1, 0)
+        WHERE id = ${videoId}
+        RETURNING "likeCount"
+      `;
+      const [updated] = rows;
 
-      const video = await tx.video.update({
-        where: { id: videoId },
-        data: { likeCount: flooredLikeCount },
-      });
-
-      return { videoId, isLiked: false, likeCount: video.likeCount };
+      return { videoId, isLiked: false, likeCount: updated.likeCount };
     });
   }
 

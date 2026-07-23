@@ -174,6 +174,70 @@ describe('InteractionsService', () => {
         service.unlike(userId, 'nonexistent-video-id'),
       ).rejects.toBeInstanceOf(AppException);
     });
+
+    /**
+     * Phase 9, work unit 9-M3: regression coverage for the known
+     * read-then-write lost-update race flagged during 8P-5 validation.
+     * `unlike()`'s decrement reads `Video.likeCount` and writes back
+     * `current - 1` inside its `$transaction`, unlike `like()`'s atomic SQL
+     * `{ increment: 1 }`. Under true concurrent unlikes on the SAME video
+     * (two different users, both currently liked), if Postgres's
+     * `READ COMMITTED` isolation lets both transactions read the same
+     * pre-decrement `likeCount` before either commits, only one decrement
+     * "sticks" and the counter ends up N-1 instead of the correct N-2 — a
+     * lost update. This test fires real concurrent `unlike()` calls via
+     * `Promise.all` and asserts the counter decreases by exactly the number
+     * of concurrent unlikes, regardless of whether the current
+     * implementation is vulnerable.
+     */
+    it('correctly decrements likeCount by exactly N under N concurrent unlikes on the same video', async () => {
+      const concurrentUserIds: string[] = [];
+      for (let i = 0; i < 5; i += 1) {
+        const user = await prisma.user.create({
+          data: {
+            email: `${testIdPrefix}-concurrent-${i}-${Date.now()}-${Math.random().toString(36).slice(2)}@example.test`,
+            passwordHash: 'irrelevant-for-this-spec',
+          },
+        });
+        concurrentUserIds.push(user.id);
+      }
+
+      const startingLikeCount = concurrentUserIds.length + 5;
+      await prisma.video.update({
+        where: { id: videoId },
+        data: { likeCount: startingLikeCount },
+      });
+
+      // Every concurrent user must actually be in the "liked" state first,
+      // so each concurrent unlike() call performs a real decrement (not a
+      // no-op short-circuit).
+      await Promise.all(
+        concurrentUserIds.map((id) => service.like(id, videoId)),
+      );
+
+      const beforeUnlike = await prisma.video.findUniqueOrThrow({
+        where: { id: videoId },
+      });
+
+      await Promise.all(
+        concurrentUserIds.map((id) => service.unlike(id, videoId)),
+      );
+
+      const afterUnlike = await prisma.video.findUniqueOrThrow({
+        where: { id: videoId },
+      });
+
+      expect(afterUnlike.likeCount).toBe(
+        beforeUnlike.likeCount - concurrentUserIds.length,
+      );
+
+      await prisma.userVideoInteraction.deleteMany({
+        where: { userId: { in: concurrentUserIds } },
+      });
+      await prisma.user.deleteMany({
+        where: { id: { in: concurrentUserIds } },
+      });
+    });
   });
 
   describe('save/unsave', () => {

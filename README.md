@@ -5,9 +5,10 @@ company video metadata and securely streams local MP4 files with HTTP
 Range-request support, so the mobile app can move off the temporary Python
 HTTP server.
 
-Phase 8 added a real SQLite database (via Prisma) and a JWT-based `/auth/*`
+Phase 8 added a real database (via Prisma) and a JWT-based `/auth/*`
 module (register/login/refresh/logout/me) — see "Auth API" and "Database"
-below.
+below. Phase 8P migrated that database from SQLite to PostgreSQL, which is
+now the only Prisma provider used by this project (see "Database" below).
 
 Phase 9 added per-user Like/Save state and per-user watch progress, backed by
 two new Prisma tables (`UserVideoInteraction`, `WatchProgress`) — see
@@ -18,7 +19,7 @@ two new Prisma tables (`UserVideoInteraction`, `WatchProgress`) — see
 ```
 mobile app (Expo/React Native)  -->  NestJS backend  -->  local company storage (STORAGE_ROOT)
                                             |
-                                            +-->  SQLite database (DATABASE_URL, via Prisma)
+                                            +-->  PostgreSQL database (DATABASE_URL, via Prisma)
 ```
 
 - The backend never copies, moves, or renames company video files. It reads
@@ -32,7 +33,7 @@ mobile app (Expo/React Native)  -->  NestJS backend  -->  local company storage 
   the mobile app plays the final MP4 as-is and must not request separate
   subtitle tracks or render subtitle overlays.
 - No uploads. Video metadata now lives in a Prisma-backed `Video` table in
-  the SQLite database (seeded from the same 40 records that previously lived
+  the PostgreSQL database (seeded from the same 40 records that previously lived
   in `src/videos/videos.data.ts`) rather than an in-memory array — see
   "What changed in Phase 8" below. Company video *files* themselves are still
   never touched by the database; only metadata rows point at `storageKey`
@@ -55,7 +56,8 @@ mobile app (Expo/React Native)  -->  NestJS backend  -->  local company storage 
 | `PUBLIC_BASE_URL`     | Base URL used to build each video's `playbackUrl`                        |
 | `STORAGE_ROOT`        | Absolute path to the company video storage folder (read-only)            |
 | `CORS_ORIGINS`        | Comma-separated list of allowed origins (e.g. the Expo dev server)        |
-| `DATABASE_URL`        | Prisma connection string for the SQLite dev database (e.g. `file:./dev.db`) — added in Phase 8 for the `User`/`Session`/`Video` tables |
+| `DATABASE_URL`        | Prisma connection string for the PostgreSQL dev database (e.g. `postgresql://USER:PASSWORD@localhost:5433/short_drama_dev`) — added in Phase 8, migrated from SQLite to PostgreSQL in Phase 8P |
+| `DATABASE_URL_TEST`   | Prisma connection string for a **dedicated** PostgreSQL test database (e.g. `.../short_drama_test`) — added in Phase 8P so `npm run test:e2e` never runs against dev data; required, or e2e tests fail loudly at startup (see "Database" below) |
 | `JWT_ACCESS_SECRET`   | Secret used to sign/verify short-lived (~15 min) access tokens — added in Phase 8 |
 | `JWT_REFRESH_SECRET`  | Secret used to key the HMAC-SHA256 hash of refresh tokens before they're persisted — added in Phase 8 |
 
@@ -106,7 +108,7 @@ origins — and an immediate, readable error if `STORAGE_ROOT` is misconfigured.
 ## How videos are mapped
 
 Video metadata records (each shaped like a `VideoRecord`) are read from the
-Prisma-backed `Video` table in the SQLite database (`DATABASE_URL`), seeded
+Prisma-backed `Video` table in the PostgreSQL database (`DATABASE_URL`), seeded
 from the same 40 curated records that originally lived in
 `src/videos/videos.data.ts` (that file is kept only as historical seed
 source, no longer read at request time — see "Database" below). Each
@@ -159,7 +161,7 @@ None of the `/videos/*` routes above require authentication.
 ### What changed in Phase 8 (internal only)
 
 `/videos/feed`, `/videos/:id`, and `/videos/:id/stream` are now backed by a
-real SQLite database (a Prisma `Video` model) instead of the in-memory
+real database (a Prisma `Video` model, PostgreSQL as of Phase 8P) instead of the in-memory
 `videos.data.ts` array. This is purely an internal storage-layer change —
 request/response shapes, status codes, and error codes for all three routes
 are unchanged from Phase 5A. `VideosService` still resolves `storageKey`
@@ -168,7 +170,7 @@ bytes directly from disk; only where the metadata row comes from changed.
 
 ## Auth API (Phase 8)
 
-Backed by the same Prisma/SQLite database as `/videos/*` (see "Database"
+Backed by the same Prisma/PostgreSQL database as `/videos/*` (see "Database"
 below). Passwords are hashed with bcrypt (cost factor 12); refresh tokens are
 opaque random strings, only an HMAC-SHA256 hash of which is ever persisted.
 
@@ -382,10 +384,13 @@ You can also open a `playbackUrl` from `GET /videos/feed` directly in a
 browser to confirm the real company video plays and that seeking (which
 relies on Range requests) works.
 
-## Database (Phase 8)
+## Database (Phase 8 / Phase 8P)
 
-The backend uses Prisma with a local SQLite file (`DATABASE_URL`) as its
-database, added in Phase 8 and extended in Phase 9. Five models:
+The backend uses Prisma with **PostgreSQL** as its only database provider
+(`prisma/schema.prisma`'s `datasource db` is `provider = "postgresql"`).
+The database was originally added in Phase 8 as SQLite and fully migrated to
+PostgreSQL in Phase 8P (work units 8P-0..8P-6) — SQLite is no longer used
+anywhere in this project. Five models:
 
 - `User` — registered accounts (`email`, bcrypt `passwordHash`, optional
   `displayName`).
@@ -393,7 +398,9 @@ database, added in Phase 8 and extended in Phase 9. Five models:
   `revokedAt`) backing `/auth/refresh` and `/auth/logout` rotation/revocation.
 - `Video` — the video catalog previously hardcoded in `videos.data.ts`, now
   seeded into this table (`prisma/seed.ts`) and read by `VideosService` at
-  request time.
+  request time. `sortOrder` is derived from each record's array position in
+  `prisma/seed.ts`'s `VIDEOS` array (fixed in work unit 8P-4 — the original
+  seed script never set it for pre-existing rows).
 - `UserVideoInteraction` (Phase 9) — per-`(userId, videoId)` `isLiked`/
   `isSaved` state, backing the Like/Save endpoints. `videoId` is a plain
   string, not a `@relation` FK to `Video.id` — existence is checked explicitly
@@ -407,10 +414,121 @@ database, added in Phase 8 and extended in Phase 9. Five models:
 Any database or schema decision for this project is recorded in the control
 workspace's `DECISIONS.md` (outside this repo), not silently chosen.
 
-**Phase 8P (in progress):** migrating from SQLite to PostgreSQL. A portable
-`docker-compose.yml` is provided at the repo root for anyone who wants to run
-Postgres via Docker locally (see that file for the env vars it expects). Full
-migration docs land in a later Phase 8P work unit.
+### Setting up PostgreSQL locally
+
+Two supported paths — pick whichever fits your machine:
+
+**Option A: Docker Compose (recommended if you have Docker).** A portable
+`docker-compose.yml` is provided at the repo root:
+
+```bash
+docker compose up -d           # starts a postgres:16-alpine container
+docker compose ps              # confirm the healthcheck (pg_isready) is "healthy"
+```
+
+It reads `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` / `POSTGRES_PORT`
+from your `.env` (see `.env.example`), exposes Postgres only on
+`127.0.0.1:${POSTGRES_PORT:-5433}`, and persists data in a named volume
+(`short_drama_pgdata`) so a container restart doesn't lose local data. You
+still need a second, separate database for e2e tests (`short_drama_test`) —
+create it inside the same container, e.g.:
+
+```bash
+docker compose exec postgres createdb -U "$POSTGRES_USER" short_drama_test
+```
+
+**Option B: native local PostgreSQL install** (what was actually used to
+develop and validate Phase 8P in this environment — e.g. via Homebrew:
+`brew install postgresql@16 && brew services start postgresql@16`). Create
+the two databases directly:
+
+```bash
+createdb short_drama_dev
+createdb short_drama_test
+```
+
+Either way, point `DATABASE_URL` at the dev database and `DATABASE_URL_TEST`
+at the test database in your `.env` (see `.env.example` for the exact
+connection-string format).
+
+### Command reference
+
+**Dev setup / schema changes:**
+
+```bash
+npx prisma generate              # regenerate the Prisma client after any schema change
+npx prisma migrate dev           # apply pending migrations to DATABASE_URL (creates the db/schema if missing)
+npx prisma db seed               # seed/refresh the 40-video catalog (idempotent — safe to re-run)
+```
+
+**Future schema changes** (new models/fields): edit `prisma/schema.prisma`,
+then run:
+
+```bash
+npx prisma migrate dev --name <short-description-of-the-change>
+```
+
+This both applies the new migration locally and writes a new
+`prisma/migrations/<timestamp>_<name>/` folder to commit.
+
+**Test database:** `npm run test:e2e` automatically targets `DATABASE_URL_TEST`
+instead of `DATABASE_URL` — `test/jest-e2e.setup.ts` runs as a Jest
+`setupFiles` entry before any test file (or `@prisma/client`) loads, and
+throws a clear startup error if `DATABASE_URL_TEST` is unset. No manual step
+is required beyond having `DATABASE_URL_TEST` set once and having run
+`npx prisma migrate dev` and `npx prisma db seed` against that database at
+least once (same commands as above, just with `DATABASE_URL_TEST` as the
+active `DATABASE_URL` — e.g. `DATABASE_URL="$DATABASE_URL_TEST" npx prisma
+migrate dev` / `... npx prisma db seed`).
+
+**Backups:**
+
+- *Historical (SQLite era):* `prisma/backups/` holds a one-time snapshot
+  (`dev.db.pre-postgres-migration-2026-07-23.bak`) taken immediately before
+  the Phase 8P SQLite→PostgreSQL migration, kept only as a rollback reference.
+  It is not read by any code and nothing regenerates it automatically.
+- *PostgreSQL, going forward:* there is no automated backup/restore tooling
+  yet (see "Known gaps" below). The manual equivalent, if ever needed, is:
+
+  ```bash
+  pg_dump "$DATABASE_URL" -F c -f backup.dump      # backup
+  pg_restore -d "$DATABASE_URL" backup.dump        # restore
+  ```
+
+**Reset — READ THIS BEFORE RUNNING:**
+
+```bash
+npx prisma migrate reset
+```
+
+This **drops and recreates the entire target database**, then reapplies all
+migrations and reruns the seed script. `prisma` reads whichever `DATABASE_URL`
+is currently active in your environment/`.env` — **never run this command
+without first confirming exactly which `DATABASE_URL` is active** (dev? test?
+something else?). Running it against the wrong connection string is
+irreversible data loss. This is a standing safety rule, not specific to any
+one work unit.
+
+### Known gaps
+
+- **No rate limiting yet** on `/auth/login` or `/auth/register` (see "Known
+  gaps in the Auth API" above).
+- **`JwtAuthGuard` does not re-check user existence per request** — see
+  "Known gaps in the Auth API" above.
+- ~~`sortOrder` not set for future/newly-seeded videos~~ — **resolved** in
+  work unit 8P-4: `prisma/seed.ts` now derives `sortOrder` from each record's
+  position in the `VIDEOS` array for both new and already-seeded rows.
+- **No automated PostgreSQL backup/restore tooling.** Only the manual
+  `pg_dump`/`pg_restore` commands documented above exist; nothing runs them on
+  a schedule or before risky operations (e.g. `migrate reset`).
+- **`InteractionsService.unlike()` has a pre-existing, unfixed decrement
+  race.** Its floor-at-0 `likeCount` decrement does a JS-level read-then-write
+  inside its `$transaction` (unlike `like()`'s atomic increment), so truly
+  concurrent unlikes on the same video from different users could
+  theoretically lose an update. Confirmed low-likelihood, predates Phase 8P,
+  not reproduced, and intentionally left unfixed — recorded in the control
+  workspace's `DECISIONS.md` (2026-07-23, Phase 8P work unit 8P-5), not this
+  repo.
 
 ## Why company videos are never committed
 
@@ -426,10 +544,12 @@ metadata (relative `storageKey` values, titles, captions) are tracked in git.
 Phase 5B connected the mobile app (Expo/React Native) to this backend,
 replacing the temporary Python HTTP server and wiring `storageKey` /
 `playbackUrl` through the existing video service layer. Phase 8 added the
-SQLite database and `/auth/*` module described above. Phase 9 (this backend's
-most recent phase) added per-user Like/Save and watch-progress endpoints
-described in "Interactions & Progress API" above. Known gaps carried forward
-for a future phase: no rate limiting on `/auth/login` / `/auth/register`, and
-the video catalog/streaming routes (`GET /videos/feed`, `GET /videos/:id`,
-`GET /videos/:id/stream`) remain unauthenticated (see "Known gaps in the Auth
-API").
+database and `/auth/*` module described above. Phase 9 added per-user
+Like/Save and watch-progress endpoints described in "Interactions & Progress
+API" above. Phase 8P (this backend's most recent phase) migrated that
+database from SQLite to PostgreSQL — see "Database" above for the full setup
+and command reference. Known gaps carried forward for a future phase: no
+rate limiting on `/auth/login` / `/auth/register`, the video catalog/streaming
+routes (`GET /videos/feed`, `GET /videos/:id`, `GET /videos/:id/stream`)
+remain unauthenticated (see "Known gaps in the Auth API"), and the other
+items under the Database section's "Known gaps".

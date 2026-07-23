@@ -1,8 +1,10 @@
-import { Module } from '@nestjs/common';
+import { MiddlewareConsumer, Module, NestModule } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
+import { AnalyticsModule } from './analytics/analytics.module';
 import { AuthModule } from './auth/auth.module';
+import { RequestLoggingMiddleware } from './common/logging/request-logging.middleware';
 import configuration from './config/configuration';
 import { validateEnv } from './config/env.validation';
 import { EntitlementsModule } from './entitlements/entitlements.module';
@@ -26,8 +28,16 @@ import { VideosModule } from './videos/videos.module';
     InteractionsModule,
     ProgressModule,
     EntitlementsModule,
+    AnalyticsModule,
   ],
   controllers: [AppController],
   providers: [AppService],
 })
-export class AppModule {}
+export class AppModule implements NestModule {
+  // Phase 11, work unit 11-B1: structured request-completion logging on
+  // every route. `{*splat}` is Express 5's catch-all syntax (Nest 11 ships
+  // Express 5, where a bare `*` is no longer a valid path pattern).
+  configure(consumer: MiddlewareConsumer): void {
+    consumer.apply(RequestLoggingMiddleware).forRoutes('{*splat}');
+  }
+}

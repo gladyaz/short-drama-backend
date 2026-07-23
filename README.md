@@ -402,6 +402,62 @@ existing one); `revoke` soft-revokes (sets `revokedAt`) every currently
 active entitlement for the target user, mirroring `Session`'s existing
 revocation pattern — never a hard delete.
 
+## Analytics & Monitoring (Phase 11)
+
+Self-hosted, zero external egress — events live in the `AnalyticsEvent`
+table, logs go to stdout as JSON. No vendor SaaS is wired; see the control
+workspace's `DECISIONS.md` ("Phase 11 approved...") for the recorded
+tool-choice decisions, including the explicitly deferred native-crash
+vendor SDK.
+
+### `POST /analytics/events`
+
+Requires `Authorization: Bearer <accessToken>`. Body: `{ "events": [...] }`,
+max 50 events per batch. Each event:
+
+```json
+{
+  "eventName": "video_play",
+  "properties": { "videoId": "video-104-01", "seriesId": "series-104", "episodeNumber": 1 },
+  "clientTimestamp": "2026-07-24T10:00:00.000Z",
+  "platform": "ios"
+}
+```
+
+Returns `201 { "accepted": <n> }`. Unknown event names are rejected (400);
+unknown property keys and non-scalar values are stripped server-side;
+string values are truncated to 2000 chars. The event schema (the single
+source of truth is `src/analytics/analytics.types.ts`):
+
+| Event | Allowed properties |
+|---|---|
+| `feed_view` | — |
+| `video_play` | `videoId`, `seriesId`, `episodeNumber` |
+| `video_like` | `videoId`, `value` |
+| `video_save` | `videoId`, `value` |
+| `episode_navigate` | `videoId`, `seriesId`, `episodeNumber`, `source` |
+| `premium_gate_hit` | `videoId`, `seriesId`, `episodeNumber`, `source` |
+| `app_error` | `message`, `stack`, `isFatal`, `source` |
+
+`AnalyticsEvent.userId` is nullable with `ON DELETE SET NULL`: deleting an
+account unlinks identity from its events without destroying aggregate data.
+
+### Structured logging
+
+All log output is JSON (one object per line, via Nest's `ConsoleLogger`
+json mode). Every request gets a completion line (`method`, `path` without
+query string, `statusCode`, `durationMs`, `userId` when authenticated).
+Unhandled exceptions are logged with request context. Everything passes
+through `src/common/logging/redact.ts`, which strips `STORAGE_ROOT` paths,
+bearer tokens, and password/token JSON fields — never log around it.
+
+### `GET /health/details`
+
+Dev-only (`404 DEV_TOOLS_DISABLED` unless `DEV_TOOLS_ENABLED=true`, same
+gate as the entitlement dev routes). Returns uptime, DB reachability,
+node/app version — an operator signal beyond the public liveness ping at
+`GET /health`.
+
 ## Testing
 
 ```bash

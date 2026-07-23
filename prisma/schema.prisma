@@ -21,6 +21,7 @@ model User {
   videoInteractions UserVideoInteraction[]
   watchProgress     WatchProgress[]
   entitlements      Entitlement[]
+  analyticsEvents   AnalyticsEvent[]
 }
 
 model Session {
@@ -150,4 +151,28 @@ model Entitlement {
   updatedAt DateTime  @updatedAt
 
   @@index([userId])
+}
+
+// Phase 11, work unit 11-B2: self-hosted analytics/crash-event ingestion
+// (see DECISIONS.md "Phase 11 approved..." — default decisions 1/2/4).
+// Unlike every other user-owned model in this schema (which cascade-delete
+// with the User), `userId` here is nullable with ON DELETE SET NULL:
+// deleting an account unlinks the user's identity from their events without
+// destroying the aggregate data — the privacy-preserving middle ground
+// recorded in DECISIONS.md. `properties` is validated against a per-event
+// server-side allowlist in AnalyticsService before ever reaching this
+// table; nothing outside that allowlist is persisted.
+model AnalyticsEvent {
+  id              String   @id @default(cuid())
+  userId          String?
+  user            User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  eventName       String
+  properties      Json
+  platform        String
+  clientTimestamp DateTime
+  receivedAt      DateTime @default(now())
+
+  @@index([eventName])
+  @@index([userId])
+  @@index([receivedAt])
 }

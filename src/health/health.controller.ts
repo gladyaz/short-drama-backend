@@ -1,14 +1,58 @@
-import { Controller, Get } from '@nestjs/common';
+import { Controller, Get, UseGuards } from '@nestjs/common';
+import { DevToolsGuard } from '../entitlements/guards/dev-tools.guard';
+import { PrismaService } from '../prisma/prisma.service';
 
 interface HealthResponse {
   status: 'ok';
   service: string;
 }
 
+interface HealthDetailsResponse {
+  status: 'ok';
+  service: string;
+  uptimeSeconds: number;
+  database: 'ok' | 'unreachable';
+  nodeVersion: string;
+  /** From npm's env when started via an npm script; null under plain `node`. */
+  version: string | null;
+}
+
 @Controller('health')
 export class HealthController {
+  constructor(private readonly prisma: PrismaService) {}
+
   @Get()
   getHealth(): HealthResponse {
     return { status: 'ok', service: 'short-drama-backend' };
+  }
+
+  /**
+   * Phase 11, work unit 11-B5: an operational health signal beyond the bare
+   * liveness ping above — DB reachability, uptime, runtime versions. Gated
+   * behind `DevToolsGuard` (`DEV_TOOLS_ENABLED=true`) per the recorded
+   * decision (DECISIONS.md "Phase 11 approved...", default decision 5):
+   * these details are for a developer/operator, never for an anonymous
+   * production caller, and the env-validation layer already refuses to boot
+   * with dev tools enabled in production.
+   */
+  @UseGuards(DevToolsGuard)
+  @Get('details')
+  async getDetails(): Promise<HealthDetailsResponse> {
+    let database: HealthDetailsResponse['database'] = 'ok';
+
+    try {
+      await this.prisma.$queryRaw`SELECT 1`;
+    } catch {
+      database = 'unreachable';
+    }
+
+    return {
+      status: 'ok',
+      service: 'short-drama-backend',
+      uptimeSeconds: Math.round(process.uptime()),
+      database,
+      nodeVersion: process.version,
+      version: process.env.npm_package_version ?? null,
+    };
   }
 }

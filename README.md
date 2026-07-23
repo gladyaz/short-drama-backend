@@ -407,6 +407,11 @@ database, added in Phase 8 and extended in Phase 9. Five models:
 Any database or schema decision for this project is recorded in the control
 workspace's `DECISIONS.md` (outside this repo), not silently chosen.
 
+**Phase 8P (in progress):** migrating from SQLite to PostgreSQL. A portable
+`docker-compose.yml` is provided at the repo root for anyone who wants to run
+Postgres via Docker locally (see that file for the env vars it expects). Full
+migration docs land in a later Phase 8P work unit.
+
 ## Why company videos are never committed
 
 `STORAGE_ROOT` points at real, company-owned Mandarin drama video files

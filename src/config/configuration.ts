@@ -3,6 +3,8 @@ export interface AppConfig {
   publicBaseUrl: string;
   storageRoot: string;
   corsOrigins: string[];
+  /** Phase 10, work unit 10-B5: gates dev-only entitlement grant/revoke routes. */
+  devToolsEnabled: boolean;
 }
 
 export interface AuthConfig {
@@ -26,6 +28,7 @@ export default (): RootConfig => ({
       .split(',')
       .map((origin) => origin.trim())
       .filter((origin) => origin.length > 0),
+    devToolsEnabled: process.env.DEV_TOOLS_ENABLED === 'true',
   },
   auth: {
     jwtAccessSecret: process.env.JWT_ACCESS_SECRET ?? '',

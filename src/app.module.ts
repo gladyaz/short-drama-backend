@@ -5,6 +5,7 @@ import { AppService } from './app.service';
 import { AuthModule } from './auth/auth.module';
 import configuration from './config/configuration';
 import { validateEnv } from './config/env.validation';
+import { EntitlementsModule } from './entitlements/entitlements.module';
 import { HealthModule } from './health/health.module';
 import { InteractionsModule } from './interactions/interactions.module';
 import { PrismaModule } from './prisma/prisma.module';
@@ -24,6 +25,7 @@ import { VideosModule } from './videos/videos.module';
     AuthModule,
     InteractionsModule,
     ProgressModule,
+    EntitlementsModule,
   ],
   controllers: [AppController],
   providers: [AppService],

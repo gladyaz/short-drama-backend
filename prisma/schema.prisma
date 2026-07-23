@@ -20,6 +20,7 @@ model User {
   sessions          Session[]
   videoInteractions UserVideoInteraction[]
   watchProgress     WatchProgress[]
+  entitlements      Entitlement[]
 }
 
 model Session {
@@ -119,5 +120,34 @@ model WatchProgress {
   updatedAt                DateTime @updatedAt
 
   @@unique([userId, seriesId])
+  @@index([userId])
+}
+
+// Phase 10, work unit 10-B1: account-wide premium entitlement (single tier,
+// not per-series/per-episode — matches how `FREE_EPISODE_LIMIT` already
+// works client-side today; see DECISIONS.md "Phase 10 approved..." entry,
+// default decision 5). `revokedAt` mirrors `Session.revokedAt`'s existing
+// nullable-timestamp revocation pattern (soft-revoke, not delete, so history
+// stays auditable) rather than introducing a new convention.
+// `expiresAt`/`revokedAt` are independently nullable: `expiresAt IS NULL`
+// means "no expiration," `revokedAt IS NULL` means "not revoked" — a row is
+// currently active only when both are satisfied
+// (`revokedAt IS NULL AND (expiresAt IS NULL OR expiresAt > now())`).
+// `source`/`tier` are plain strings, not enums, matching `Video.category`'s
+// existing precedent — no real payment source exists yet ("dev-grant" is the
+// only value produced by this phase), and using a string avoids a schema
+// migration when a real source is added later.
+model Entitlement {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tier      String
+  grantedAt DateTime  @default(now())
+  expiresAt DateTime?
+  revokedAt DateTime?
+  source    String
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
   @@index([userId])
 }

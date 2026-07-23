@@ -30,5 +30,16 @@ export function validateEnv(
     );
   }
 
+  // Phase 10, work unit 10-B5: dev-only entitlement grant/revoke routes must
+  // never be reachable in a production deployment. Fail the app's boot
+  // entirely rather than silently ignoring the flag, so a misconfigured
+  // production environment cannot expose these routes by accident.
+  if (config.DEV_TOOLS_ENABLED === 'true' && config.NODE_ENV === 'production') {
+    throw new Error(
+      'DEV_TOOLS_ENABLED=true is not allowed when NODE_ENV=production. ' +
+        'Dev-only entitlement grant/revoke routes must never be reachable in production.',
+    );
+  }
+
   return config;
 }

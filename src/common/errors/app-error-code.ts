@@ -26,4 +26,23 @@ export enum AppErrorCode {
    * which leaks unnecessary detail about why authentication failed.
    */
   INVALID_ACCESS_TOKEN = 'INVALID_ACCESS_TOKEN',
+  // Phase 10, work unit 10-B3 (premium entitlement enforcement)
+  /**
+   * Returned when an authenticated caller lacks an active entitlement for a
+   * premium-tier episode. Deliberately does not distinguish "never
+   * entitled" from "expired" from "revoked" (see DECISIONS.md "Phase 10
+   * approved..." entry, default decision 4) — all three collapse to this
+   * one code/403, keeping the contract simple and avoiding leaking
+   * granular entitlement history to the client.
+   */
+  ENTITLEMENT_REQUIRED = 'ENTITLEMENT_REQUIRED',
+  // Phase 10, work unit 10-B5 (dev-only entitlement grant/revoke tooling)
+  /** Returned when a dev-only route is hit while DEV_TOOLS_ENABLED is not 'true'. */
+  DEV_TOOLS_DISABLED = 'DEV_TOOLS_DISABLED',
+  /**
+   * Returned by the dev-only grant/revoke routes when `targetUserId` does not
+   * match any existing user, instead of letting a Prisma foreign-key
+   * violation surface as an unstructured 500.
+   */
+  USER_NOT_FOUND = 'USER_NOT_FOUND',
 }

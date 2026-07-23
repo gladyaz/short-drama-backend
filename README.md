@@ -152,11 +152,22 @@ with `Content-Range` when a `Range` header is supplied, or a full `200` with
 the whole file otherwise. Never loads the full file into memory — it streams
 from disk with `fs.createReadStream`.
 
-Error codes used across the video API: `VIDEO_NOT_FOUND`, `MEDIA_FILE_NOT_FOUND`,
-`INVALID_MEDIA_RANGE`, `INVALID_STORAGE_PATH`. Responses never include stack
-traces or absolute filesystem paths.
+**Requires `Authorization: Bearer <accessToken>` (Phase 10, work unit
+10-B3).** Previously this route had no guard at all — any client with a
+video id could stream the file directly. Episodes 1-5 (`FREE_EPISODE_LIMIT`)
+stream for any authenticated user; episode 6+ additionally requires an
+active premium entitlement (see "Entitlements API" below), checked before
+the file is even opened. A denied request returns `403
+ENTITLEMENT_REQUIRED`.
 
-None of the `/videos/*` routes above require authentication.
+Error codes used across the video API: `VIDEO_NOT_FOUND`, `MEDIA_FILE_NOT_FOUND`,
+`INVALID_MEDIA_RANGE`, `INVALID_STORAGE_PATH`, `INVALID_ACCESS_TOKEN`,
+`ENTITLEMENT_REQUIRED`. Responses never include stack traces or absolute
+filesystem paths.
+
+`GET /videos/feed` and `GET /videos/:id` (metadata only) remain
+unauthenticated — only the stream route (the protected asset itself)
+requires a token.
 
 ### What changed in Phase 8 (internal only)
 
@@ -352,6 +363,45 @@ below) — only the body's `videoId` is checked against `Video`.
 Returns `200` with every `WatchProgress` row belonging to the authenticated
 user only, as `ProgressResponseDto[]`.
 
+## Entitlements API (Phase 10)
+
+Account-wide premium entitlement, backing the `GET /videos/:id/stream` guard
+above. Single tier ("premium"), no per-series/per-episode entitlement — see
+`DECISIONS.md` in the control workspace ("Phase 10 approved..." entry) for
+why. All routes require `Authorization: Bearer <accessToken>`.
+
+### `GET /users/me/entitlement`
+
+Returns `200` with the current user's entitlement status:
+
+```json
+{ "isPremium": false, "expiresAt": null }
+```
+
+`isPremium` is `false` for "never entitled," "expired," and "revoked" alike
+— this is a deliberately simple contract, not a bug (see DECISIONS.md,
+default decision 4).
+
+### `POST /dev/entitlements/grant` / `POST /dev/entitlements/revoke`
+
+**Development/testing only — stand in for a real payment webhook, which is
+explicitly out of scope for this phase.** Disabled (`404
+DEV_TOOLS_DISABLED`) unless `DEV_TOOLS_ENABLED=true` in your local `.env`.
+The app refuses to boot at all if `DEV_TOOLS_ENABLED=true` while
+`NODE_ENV=production` (see `src/config/env.validation.ts`) — these routes
+must never be reachable in a real deployment.
+
+Body (both optional):
+
+```json
+{ "targetUserId": "optional, defaults to the caller", "expiresAt": "optional ISO-8601, grant only" }
+```
+
+`grant` creates a new active entitlement row (does not merge with an
+existing one); `revoke` soft-revokes (sets `revokedAt`) every currently
+active entitlement for the target user, mirroring `Session`'s existing
+revocation pattern — never a hard delete.
+
 ## Testing
 
 ```bash
@@ -546,10 +596,13 @@ replacing the temporary Python HTTP server and wiring `storageKey` /
 `playbackUrl` through the existing video service layer. Phase 8 added the
 database and `/auth/*` module described above. Phase 9 added per-user
 Like/Save and watch-progress endpoints described in "Interactions & Progress
-API" above. Phase 8P (this backend's most recent phase) migrated that
-database from SQLite to PostgreSQL — see "Database" above for the full setup
-and command reference. Known gaps carried forward for a future phase: no
-rate limiting on `/auth/login` / `/auth/register`, the video catalog/streaming
-routes (`GET /videos/feed`, `GET /videos/:id`, `GET /videos/:id/stream`)
-remain unauthenticated (see "Known gaps in the Auth API"), and the other
-items under the Database section's "Known gaps".
+API" above. Phase 8P migrated that database from SQLite to PostgreSQL — see
+"Database" above for the full setup and command reference. Phase 10 (this
+backend's most recent phase) added account-wide premium entitlement and
+closed a real gap: `GET /videos/:id/stream` previously had no guard at all
+(any client with a video id could stream any file); it now requires
+`Authorization: Bearer <accessToken>` and, for episode 6+, an active
+entitlement — see "Entitlements API" above. Known gaps carried forward for a
+future phase: no rate limiting on `/auth/login` / `/auth/register` (see
+"Known gaps in the Auth API"), and the other items under the Database
+section's "Known gaps".

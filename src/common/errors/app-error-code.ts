@@ -45,4 +45,13 @@ export enum AppErrorCode {
    * violation surface as an unstructured 500.
    */
   USER_NOT_FOUND = 'USER_NOT_FOUND',
+  // Phase 11, work unit 11B-1 (media lifecycle state machine)
+  /**
+   * Returned when a requested media lifecycle transition (e.g.
+   * `published` -> `draft`) is not one of the explicitly allowed edges —
+   * see `MediaLifecycleService`/`MEDIA_LIFECYCLE_TRANSITIONS`. Also covers
+   * an unrecognized `from`/`to` state string, rather than letting an
+   * invalid string reach a Prisma write.
+   */
+  INVALID_MEDIA_LIFECYCLE_TRANSITION = 'INVALID_MEDIA_LIFECYCLE_TRANSITION',
 }

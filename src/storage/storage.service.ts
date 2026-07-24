@@ -146,6 +146,29 @@ export class StorageService {
     );
   }
 
+  /**
+   * Phase 11, work unit 11D-2b: uploads `body` directly through this
+   * backend (unlike `createPresignedPutUrl`'s direct-to-client flow) — used
+   * by `ThumbnailService` to ingest a small, server-generated thumbnail
+   * image. Every test that exercises a caller of this method mocks
+   * `StorageService`/its underlying `S3Client`; no real R2/network call is
+   * ever made from this credential-free slice.
+   */
+  async putObject(
+    key: string,
+    body: Buffer,
+    contentType?: string,
+  ): Promise<void> {
+    await this.client.send(
+      new PutObjectCommand({
+        Bucket: this.storageConfig.bucket,
+        Key: key,
+        Body: body,
+        ContentType: contentType,
+      }),
+    );
+  }
+
   /** Builds a public CDN URL for `key` from the configured public base URL. */
   buildPublicUrl(key: string): string {
     const base = this.storageConfig.publicBaseUrl.replace(/\/+$/, '');

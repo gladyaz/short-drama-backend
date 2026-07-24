@@ -252,6 +252,46 @@ describe('StorageService', () => {
     });
   });
 
+  describe('putObject', () => {
+    it('sends a PutObjectCommand with the body and content type for the configured bucket and key', async () => {
+      // Arrange
+      mockClient.send.mockResolvedValue({});
+      const body = Buffer.from('fake-thumbnail-bytes');
+
+      // Act
+      await service.putObject('thumbnails/abc/w480.jpg', body, 'image/jpeg');
+
+      // Assert
+      expect(mockClient.send).toHaveBeenCalledTimes(1);
+      const command = mockClient.send.mock.calls[0][0] as PutObjectCommand;
+      expect(command).toBeInstanceOf(PutObjectCommand);
+      expect(command.input).toEqual({
+        Bucket: 'mock-bucket',
+        Key: 'thumbnails/abc/w480.jpg',
+        Body: body,
+        ContentType: 'image/jpeg',
+      });
+    });
+
+    it('omits ContentType when not provided', async () => {
+      // Arrange
+      mockClient.send.mockResolvedValue({});
+      const body = Buffer.from('fake-bytes');
+
+      // Act
+      await service.putObject('thumbnails/abc/w480.jpg', body);
+
+      // Assert
+      const command = mockClient.send.mock.calls[0][0] as PutObjectCommand;
+      expect(command.input).toEqual({
+        Bucket: 'mock-bucket',
+        Key: 'thumbnails/abc/w480.jpg',
+        Body: body,
+        ContentType: undefined,
+      });
+    });
+  });
+
   describe('buildPublicUrl', () => {
     it('joins the configured public base URL and key with exactly one slash', () => {
       expect(service.buildPublicUrl('videos/abc.mp4')).toBe(

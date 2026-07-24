@@ -63,4 +63,27 @@ export enum AppErrorCode {
    * condition failed.
    */
   ADMIN_ROLE_REQUIRED = 'ADMIN_ROLE_REQUIRED',
+  // Phase 11, work unit 11D-2b (ffmpeg thumbnail generation)
+  /**
+   * Returned when `ThumbnailService.generate` is asked to read a source
+   * video whose extension is not in the supported list — deliberately
+   * distinct from `MEDIA_FILE_NOT_FOUND` (the file exists, but this service
+   * refuses to process it).
+   */
+  UNSUPPORTED_MEDIA_FORMAT = 'UNSUPPORTED_MEDIA_FORMAT',
+  /** Returned when a requested thumbnail capture timestamp is not a finite, non-negative number of seconds. */
+  INVALID_THUMBNAIL_TIMESTAMP = 'INVALID_THUMBNAIL_TIMESTAMP',
+  /**
+   * Returned when the generated thumbnail's measured width does not match
+   * the requested width, or either dimension is not a positive number —
+   * caught before the artifact is ever ingested into object storage.
+   */
+  THUMBNAIL_DIMENSION_MISMATCH = 'THUMBNAIL_DIMENSION_MISMATCH',
+  /**
+   * Returned when the injected `ThumbnailClient` or the ingestion call to
+   * `StorageService.putObject` fails. Deliberately does not echo the
+   * underlying error's raw message (which could contain an absolute
+   * filesystem path) — full detail is logged server-side, redacted, instead.
+   */
+  THUMBNAIL_GENERATION_FAILED = 'THUMBNAIL_GENERATION_FAILED',
 }

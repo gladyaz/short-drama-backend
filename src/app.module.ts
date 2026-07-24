@@ -2,6 +2,7 @@ import { MiddlewareConsumer, Module, NestModule } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
+import { AdminModule } from './admin/admin.module';
 import { AnalyticsModule } from './analytics/analytics.module';
 import { AuthModule } from './auth/auth.module';
 import { RequestLoggingMiddleware } from './common/logging/request-logging.middleware';
@@ -31,6 +32,7 @@ import { VideosModule } from './videos/videos.module';
     EntitlementsModule,
     AnalyticsModule,
     StorageModule,
+    AdminModule,
   ],
   controllers: [AppController],
   providers: [AppService],

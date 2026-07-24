@@ -22,6 +22,17 @@ model User {
   watchProgress     WatchProgress[]
   entitlements      Entitlement[]
   analyticsEvents   AnalyticsEvent[]
+  /// Phase 11, work unit 11B-2: authorizes the admin-guarded `/admin/media`
+  /// API (11B-3). Plain `String` (not a Postgres enum), matching the
+  /// existing `Video.category`/`Entitlement.tier` precedent — no second
+  /// role exists yet, and a string avoids a schema migration if one is
+  /// added later. Defaults to `"user"` so every pre-existing account (and
+  /// every caller creating a `User` without specifying it, e.g.
+  /// `AuthService.register`) is non-admin by default; becoming an admin is
+  /// an explicit, separate action (`AdminGuard`'s DEV-ONLY grant route,
+  /// gated by the existing `DEV_TOOLS_ENABLED`/`DevToolsGuard` precedent —
+  /// there is no real admin-provisioning flow yet).
+  role              String                 @default("user")
 }
 
 model Session {

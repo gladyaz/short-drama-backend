@@ -54,4 +54,13 @@ export enum AppErrorCode {
    * invalid string reach a Prisma write.
    */
   INVALID_MEDIA_LIFECYCLE_TRANSITION = 'INVALID_MEDIA_LIFECYCLE_TRANSITION',
+  // Phase 11, work unit 11B-2 (admin role + AdminGuard)
+  /**
+   * Returned by `AdminGuard` when the authenticated caller's `User.role` is
+   * not `"admin"` — deliberately does not distinguish "no such user
+   * anymore" from "exists but not an admin" (same 403), matching the
+   * `INVALID_CREDENTIALS`-style precedent of not leaking which specific
+   * condition failed.
+   */
+  ADMIN_ROLE_REQUIRED = 'ADMIN_ROLE_REQUIRED',
 }

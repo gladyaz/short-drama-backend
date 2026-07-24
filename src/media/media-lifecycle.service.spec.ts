@@ -46,6 +46,26 @@ describe('MediaLifecycleService', () => {
     });
   });
 
+  describe('canTransition / assertTransition with an unrecognized state', () => {
+    it('canTransition returns false instead of throwing when `from` is not a known state', () => {
+      expect(
+        service.canTransition(
+          'archived' as MediaLifecycleState,
+          MediaLifecycleState.DRAFT,
+        ),
+      ).toBe(false);
+    });
+
+    it('assertTransition throws INVALID_MEDIA_LIFECYCLE_TRANSITION (not a raw TypeError) for an unrecognized `from`', () => {
+      expect(() =>
+        service.assertTransition(
+          'archived' as MediaLifecycleState,
+          MediaLifecycleState.DRAFT,
+        ),
+      ).toThrow(AppException);
+    });
+  });
+
   /**
    * Exhaustive coverage: every one of the 5x5 = 25 `(from, to)` pairs across
    * all lifecycle states is checked against the explicit `ALLOWED_EDGES`

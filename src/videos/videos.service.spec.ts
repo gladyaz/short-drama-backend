@@ -177,6 +177,19 @@ describe('VideosService', () => {
         testVideos[0].id,
       ]);
     });
+
+    it('excludes a video whose lifecycleState is not "published" (Phase 11, work unit 11B-3)', async () => {
+      await prisma.video.update({
+        where: { id: testVideos[0].id },
+        data: { lifecycleState: 'draft' },
+      });
+
+      const videos = await service.findAll();
+      const specVideoIds = videos.map((video) => video.id);
+
+      expect(specVideoIds).not.toContain(testVideos[0].id);
+      expect(specVideoIds).toContain(testVideos[1].id);
+    });
   });
 
   describe('findById', () => {
@@ -191,6 +204,23 @@ describe('VideosService', () => {
       let caught: unknown;
       try {
         await service.findById('does-not-exist');
+      } catch (error) {
+        caught = error;
+      }
+
+      expect(caught).toBeInstanceOf(AppException);
+      expect((caught as AppException).code).toBe(AppErrorCode.VIDEO_NOT_FOUND);
+    });
+
+    it('throws VIDEO_NOT_FOUND for a video that exists but is not "published" (Phase 11, work unit 11B-3)', async () => {
+      await prisma.video.update({
+        where: { id: testVideos[0].id },
+        data: { lifecycleState: 'draft' },
+      });
+
+      let caught: unknown;
+      try {
+        await service.findById(testVideos[0].id);
       } catch (error) {
         caught = error;
       }

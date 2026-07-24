@@ -20,7 +20,20 @@ export class MediaLifecycleService {
     return VALID_STATES.has(value);
   }
 
+  /**
+   * Defensively re-validates `from`/`to` against the known state set (Phase
+   * 11, work unit 11B-3 needs this: `from` is read back off a `Video` row's
+   * plain-`String` `lifecycleState` column, not something the type system
+   * can already guarantee is one of the five known values) — an unknown
+   * value on either side is always "cannot transition", never a thrown
+   * `TypeError` from indexing `MEDIA_LIFECYCLE_TRANSITIONS` with an unknown
+   * key.
+   */
   canTransition(from: MediaLifecycleState, to: MediaLifecycleState): boolean {
+    if (!this.isValidState(from) || !this.isValidState(to)) {
+      return false;
+    }
+
     return MEDIA_LIFECYCLE_TRANSITIONS[from].includes(to);
   }
 

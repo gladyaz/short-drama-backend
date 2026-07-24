@@ -4,6 +4,7 @@ import { existsSync, statSync } from 'fs';
 import { AppConfig, RootConfig } from '../config/configuration';
 import { AppErrorCode } from '../common/errors/app-error-code';
 import { AppException } from '../common/errors/app.exception';
+import { MediaLifecycleState } from '../media/media-lifecycle.types';
 import { PrismaService } from '../prisma/prisma.service';
 import { VideoRecord, VideoResponseDto } from './video.types';
 import { resolveSafeStoragePath } from './storage-path.util';
@@ -33,7 +34,15 @@ export class VideosService {
     // column carrying the original curated order from `videos.data.ts`
     // (series-104 first) — `seriesId`/`episodeNumber` ordering does not
     // reproduce that order, since series are not curated alphabetically.
+    //
+    // `lifecycleState: PUBLISHED` (Phase 11, work unit 11B-3): the public
+    // feed must never leak `draft`/`ready`/`unpublished`/`failed` rows
+    // created by the admin media pipeline — those have no guarantee of a
+    // real, streamable file yet. Every one of the 40 pre-existing rows
+    // already defaults to `"published"` (11A-2's migration), so this is a
+    // no-op for them and does not change `findAll`'s existing behavior.
     const records = await this.prisma.video.findMany({
+      where: { lifecycleState: MediaLifecycleState.PUBLISHED },
       orderBy: { sortOrder: 'asc' },
     });
     return records.map((record) =>
@@ -66,7 +75,16 @@ export class VideosService {
 
   private async findRecordById(id: string): Promise<VideoRecord> {
     const record = await this.prisma.video.findUnique({ where: { id } });
-    if (!record) {
+    // A row that exists but is not `published` (Phase 11, work unit 11B-3:
+    // a draft/ready/unpublished/failed row from the admin media pipeline)
+    // is treated identically to a nonexistent one for every public-facing
+    // lookup (`findById`, and transitively `resolveStreamableFile`) — the
+    // same `VIDEO_NOT_FOUND` outcome, deliberately not a distinct code, so
+    // a caller cannot use this endpoint to enumerate unpublished ids.
+    if (
+      !record ||
+      record.lifecycleState !== (MediaLifecycleState.PUBLISHED as string)
+    ) {
       throw new AppException(
         AppErrorCode.VIDEO_NOT_FOUND,
         'Video not found',

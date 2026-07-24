@@ -11,6 +11,7 @@ import { validateEnv } from './config/env.validation';
 import { EntitlementsModule } from './entitlements/entitlements.module';
 import { HealthModule } from './health/health.module';
 import { InteractionsModule } from './interactions/interactions.module';
+import { MediaModule } from './media/media.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { ProgressModule } from './progress/progress.module';
 import { StorageModule } from './storage/storage.module';
@@ -33,6 +34,7 @@ import { VideosModule } from './videos/videos.module';
     AnalyticsModule,
     StorageModule,
     AdminModule,
+    MediaModule,
   ],
   controllers: [AppController],
   providers: [AppService],

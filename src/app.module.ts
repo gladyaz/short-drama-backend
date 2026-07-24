@@ -12,6 +12,7 @@ import { HealthModule } from './health/health.module';
 import { InteractionsModule } from './interactions/interactions.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { ProgressModule } from './progress/progress.module';
+import { StorageModule } from './storage/storage.module';
 import { VideosModule } from './videos/videos.module';
 
 @Module({
@@ -29,6 +30,7 @@ import { VideosModule } from './videos/videos.module';
     ProgressModule,
     EntitlementsModule,
     AnalyticsModule,
+    StorageModule,
   ],
   controllers: [AppController],
   providers: [AppService],

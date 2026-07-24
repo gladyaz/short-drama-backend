@@ -68,9 +68,37 @@ model Video {
   /// `Video` rows without specifying it keep compiling; the additive
   /// migration backfills the correct value for the 40 pre-existing rows.
   sortOrder                     Int     @default(0)
+  /// Phase 11, work unit 11A-2: object-storage fields for the upcoming
+  /// R2/S3-compatible media pipeline (11B/11D), added alongside the existing
+  /// `storageKey` (local `STORAGE_ROOT`-relative path — untouched, still the
+  /// sole field `VideosController#streamVideo` resolves against; see
+  /// DECISIONS.md "Phase 11 runbook reviewed..." entry: this slice does NOT
+  /// cut streaming over to object storage, that is 11A-3, out of scope).
+  /// All four are nullable with no default, so every existing row (and every
+  /// caller that creates/updates a `Video` without them, e.g. `seed.ts`)
+  /// keeps compiling and importing unchanged; they are populated only once a
+  /// video is actually uploaded to object storage via the 11B-3 admin API.
+  /// `objectStorageVariant` is a free-form label (e.g. "source", "720p")
+  /// rather than a separate join table — no real transcoding/rendition
+  /// pipeline exists yet, and a plain string avoids a schema migration when
+  /// one is added later (matching the existing `Video.category` precedent).
+  objectStorageKey              String?
+  objectStorageVariant          String?
+  coverImageKey                 String?
+  thumbnailImageKey             String?
+  /// Phase 11, work unit 11A-2 (state machine itself lands in 11B-1):
+  /// defaults to `"published"` so every one of the 40 pre-existing rows
+  /// stays exactly as playable/streamable as it is today after this
+  /// additive migration runs — none of them silently become a draft. New
+  /// media uploaded through the 11B-3 admin API starts at `"draft"`
+  /// instead, set explicitly by that endpoint rather than relying on this
+  /// column default (which exists for backfill safety, not as the intended
+  /// state for freshly created rows).
+  lifecycleState                String  @default("published")
 
   @@index([seriesId])
   @@index([sortOrder])
+  @@index([lifecycleState])
 }
 
 // Phase 9, work unit 9-B1: per-user Like/Save state for a video, mirroring

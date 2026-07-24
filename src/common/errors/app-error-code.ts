@@ -86,4 +86,17 @@ export enum AppErrorCode {
    * filesystem path) — full detail is logged server-side, redacted, instead.
    */
   THUMBNAIL_GENERATION_FAILED = 'THUMBNAIL_GENERATION_FAILED',
+  // Phase 11, work unit 11D-1-dryrun (read-only dry-run importer)
+  /**
+   * Returned when `MediaDryRunService.inspect` is called with a missing or
+   * empty `folderPath`. This service has no default path — it never falls
+   * back to `STORAGE_ROOT` or any other directory, so an absent path is
+   * always a caller error, not something to silently default around.
+   */
+  DRY_RUN_FOLDER_PATH_REQUIRED = 'DRY_RUN_FOLDER_PATH_REQUIRED',
+  /**
+   * Returned when the passed `folderPath` does not resolve to an existing,
+   * readable directory (missing, or exists but is a file, not a folder).
+   */
+  DRY_RUN_FOLDER_NOT_FOUND = 'DRY_RUN_FOLDER_NOT_FOUND',
 }

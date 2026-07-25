@@ -107,4 +107,22 @@ export enum AppErrorCode {
    * single decorator, so this is checked in `AdminMediaService.updateMetadata`.
    */
   EMPTY_MEDIA_METADATA_UPDATE = 'EMPTY_MEDIA_METADATA_UPDATE',
+  // Phase 11, work unit 11E-4 (additive Series model + admin CRUD)
+  /** Returned by `PATCH /admin/series/:id` and internal lookups when no `Series` row matches the given id. */
+  SERIES_NOT_FOUND = 'SERIES_NOT_FOUND',
+  /**
+   * Returned by `POST /admin/series` when a `Series` row with the given
+   * `id` already exists — a clean, structured 409 instead of letting a
+   * Postgres unique-constraint violation (`P2002`) surface as an
+   * unstructured 500.
+   */
+  SERIES_ALREADY_EXISTS = 'SERIES_ALREADY_EXISTS',
+  /**
+   * Returned by `PATCH /admin/series/:id` when the request body contains
+   * none of the three updatable fields (`title`/`coverImageKey`/
+   * `sortOrder`) — `UpdateSeriesDto` itself has no way to require "at least
+   * one of N optional fields" as a single decorator, matching the
+   * `EMPTY_MEDIA_METADATA_UPDATE` precedent (work unit 11E-2).
+   */
+  EMPTY_SERIES_UPDATE = 'EMPTY_SERIES_UPDATE',
 }

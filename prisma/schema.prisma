@@ -129,6 +129,33 @@ model Video {
   @@index([lifecycleState])
 }
 
+// Phase 11, work unit 11E-4: additive series metadata. `id` intentionally
+// has NO `@default` — it is the existing plain-string `seriesId` convention
+// already used by `Video.seriesId` above (e.g. "series-104"), so a `Series`
+// row is created with a client-provided id that ANNOTATES an existing
+// grouping rather than generating a new one. There is deliberately NO
+// relation/FK to `Video` here (`Video.seriesId` stays a plain, unconstrained
+// `String`, matching its existing doc comment and the
+// `UserVideoInteraction.videoId`/`WatchProgress.seriesId` precedent of
+// keeping cross-entity references at the application level, not the DB
+// level) — this table is purely optional metadata (display title, cover
+// image, manual ordering) about a `seriesId` value that may or may not have
+// any `Video` rows yet. Creating, updating, listing, or never creating a
+// `Series` row has zero effect on `Video` rows or the public `/videos/feed`
+// grouping (still computed client-side from `Video.seriesId`, unchanged by
+// this work unit). `sortOrder` defaults to 0, independent of and unrelated
+// to `Video.sortOrder` (a different table, a different ordering concern).
+model Series {
+  id            String   @id
+  title         String
+  coverImageKey String?
+  sortOrder     Int      @default(0)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([sortOrder])
+}
+
 // Phase 9, work unit 9-B1: per-user Like/Save state for a video, mirroring
 // mobile's local `VideoInteraction` shape (`video-interactions.tsx`) exactly
 // so the sync layer added in 9-B2/mobile is a near-direct mapping. `videoId`

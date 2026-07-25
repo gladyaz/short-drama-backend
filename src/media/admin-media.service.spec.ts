@@ -102,9 +102,58 @@ describe('AdminMediaService', () => {
       });
 
       const first = await service.createUpload(baseDto);
-      const second = await service.createUpload(baseDto);
+      const second = await service.createUpload({
+        ...baseDto,
+        episodeNumber: baseDto.episodeNumber + 1,
+      });
 
       expect(first.media.id).not.toBe(second.media.id);
+    });
+
+    // Work unit 11F-3: duplicate episode-number-within-series validation.
+    describe('duplicate episode-number-within-series validation', () => {
+      beforeEach(() => {
+        storageService.createPresignedPutUrl.mockResolvedValue({
+          url: 'https://signed.example.test/put',
+          key: 'k',
+          expiresAt: new Date(),
+        });
+      });
+
+      it('rejects a second create with the same (seriesId, episodeNumber) with 409 DUPLICATE_EPISODE_NUMBER, and creates no row', async () => {
+        await service.createUpload(baseDto);
+
+        await expect(service.createUpload(baseDto)).rejects.toMatchObject({
+          code: AppErrorCode.DUPLICATE_EPISODE_NUMBER,
+        });
+
+        const rows = await prisma.video.findMany({
+          where: { seriesId: baseDto.seriesId, episodeNumber: 1 },
+        });
+        expect(rows).toHaveLength(1);
+      });
+
+      it('allows a create with a unique episodeNumber in the same series', async () => {
+        await service.createUpload(baseDto);
+
+        const second = await service.createUpload({
+          ...baseDto,
+          episodeNumber: 2,
+        });
+
+        expect(second.media.episodeNumber).toBe(2);
+      });
+
+      it('allows the same episodeNumber in a different series (not a duplicate)', async () => {
+        await service.createUpload(baseDto);
+
+        const other = await service.createUpload({
+          ...baseDto,
+          seriesId: `${baseDto.seriesId}-other`,
+        });
+
+        expect(other.media.episodeNumber).toBe(baseDto.episodeNumber);
+      });
     });
   });
 
@@ -280,6 +329,17 @@ describe('AdminMediaService', () => {
   });
 
   describe('list', () => {
+    // Work unit 11F-3: `createUpload` now rejects a duplicate
+    // (seriesId, episodeNumber) pair, so this counter gives every fixture
+    // created within a single test its own episode number — even the ones
+    // that share `baseDto.seriesId` — instead of every call reusing
+    // `baseDto.episodeNumber`. Reset per test so the exact numbers stay
+    // small and predictable; irrelevant to any assertion below either way.
+    let episodeCounter = 1;
+    beforeEach(() => {
+      episodeCounter = 1;
+    });
+
     /**
      * Creates a media record and drives it through the lifecycle states
      * needed to reach `targetState` via the service's own public methods
@@ -299,6 +359,7 @@ describe('AdminMediaService', () => {
       const created = await service.createUpload({
         ...baseDto,
         seriesId: overrides.seriesId ?? baseDto.seriesId,
+        episodeNumber: episodeCounter++,
       });
       const id = created.media.id;
 
@@ -551,6 +612,80 @@ describe('AdminMediaService', () => {
       await expect(
         service.updateMetadata('does-not-exist', { title: 'X' }),
       ).rejects.toMatchObject({ code: AppErrorCode.VIDEO_NOT_FOUND });
+    });
+
+    // Work unit 11F-3: duplicate episode-number-within-series validation.
+    describe('duplicate episode-number-within-series validation', () => {
+      async function createMediaWithEpisode(
+        episodeNumber: number,
+      ): Promise<string> {
+        storageService.createPresignedPutUrl.mockResolvedValue({
+          url: 'https://signed.example.test/put',
+          key: 'k',
+          expiresAt: new Date(),
+        });
+        const created = await service.createUpload({
+          ...baseDto,
+          episodeNumber,
+        });
+        return created.media.id;
+      }
+
+      it('rejects a PATCH that collides with ANOTHER episode in the same series with 409 DUPLICATE_EPISODE_NUMBER, and applies no update', async () => {
+        const firstId = await createMediaWithEpisode(1);
+        const secondId = await createMediaWithEpisode(2);
+
+        await expect(
+          service.updateMetadata(secondId, { episodeNumber: 1 }),
+        ).rejects.toMatchObject({
+          code: AppErrorCode.DUPLICATE_EPISODE_NUMBER,
+        });
+
+        const persistedFirst = await prisma.video.findUnique({
+          where: { id: firstId },
+        });
+        const persistedSecond = await prisma.video.findUnique({
+          where: { id: secondId },
+        });
+        expect(persistedFirst?.episodeNumber).toBe(1);
+        expect(persistedSecond?.episodeNumber).toBe(2); // unchanged
+      });
+
+      it('allows a PATCH to an episodeNumber unused in the series', async () => {
+        await createMediaWithEpisode(1);
+        const secondId = await createMediaWithEpisode(2);
+
+        const result = await service.updateMetadata(secondId, {
+          episodeNumber: 3,
+        });
+
+        expect(result.episodeNumber).toBe(3);
+      });
+
+      it('does not false-positive when PATCHing other fields without episodeNumber, even alongside another same-series episode', async () => {
+        await createMediaWithEpisode(1);
+        const secondId = await createMediaWithEpisode(2);
+
+        const result = await service.updateMetadata(secondId, {
+          title: 'Retitled, no episodeNumber in body',
+        });
+
+        expect(result.title).toBe('Retitled, no episodeNumber in body');
+        expect(result.episodeNumber).toBe(2);
+      });
+
+      it("allows a PATCH that sets episodeNumber to the row's own current value (no-op, not a self-collision)", async () => {
+        await createMediaWithEpisode(1);
+        const secondId = await createMediaWithEpisode(2);
+
+        const result = await service.updateMetadata(secondId, {
+          episodeNumber: 2,
+          title: 'Still allowed',
+        });
+
+        expect(result.episodeNumber).toBe(2);
+        expect(result.title).toBe('Still allowed');
+      });
     });
   });
 });

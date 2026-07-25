@@ -191,6 +191,78 @@ describe('Admin Media (e2e)', () => {
     });
   });
 
+  /**
+   * Work unit 11F-3: duplicate episode-number-within-series validation on
+   * `POST /admin/media`. Each test namespaces its own sub-series under
+   * `${testSeriesId}-11f3-create-dup-*` (still covered by `afterAll`'s
+   * `startsWith(testSeriesId)` sweep) so tests never collide with each
+   * other or with the "admin happy path" fixtures above.
+   */
+  describe('409 — duplicate episode-number-within-series (create)', () => {
+    const dupSeriesId = `${testSeriesId}-11f3-create-dup`;
+
+    it('rejects a second create with the same (seriesId, episodeNumber) with 409 DUPLICATE_EPISODE_NUMBER, and creates no row', async () => {
+      const seriesId = `${dupSeriesId}-reject`;
+      const body = { ...validCreateBody, seriesId, episodeNumber: 1 };
+
+      const first = await request(app.getHttpServer())
+        .post('/admin/media')
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send(body)
+        .expect(HttpStatus.CREATED);
+
+      const response = await request(app.getHttpServer())
+        .post('/admin/media')
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send(body)
+        .expect(HttpStatus.CONFLICT);
+
+      const errorBody = response.body as ErrorResponseBody;
+      expect(errorBody.code).toBe('DUPLICATE_EPISODE_NUMBER');
+
+      const rows = await prisma.video.findMany({
+        where: { seriesId, episodeNumber: 1 },
+      });
+      expect(rows).toHaveLength(1);
+      expect(rows[0].id).toBe(
+        (first.body as CreateUploadResponseBody).media.id,
+      );
+    });
+
+    it('allows a create with a unique episodeNumber in the same series', async () => {
+      const seriesId = `${dupSeriesId}-unique`;
+
+      await request(app.getHttpServer())
+        .post('/admin/media')
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({ ...validCreateBody, seriesId, episodeNumber: 1 })
+        .expect(HttpStatus.CREATED);
+
+      await request(app.getHttpServer())
+        .post('/admin/media')
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({ ...validCreateBody, seriesId, episodeNumber: 2 })
+        .expect(HttpStatus.CREATED);
+    });
+
+    it('allows the same episodeNumber in a different series (not a duplicate)', async () => {
+      const seriesId = `${dupSeriesId}-diff-series-a`;
+      const otherSeriesId = `${dupSeriesId}-diff-series-b`;
+
+      await request(app.getHttpServer())
+        .post('/admin/media')
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({ ...validCreateBody, seriesId, episodeNumber: 1 })
+        .expect(HttpStatus.CREATED);
+
+      await request(app.getHttpServer())
+        .post('/admin/media')
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({ ...validCreateBody, seriesId: otherSeriesId, episodeNumber: 1 })
+        .expect(HttpStatus.CREATED);
+    });
+  });
+
   describe('admin happy path', () => {
     let mediaId: string;
 
@@ -775,6 +847,123 @@ describe('Admin Media (e2e)', () => {
 
       const body = response.body as ErrorResponseBody;
       expect(body.code).toBe('VIDEO_NOT_FOUND');
+    });
+
+    /**
+     * Work unit 11F-3: duplicate episode-number-within-series validation on
+     * `PATCH /admin/media/:id`. Each test namespaces its own sub-series
+     * under `${patchSeriesId}-11f3-*` (still covered by `afterAll`'s
+     * `startsWith(testSeriesId)` sweep) so fixtures never collide across
+     * tests.
+     */
+    describe('409 — duplicate episode-number-within-series', () => {
+      const patchDupSeriesId = `${patchSeriesId}-11f3`;
+
+      async function createFixtureWithEpisode(
+        id: string,
+        seriesId: string,
+        episodeNumber: number,
+      ): Promise<string> {
+        await prisma.video.create({
+          data: {
+            id,
+            seriesId,
+            title: `Patch-dup fixture ${id}`,
+            episodeNumber,
+            channelName: 'E2E Channel',
+            caption: 'Patch-dup fixture caption',
+            category: 'drama',
+            storageKey: '',
+            sourceLanguage: 'zh',
+            hasEmbeddedIndonesianSubtitle: true,
+            likeCount: 0,
+            lifecycleState: 'draft',
+          },
+        });
+        return id;
+      }
+
+      it('returns 409 DUPLICATE_EPISODE_NUMBER when episodeNumber collides with ANOTHER episode in the same series, and applies no update', async () => {
+        const seriesId = `${patchDupSeriesId}-reject`;
+        await createFixtureWithEpisode(`${seriesId}-1`, seriesId, 1);
+        const secondId = await createFixtureWithEpisode(
+          `${seriesId}-2`,
+          seriesId,
+          2,
+        );
+
+        const response = await request(app.getHttpServer())
+          .patch(`/admin/media/${secondId}`)
+          .set('Authorization', `Bearer ${adminAccessToken}`)
+          .send({ episodeNumber: 1 })
+          .expect(HttpStatus.CONFLICT);
+
+        const body = response.body as ErrorResponseBody;
+        expect(body.code).toBe('DUPLICATE_EPISODE_NUMBER');
+
+        const persisted = await prisma.video.findUnique({
+          where: { id: secondId },
+        });
+        expect(persisted?.episodeNumber).toBe(2); // unchanged
+      });
+
+      it('allows a PATCH to an episodeNumber unused in the series', async () => {
+        const seriesId = `${patchDupSeriesId}-unique`;
+        await createFixtureWithEpisode(`${seriesId}-1`, seriesId, 1);
+        const secondId = await createFixtureWithEpisode(
+          `${seriesId}-2`,
+          seriesId,
+          2,
+        );
+
+        const response = await request(app.getHttpServer())
+          .patch(`/admin/media/${secondId}`)
+          .set('Authorization', `Bearer ${adminAccessToken}`)
+          .send({ episodeNumber: 3 })
+          .expect(HttpStatus.OK);
+
+        expect((response.body as AdminMediaDto).episodeNumber).toBe(3);
+      });
+
+      it('does not false-positive when PATCHing other fields without episodeNumber', async () => {
+        const seriesId = `${patchDupSeriesId}-no-false-positive`;
+        await createFixtureWithEpisode(`${seriesId}-1`, seriesId, 1);
+        const secondId = await createFixtureWithEpisode(
+          `${seriesId}-2`,
+          seriesId,
+          2,
+        );
+
+        const response = await request(app.getHttpServer())
+          .patch(`/admin/media/${secondId}`)
+          .set('Authorization', `Bearer ${adminAccessToken}`)
+          .send({ title: 'Retitled, no episodeNumber in body' })
+          .expect(HttpStatus.OK);
+
+        const body = response.body as AdminMediaDto;
+        expect(body.title).toBe('Retitled, no episodeNumber in body');
+        expect(body.episodeNumber).toBe(2);
+      });
+
+      it("allows a PATCH that sets episodeNumber to the row's own current value (no-op, not a self-collision)", async () => {
+        const seriesId = `${patchDupSeriesId}-self-noop`;
+        await createFixtureWithEpisode(`${seriesId}-1`, seriesId, 1);
+        const secondId = await createFixtureWithEpisode(
+          `${seriesId}-2`,
+          seriesId,
+          2,
+        );
+
+        const response = await request(app.getHttpServer())
+          .patch(`/admin/media/${secondId}`)
+          .set('Authorization', `Bearer ${adminAccessToken}`)
+          .send({ episodeNumber: 2, title: 'Still allowed' })
+          .expect(HttpStatus.OK);
+
+        const body = response.body as AdminMediaDto;
+        expect(body.episodeNumber).toBe(2);
+        expect(body.title).toBe('Still allowed');
+      });
     });
   });
 

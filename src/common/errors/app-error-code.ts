@@ -136,4 +136,17 @@ export enum AppErrorCode {
    * always-available alternative that never has this restriction.
    */
   SERIES_HAS_PUBLISHED_EPISODES = 'SERIES_HAS_PUBLISHED_EPISODES',
+  // Phase 11, work unit 11F-3 (duplicate episode-number-within-series validation)
+  /**
+   * Returned by `POST /admin/media` when a `Video` row with the same
+   * `seriesId` AND `episodeNumber` already exists (no row is created), and
+   * by `PATCH /admin/media/:id` when the request body's `episodeNumber`
+   * collides with a DIFFERENT `Video` row (`id !=` the one being edited) in
+   * the same series (no update is applied). Since `seriesId` is not
+   * editable via the metadata PATCH (see `UpdateMediaMetadataDto`), the
+   * collision check always uses the row's existing, unchanged `seriesId`.
+   * Changing `episodeNumber` to the row's own current value is a no-op and
+   * is explicitly NOT treated as a collision.
+   */
+  DUPLICATE_EPISODE_NUMBER = 'DUPLICATE_EPISODE_NUMBER',
 }

@@ -108,6 +108,8 @@ export class AdminMediaService {
   async createUpload(
     dto: CreateMediaUploadDto,
   ): Promise<CreateMediaUploadResponseDto> {
+    await this.assertNoDuplicateEpisodeNumber(dto.seriesId, dto.episodeNumber);
+
     const id = `${MEDIA_ID_PREFIX}-${randomUUID()}`;
     const objectStorageKey = buildSourceObjectKey(id);
 
@@ -233,6 +235,13 @@ export class AdminMediaService {
    * (lifecycle state, object-storage keys, `storageKey`, `sortOrder`,
    * `likeCount`, dimensions/duration, `accessTierOverride`) is left
    * completely untouched by this call.
+   *
+   * Work unit 11F-3: when the body includes `episodeNumber` and it differs
+   * from the row's current value, this also rejects with a 409
+   * `DUPLICATE_EPISODE_NUMBER` if ANOTHER row (`id !=` this one) in the same
+   * series already has that episode number. `seriesId` itself is not
+   * editable here (see the whitelist above), so the row's existing
+   * `seriesId` is always the one checked against.
    */
   async updateMetadata(
     id: string,
@@ -248,7 +257,18 @@ export class AdminMediaService {
       );
     }
 
-    await this.findMediaOrThrow(id);
+    const media = await this.findMediaOrThrow(id);
+
+    if (
+      data.episodeNumber !== undefined &&
+      data.episodeNumber !== media.episodeNumber
+    ) {
+      await this.assertNoDuplicateEpisodeNumber(
+        media.seriesId,
+        data.episodeNumber,
+        id,
+      );
+    }
 
     const updated = await this.prisma.video.update({
       where: { id },
@@ -357,6 +377,39 @@ export class AdminMediaService {
       media: toAdminMediaDto(updated),
       upload: toPresignedUploadDto(presigned),
     };
+  }
+
+  /**
+   * Work unit 11F-3: a clean, application-level duplicate check — no DB
+   * unique constraint/migration is added for this (see the class doc on
+   * `AdminMediaService` and DECISIONS.md for why this slice stays
+   * validation-only). Used by both `createUpload` (no `excludeId`, since the
+   * row does not exist yet) and `updateMetadata` (`excludeId` set to the
+   * row being edited, so a PATCH that changes some other field while
+   * leaving `episodeNumber` pointed at the row's own current value never
+   * collides with itself).
+   */
+  private async assertNoDuplicateEpisodeNumber(
+    seriesId: string,
+    episodeNumber: number,
+    excludeId?: string,
+  ): Promise<void> {
+    const existing = await this.prisma.video.findFirst({
+      where: {
+        seriesId,
+        episodeNumber,
+        ...(excludeId ? { id: { not: excludeId } } : {}),
+      },
+      select: { id: true },
+    });
+
+    if (existing) {
+      throw new AppException(
+        AppErrorCode.DUPLICATE_EPISODE_NUMBER,
+        `Episode number ${episodeNumber} already exists in series "${seriesId}"`,
+        HttpStatus.CONFLICT,
+      );
+    }
   }
 
   private async findMediaOrThrow(id: string): Promise<VideoRow> {

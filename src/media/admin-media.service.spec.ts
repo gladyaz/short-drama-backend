@@ -535,6 +535,252 @@ describe('AdminMediaService', () => {
       expect(result.page).toBe(1);
       expect(result.pageSize).toBe(20);
     });
+
+    /**
+     * Work unit 11F-2: `search` (case-insensitive substring across
+     * `title`/`caption`/`channelName`), `tier` (exact match on the
+     * DB-backed `accessTierOverride` column — 11F-4 backfilled every row,
+     * so this is NOT re-derived from `episodeNumber`), and `category`
+     * (exact match), each ANDed with the existing `status`/`seriesId`
+     * filters. Fixtures are written directly via `prisma.video.create`
+     * (bypassing `createUpload`'s own tier derivation) so each row's
+     * `title`/`caption`/`channelName`/`category`/`accessTierOverride`/
+     * `lifecycleState` can be set independently; namespaced under
+     * `${testIdPrefix}-11f2-filters`, still covered by this describe
+     * block's own `afterEach` sweep (`seriesId: { startsWith: testIdPrefix
+     * }`).
+     */
+    describe('search / tier / category filters (work unit 11F-2)', () => {
+      const filterSeriesId = `${testIdPrefix}-11f2-filters`;
+
+      async function createFixture(
+        id: string,
+        overrides: Partial<{
+          seriesId: string;
+          title: string;
+          caption: string;
+          channelName: string;
+          category: string;
+          accessTierOverride: string | null;
+          lifecycleState: string;
+        }> = {},
+      ): Promise<string> {
+        await prisma.video.create({
+          data: {
+            id,
+            seriesId: overrides.seriesId ?? filterSeriesId,
+            title: overrides.title ?? 'Default Title',
+            episodeNumber: 1,
+            channelName: overrides.channelName ?? 'Default Channel',
+            caption: overrides.caption ?? 'Default caption',
+            category: overrides.category ?? 'drama',
+            storageKey: '',
+            sourceLanguage: 'zh',
+            hasEmbeddedIndonesianSubtitle: true,
+            likeCount: 0,
+            lifecycleState: overrides.lifecycleState ?? 'draft',
+            accessTierOverride: overrides.accessTierOverride ?? 'free',
+          },
+        });
+        return id;
+      }
+
+      it('search matches on title (case-insensitive)', async () => {
+        const matchId = await createFixture(`${filterSeriesId}-title-match`, {
+          title: 'Amazing Dragon Story',
+        });
+        await createFixture(`${filterSeriesId}-title-nomatch`, {
+          title: 'Something Else Entirely',
+        });
+
+        const result = await service.list({
+          seriesId: filterSeriesId,
+          search: 'dragon',
+          page: 1,
+          pageSize: 20,
+        });
+
+        expect(result.items.map((item) => item.id)).toEqual([matchId]);
+        expect(result.total).toBe(1);
+      });
+
+      it('search matches on caption (case-insensitive)', async () => {
+        const matchId = await createFixture(`${filterSeriesId}-caption-match`, {
+          caption: 'A tale of ROYAL intrigue',
+        });
+        await createFixture(`${filterSeriesId}-caption-nomatch`, {
+          caption: 'Nothing related here',
+        });
+
+        const result = await service.list({
+          seriesId: filterSeriesId,
+          search: 'royal',
+          page: 1,
+          pageSize: 20,
+        });
+
+        expect(result.items.map((item) => item.id)).toEqual([matchId]);
+      });
+
+      it('search matches on channelName (case-insensitive)', async () => {
+        const matchId = await createFixture(`${filterSeriesId}-channel-match`, {
+          channelName: 'Studio NEBULA',
+        });
+        await createFixture(`${filterSeriesId}-channel-nomatch`, {
+          channelName: 'Other Studio',
+        });
+
+        const result = await service.list({
+          seriesId: filterSeriesId,
+          search: 'nebula',
+          page: 1,
+          pageSize: 20,
+        });
+
+        expect(result.items.map((item) => item.id)).toEqual([matchId]);
+      });
+
+      it('a non-matching search term returns no rows', async () => {
+        await createFixture(`${filterSeriesId}-nomatch-only`, {
+          title: 'Totally Unrelated Title',
+          caption: 'unrelated caption',
+          channelName: 'unrelated channel',
+        });
+
+        const result = await service.list({
+          seriesId: filterSeriesId,
+          search: 'zzz-nonexistent-term-zzz',
+          page: 1,
+          pageSize: 20,
+        });
+
+        expect(result.items).toHaveLength(0);
+        expect(result.total).toBe(0);
+      });
+
+      it('tier=free returns only free rows, asserted against accessTierOverride', async () => {
+        const freeId = await createFixture(`${filterSeriesId}-tier-free`, {
+          accessTierOverride: 'free',
+        });
+        await createFixture(`${filterSeriesId}-tier-premium`, {
+          accessTierOverride: 'premium',
+        });
+
+        const result = await service.list({
+          seriesId: filterSeriesId,
+          tier: 'free',
+          page: 1,
+          pageSize: 20,
+        });
+
+        expect(result.items.map((item) => item.id)).toEqual([freeId]);
+        for (const item of result.items) {
+          expect(item.accessTierOverride).toBe('free');
+        }
+      });
+
+      it('tier=premium returns only premium rows, asserted against accessTierOverride', async () => {
+        await createFixture(`${filterSeriesId}-tier-free-2`, {
+          accessTierOverride: 'free',
+        });
+        const premiumId = await createFixture(
+          `${filterSeriesId}-tier-premium-2`,
+          { accessTierOverride: 'premium' },
+        );
+
+        const result = await service.list({
+          seriesId: filterSeriesId,
+          tier: 'premium',
+          page: 1,
+          pageSize: 20,
+        });
+
+        expect(result.items.map((item) => item.id)).toEqual([premiumId]);
+        for (const item of result.items) {
+          expect(item.accessTierOverride).toBe('premium');
+        }
+      });
+
+      it('category filter returns only that category', async () => {
+        const dramaId = await createFixture(`${filterSeriesId}-cat-drama`, {
+          category: 'drama',
+        });
+        await createFixture(`${filterSeriesId}-cat-comedy`, {
+          category: 'comedy',
+        });
+
+        const result = await service.list({
+          seriesId: filterSeriesId,
+          category: 'drama',
+          page: 1,
+          pageSize: 20,
+        });
+
+        expect(result.items.map((item) => item.id)).toEqual([dramaId]);
+      });
+
+      it('composes search + status + tier + category + seriesId together (AND semantics), with total reflecting the filtered set', async () => {
+        const targetId = await createFixture(
+          `${filterSeriesId}-compose-target`,
+          {
+            title: 'Composable Dragon Epic',
+            category: 'drama',
+            accessTierOverride: 'premium',
+            lifecycleState: 'published',
+          },
+        );
+
+        // Same series, matches everything except category.
+        await createFixture(`${filterSeriesId}-compose-wrong-category`, {
+          title: 'Composable Dragon Epic',
+          category: 'comedy',
+          accessTierOverride: 'premium',
+          lifecycleState: 'published',
+        });
+        // Same series, matches everything except tier.
+        await createFixture(`${filterSeriesId}-compose-wrong-tier`, {
+          title: 'Composable Dragon Epic',
+          category: 'drama',
+          accessTierOverride: 'free',
+          lifecycleState: 'published',
+        });
+        // Same series, matches everything except lifecycle status.
+        await createFixture(`${filterSeriesId}-compose-wrong-status`, {
+          title: 'Composable Dragon Epic',
+          category: 'drama',
+          accessTierOverride: 'premium',
+          lifecycleState: 'draft',
+        });
+        // Same series, matches everything except the search term.
+        await createFixture(`${filterSeriesId}-compose-wrong-search`, {
+          title: 'Totally Different Title',
+          category: 'drama',
+          accessTierOverride: 'premium',
+          lifecycleState: 'published',
+        });
+        // A different series that otherwise matches every other filter.
+        await createFixture(`${filterSeriesId}-compose-other-series`, {
+          seriesId: `${filterSeriesId}-other`,
+          title: 'Composable Dragon Epic',
+          category: 'drama',
+          accessTierOverride: 'premium',
+          lifecycleState: 'published',
+        });
+
+        const result = await service.list({
+          seriesId: filterSeriesId,
+          search: 'dragon',
+          status: MediaLifecycleState.PUBLISHED,
+          tier: 'premium',
+          category: 'drama',
+          page: 1,
+          pageSize: 20,
+        });
+
+        expect(result.items.map((item) => item.id)).toEqual([targetId]);
+        expect(result.total).toBe(1);
+      });
+    });
   });
 
   describe('findById', () => {

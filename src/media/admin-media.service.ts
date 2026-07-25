@@ -318,15 +318,41 @@ export class AdminMediaService {
    * rows to the public feed — see the class doc above). Ordered
    * deterministically by `sortOrder` then `id`, matching the existing
    * public-feed ordering convention (`VideosService.findAll`).
+   *
+   * Work unit 11F-2: three additional optional filters — `search`
+   * (case-insensitive substring across `title`/`caption`/`channelName`),
+   * `tier` (exact match on `accessTierOverride`), and `category` (exact
+   * match) — all ANDed together with `status`/`seriesId` and with each
+   * other (Prisma's default `where` object semantics: every top-level key
+   * is an implicit AND; `search`'s three-field `OR` nests inside that AND
+   * as its own key). None of these re-derive anything from `episodeNumber`
+   * — `tier` reads the DB column directly, matching 11F-4.
    */
   async list(
     query: ListAdminMediaQueryDto,
   ): Promise<AdminMediaListResponseDto> {
     const page = query.page;
     const pageSize = query.pageSize;
+    const search = query.search?.trim();
     const where = {
       ...(query.status ? { lifecycleState: query.status } : {}),
       ...(query.seriesId ? { seriesId: query.seriesId } : {}),
+      ...(query.tier ? { accessTierOverride: query.tier } : {}),
+      ...(query.category ? { category: query.category } : {}),
+      ...(search
+        ? {
+            OR: [
+              { title: { contains: search, mode: 'insensitive' as const } },
+              { caption: { contains: search, mode: 'insensitive' as const } },
+              {
+                channelName: {
+                  contains: search,
+                  mode: 'insensitive' as const,
+                },
+              },
+            ],
+          }
+        : {}),
     };
 
     const [rows, total] = await Promise.all([

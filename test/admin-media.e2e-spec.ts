@@ -697,6 +697,325 @@ describe('Admin Media (e2e)', () => {
         expect(body.total).toBe(3);
       });
     });
+
+    /**
+     * Work unit 11F-2: `search` (case-insensitive substring across
+     * `title`/`caption`/`channelName`), `tier` (exact match on the
+     * DB-backed `accessTierOverride` column, backfilled non-null for every
+     * row by 11F-4 — NOT re-derived from `episodeNumber`), and `category`
+     * (exact match), each optional and ANDed with the existing
+     * `status`/`seriesId` filters. Fixtures are written directly via
+     * `prisma.video.create` (same precedent as the fixtures above).
+     *
+     * Unlike `admin-media.service.spec.ts` (which wipes every fixture via
+     * `afterEach` between tests), this file only cleans up once, in the
+     * top-level `afterAll`, so EACH test below scopes its own fixtures under
+     * a distinct `${filterSeriesId}-<test>` sub-series and always filters
+     * the query by that same sub-series — otherwise an earlier test's rows
+     * (e.g. the `free`-tier default `createFilterFixture` writes) would leak
+     * into a later test's `tier`/`category` assertions. Every sub-series
+     * still starts with `listSeriesId`/`testSeriesId`, so the top-level
+     * `afterAll` sweep covers all of them; none of the 40 seed rows are
+     * touched.
+     */
+    describe('search / tier / category filters (work unit 11f2)', () => {
+      const filterSeriesId = `${listSeriesId}-11f2-filters`;
+
+      async function createFilterFixture(
+        id: string,
+        seriesId: string,
+        overrides: Partial<{
+          title: string;
+          caption: string;
+          channelName: string;
+          category: string;
+          accessTierOverride: string | null;
+          lifecycleState: string;
+        }> = {},
+      ): Promise<string> {
+        await prisma.video.create({
+          data: {
+            id,
+            seriesId,
+            title: overrides.title ?? 'Default Title',
+            episodeNumber: 1,
+            channelName: overrides.channelName ?? 'Default Channel',
+            caption: overrides.caption ?? 'Default caption',
+            category: overrides.category ?? 'drama',
+            storageKey: '',
+            sourceLanguage: 'zh',
+            hasEmbeddedIndonesianSubtitle: true,
+            likeCount: 0,
+            lifecycleState: overrides.lifecycleState ?? 'draft',
+            accessTierOverride: overrides.accessTierOverride ?? 'free',
+          },
+        });
+        return id;
+      }
+
+      it('search matches on title (case-insensitive)', async () => {
+        const seriesId = `${filterSeriesId}-title`;
+        const matchId = await createFilterFixture(
+          `${seriesId}-match`,
+          seriesId,
+          { title: 'Amazing Dragon Story' },
+        );
+        await createFilterFixture(`${seriesId}-nomatch`, seriesId, {
+          title: 'Something Else Entirely',
+        });
+
+        const response = await request(app.getHttpServer())
+          .get('/admin/media')
+          .query({ seriesId, search: 'dragon' })
+          .set('Authorization', `Bearer ${adminAccessToken}`)
+          .expect(HttpStatus.OK);
+
+        const body = response.body as AdminMediaListResponseDto;
+        expect(body.items.map((item) => item.id)).toEqual([matchId]);
+        expect(body.total).toBe(1);
+      });
+
+      it('search matches on caption (case-insensitive)', async () => {
+        const seriesId = `${filterSeriesId}-caption`;
+        const matchId = await createFilterFixture(
+          `${seriesId}-match`,
+          seriesId,
+          { caption: 'A tale of ROYAL intrigue' },
+        );
+        await createFilterFixture(`${seriesId}-nomatch`, seriesId, {
+          caption: 'Nothing related here',
+        });
+
+        const response = await request(app.getHttpServer())
+          .get('/admin/media')
+          .query({ seriesId, search: 'royal' })
+          .set('Authorization', `Bearer ${adminAccessToken}`)
+          .expect(HttpStatus.OK);
+
+        const body = response.body as AdminMediaListResponseDto;
+        expect(body.items.map((item) => item.id)).toEqual([matchId]);
+      });
+
+      it('search matches on channelName (case-insensitive)', async () => {
+        const seriesId = `${filterSeriesId}-channel`;
+        const matchId = await createFilterFixture(
+          `${seriesId}-match`,
+          seriesId,
+          { channelName: 'Studio NEBULA' },
+        );
+        await createFilterFixture(`${seriesId}-nomatch`, seriesId, {
+          channelName: 'Other Studio',
+        });
+
+        const response = await request(app.getHttpServer())
+          .get('/admin/media')
+          .query({ seriesId, search: 'nebula' })
+          .set('Authorization', `Bearer ${adminAccessToken}`)
+          .expect(HttpStatus.OK);
+
+        const body = response.body as AdminMediaListResponseDto;
+        expect(body.items.map((item) => item.id)).toEqual([matchId]);
+      });
+
+      it('a non-matching search term returns no rows', async () => {
+        const seriesId = `${filterSeriesId}-nomatch-only`;
+        await createFilterFixture(`${seriesId}-fixture`, seriesId, {
+          title: 'Totally Unrelated Title',
+          caption: 'unrelated caption',
+          channelName: 'unrelated channel',
+        });
+
+        const response = await request(app.getHttpServer())
+          .get('/admin/media')
+          .query({ seriesId, search: 'zzz-nonexistent-term-zzz' })
+          .set('Authorization', `Bearer ${adminAccessToken}`)
+          .expect(HttpStatus.OK);
+
+        const body = response.body as AdminMediaListResponseDto;
+        expect(body.items).toHaveLength(0);
+        expect(body.total).toBe(0);
+      });
+
+      it('an empty search=<empty> is treated as absent (200, unfiltered) — not a 400', async () => {
+        const seriesId = `${filterSeriesId}-empty-search`;
+        const firstId = await createFilterFixture(`${seriesId}-a`, seriesId, {
+          title: 'Alpha Title',
+        });
+        const secondId = await createFilterFixture(`${seriesId}-b`, seriesId, {
+          title: 'Beta Title',
+        });
+
+        const emptySearchResponse = await request(app.getHttpServer())
+          .get('/admin/media')
+          .query({ seriesId, search: '' })
+          .set('Authorization', `Bearer ${adminAccessToken}`)
+          .expect(HttpStatus.OK);
+
+        const omittedResponse = await request(app.getHttpServer())
+          .get('/admin/media')
+          .query({ seriesId })
+          .set('Authorization', `Bearer ${adminAccessToken}`)
+          .expect(HttpStatus.OK);
+
+        const emptySearchBody =
+          emptySearchResponse.body as AdminMediaListResponseDto;
+        const omittedBody = omittedResponse.body as AdminMediaListResponseDto;
+
+        expect(emptySearchBody.total).toBe(2);
+        expect(emptySearchBody.items.map((item) => item.id).sort()).toEqual(
+          [firstId, secondId].sort(),
+        );
+        expect(emptySearchBody).toEqual(omittedBody);
+      });
+
+      it('tier=free returns only free rows, asserted against accessTierOverride', async () => {
+        const seriesId = `${filterSeriesId}-tier-free`;
+        const freeId = await createFilterFixture(`${seriesId}-free`, seriesId, {
+          accessTierOverride: 'free',
+        });
+        await createFilterFixture(`${seriesId}-premium`, seriesId, {
+          accessTierOverride: 'premium',
+        });
+
+        const response = await request(app.getHttpServer())
+          .get('/admin/media')
+          .query({ seriesId, tier: 'free' })
+          .set('Authorization', `Bearer ${adminAccessToken}`)
+          .expect(HttpStatus.OK);
+
+        const body = response.body as AdminMediaListResponseDto;
+        expect(body.items.map((item) => item.id)).toEqual([freeId]);
+        for (const item of body.items) {
+          expect(item.accessTierOverride).toBe('free');
+        }
+      });
+
+      it('tier=premium returns only premium rows, asserted against accessTierOverride', async () => {
+        const seriesId = `${filterSeriesId}-tier-premium`;
+        await createFilterFixture(`${seriesId}-free`, seriesId, {
+          accessTierOverride: 'free',
+        });
+        const premiumId = await createFilterFixture(
+          `${seriesId}-premium`,
+          seriesId,
+          { accessTierOverride: 'premium' },
+        );
+
+        const response = await request(app.getHttpServer())
+          .get('/admin/media')
+          .query({ seriesId, tier: 'premium' })
+          .set('Authorization', `Bearer ${adminAccessToken}`)
+          .expect(HttpStatus.OK);
+
+        const body = response.body as AdminMediaListResponseDto;
+        expect(body.items.map((item) => item.id)).toEqual([premiumId]);
+        for (const item of body.items) {
+          expect(item.accessTierOverride).toBe('premium');
+        }
+      });
+
+      it('rejects an invalid tier value with a clean 400', async () => {
+        const seriesId = `${filterSeriesId}-tier-invalid`;
+        await request(app.getHttpServer())
+          .get('/admin/media')
+          .query({ seriesId, tier: 'gold' })
+          .set('Authorization', `Bearer ${adminAccessToken}`)
+          .expect(HttpStatus.BAD_REQUEST);
+      });
+
+      it('category filter returns only that category', async () => {
+        const seriesId = `${filterSeriesId}-category`;
+        const dramaId = await createFilterFixture(
+          `${seriesId}-drama`,
+          seriesId,
+          { category: 'drama' },
+        );
+        await createFilterFixture(`${seriesId}-comedy`, seriesId, {
+          category: 'comedy',
+        });
+
+        const response = await request(app.getHttpServer())
+          .get('/admin/media')
+          .query({ seriesId, category: 'drama' })
+          .set('Authorization', `Bearer ${adminAccessToken}`)
+          .expect(HttpStatus.OK);
+
+        const body = response.body as AdminMediaListResponseDto;
+        expect(body.items.map((item) => item.id)).toEqual([dramaId]);
+      });
+
+      it('composes search + status + tier + category + seriesId together (AND semantics), with total/pagination reflecting the filtered set', async () => {
+        const seriesId = `${filterSeriesId}-compose`;
+        const otherSeriesId = `${filterSeriesId}-compose-other`;
+
+        const targetId = await createFilterFixture(
+          `${seriesId}-target`,
+          seriesId,
+          {
+            title: 'Composable Dragon Epic',
+            category: 'drama',
+            accessTierOverride: 'premium',
+            lifecycleState: 'published',
+          },
+        );
+
+        // Same series, matches everything except category.
+        await createFilterFixture(`${seriesId}-wrong-category`, seriesId, {
+          title: 'Composable Dragon Epic',
+          category: 'comedy',
+          accessTierOverride: 'premium',
+          lifecycleState: 'published',
+        });
+        // Same series, matches everything except tier.
+        await createFilterFixture(`${seriesId}-wrong-tier`, seriesId, {
+          title: 'Composable Dragon Epic',
+          category: 'drama',
+          accessTierOverride: 'free',
+          lifecycleState: 'published',
+        });
+        // Same series, matches everything except lifecycle status.
+        await createFilterFixture(`${seriesId}-wrong-status`, seriesId, {
+          title: 'Composable Dragon Epic',
+          category: 'drama',
+          accessTierOverride: 'premium',
+          lifecycleState: 'draft',
+        });
+        // Same series, matches everything except the search term.
+        await createFilterFixture(`${seriesId}-wrong-search`, seriesId, {
+          title: 'Totally Different Title',
+          category: 'drama',
+          accessTierOverride: 'premium',
+          lifecycleState: 'published',
+        });
+        // A different series that otherwise matches every other filter.
+        await createFilterFixture(`${seriesId}-other-series`, otherSeriesId, {
+          title: 'Composable Dragon Epic',
+          category: 'drama',
+          accessTierOverride: 'premium',
+          lifecycleState: 'published',
+        });
+
+        const response = await request(app.getHttpServer())
+          .get('/admin/media')
+          .query({
+            seriesId,
+            search: 'dragon',
+            status: 'published',
+            tier: 'premium',
+            category: 'drama',
+            page: 1,
+            pageSize: 20,
+          })
+          .set('Authorization', `Bearer ${adminAccessToken}`)
+          .expect(HttpStatus.OK);
+
+        const body = response.body as AdminMediaListResponseDto;
+        expect(body.items.map((item) => item.id)).toEqual([targetId]);
+        expect(body.total).toBe(1);
+        expect(body.page).toBe(1);
+        expect(body.pageSize).toBe(20);
+      });
+    });
   });
 
   /**

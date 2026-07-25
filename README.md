@@ -588,6 +588,13 @@ scope.
 
 ## Admin content management API (Phase 11, work units 11E-1..11E-4)
 
+**Frozen contract:** `docs/admin-api-contract.md` is the authoritative,
+frozen reference for this whole admin surface (work unit 11F-5, 2026-07-25)
+— every route, DTO field, status code, and error code the Slice #4
+admin-dashboard wiring (11F-6) and mobile docs (11F-7) target. This section
+remains the narrative writeup; the frozen doc is the source of truth for
+exact shapes.
+
 Four admin-guarded routes across two controllers, layered on top of the
 existing 11B-2/11B-3 admin auth-and-upload foundation described above.
 Every route in this section requires **both** a valid access token

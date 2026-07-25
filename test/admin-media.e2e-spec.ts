@@ -569,4 +569,209 @@ describe('Admin Media (e2e)', () => {
       });
     });
   });
+
+  /**
+   * Work unit 11E-2: `PATCH /admin/media/:id`, a partial metadata edit.
+   * Fixtures are namespaced under `${testSeriesId}-11e2-*`, covered by the
+   * same `afterAll` `startsWith(testSeriesId)` sweep as every other fixture
+   * in this file; none of the 40 seed rows are touched.
+   */
+  describe('PATCH /admin/media/:id (metadata edit)', () => {
+    const patchSeriesId = `${testSeriesId}-11e2-patch`;
+
+    async function createFixture(
+      id: string,
+      overrides: Partial<{
+        lifecycleState: string;
+        objectStorageKey: string | null;
+        likeCount: number;
+        sortOrder: number;
+      }> = {},
+    ): Promise<string> {
+      await prisma.video.create({
+        data: {
+          id,
+          seriesId: patchSeriesId,
+          title: `Patch fixture ${id}`,
+          episodeNumber: 1,
+          channelName: 'E2E Channel',
+          caption: 'Patch fixture caption',
+          category: 'drama',
+          storageKey: '',
+          sourceLanguage: 'zh',
+          hasEmbeddedIndonesianSubtitle: true,
+          likeCount: overrides.likeCount ?? 0,
+          lifecycleState: overrides.lifecycleState ?? 'draft',
+          objectStorageKey: overrides.objectStorageKey ?? null,
+          sortOrder: overrides.sortOrder ?? 0,
+        },
+      });
+      return id;
+    }
+
+    describe('401 — no token', () => {
+      it('returns 401 without a token', async () => {
+        const id = await createFixture(`${patchSeriesId}-401`);
+        await request(app.getHttpServer())
+          .patch(`/admin/media/${id}`)
+          .send({ title: 'New Title' })
+          .expect(HttpStatus.UNAUTHORIZED);
+      });
+    });
+
+    describe('403 — authenticated but not an admin', () => {
+      it('returns 403 ADMIN_ROLE_REQUIRED for a non-admin user', async () => {
+        const id = await createFixture(`${patchSeriesId}-403`);
+        const response = await request(app.getHttpServer())
+          .patch(`/admin/media/${id}`)
+          .set('Authorization', `Bearer ${nonAdminAccessToken}`)
+          .send({ title: 'New Title' })
+          .expect(HttpStatus.FORBIDDEN);
+
+        const body = response.body as ErrorResponseBody;
+        expect(body.code).toBe('ADMIN_ROLE_REQUIRED');
+      });
+    });
+
+    it('updates a single field and returns the updated AdminMediaDto', async () => {
+      const id = await createFixture(`${patchSeriesId}-single`);
+
+      const response = await request(app.getHttpServer())
+        .patch(`/admin/media/${id}`)
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({ title: 'Updated Title' })
+        .expect(HttpStatus.OK);
+
+      const body = response.body as AdminMediaDto;
+      expect(body.id).toBe(id);
+      expect(body.title).toBe('Updated Title');
+      expect(body.caption).toBe('Patch fixture caption');
+    });
+
+    it('updates multiple fields at once', async () => {
+      const id = await createFixture(`${patchSeriesId}-multi`);
+
+      const response = await request(app.getHttpServer())
+        .patch(`/admin/media/${id}`)
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({
+          title: 'Multi Title',
+          caption: 'Multi caption',
+          category: 'comedy',
+          channelName: 'Multi Channel',
+          sourceLanguage: 'en',
+          episodeNumber: 3,
+          hasEmbeddedIndonesianSubtitle: false,
+        })
+        .expect(HttpStatus.OK);
+
+      const body = response.body as AdminMediaDto;
+      expect(body).toMatchObject({
+        id,
+        title: 'Multi Title',
+        caption: 'Multi caption',
+        category: 'comedy',
+        channelName: 'Multi Channel',
+        sourceLanguage: 'en',
+        episodeNumber: 3,
+        hasEmbeddedIndonesianSubtitle: false,
+      });
+    });
+
+    it('preserves lifecycleState, objectStorageKey, likeCount and sortOrder', async () => {
+      const id = await createFixture(`${patchSeriesId}-untouched`, {
+        lifecycleState: 'published',
+        objectStorageKey: 'admin-media/untouched/source',
+        likeCount: 5,
+        sortOrder: 3,
+      });
+
+      const response = await request(app.getHttpServer())
+        .patch(`/admin/media/${id}`)
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({ title: 'Still Untouched Elsewhere' })
+        .expect(HttpStatus.OK);
+
+      const body = response.body as AdminMediaDto;
+      expect(body.title).toBe('Still Untouched Elsewhere');
+      expect(body.lifecycleState).toBe('published');
+      expect(body.objectStorageKey).toBe('admin-media/untouched/source');
+
+      const persisted = await prisma.video.findUnique({ where: { id } });
+      expect(persisted?.likeCount).toBe(5);
+      expect(persisted?.sortOrder).toBe(3);
+      expect(persisted?.lifecycleState).toBe('published');
+      expect(persisted?.objectStorageKey).toBe('admin-media/untouched/source');
+    });
+
+    it('returns 400 EMPTY_MEDIA_METADATA_UPDATE for an empty body', async () => {
+      const id = await createFixture(`${patchSeriesId}-empty`);
+
+      const response = await request(app.getHttpServer())
+        .patch(`/admin/media/${id}`)
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({})
+        .expect(HttpStatus.BAD_REQUEST);
+
+      const body = response.body as ErrorResponseBody;
+      expect(body.code).toBe('EMPTY_MEDIA_METADATA_UPDATE');
+    });
+
+    it('returns 400 for an unknown/non-whitelisted field', async () => {
+      const id = await createFixture(`${patchSeriesId}-unknown-field`);
+
+      await request(app.getHttpServer())
+        .patch(`/admin/media/${id}`)
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({ notARealField: 'nope' })
+        .expect(HttpStatus.BAD_REQUEST);
+    });
+
+    it('returns 400 when an immutable field is included (e.g. lifecycleState)', async () => {
+      const id = await createFixture(`${patchSeriesId}-immutable-field`);
+
+      const response = await request(app.getHttpServer())
+        .patch(`/admin/media/${id}`)
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({ lifecycleState: 'published' })
+        .expect(HttpStatus.BAD_REQUEST);
+
+      const body = response.body as ErrorResponseBody;
+      expect(body.code).toBe('HTTP_ERROR');
+
+      const persisted = await prisma.video.findUnique({ where: { id } });
+      expect(persisted?.lifecycleState).toBe('draft'); // unchanged
+    });
+
+    it('returns 400 for an invalid episodeNumber (0, below the Min(1) constraint)', async () => {
+      const id = await createFixture(`${patchSeriesId}-bad-episode`);
+
+      await request(app.getHttpServer())
+        .patch(`/admin/media/${id}`)
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({ episodeNumber: 0 })
+        .expect(HttpStatus.BAD_REQUEST);
+    });
+
+    it('returns 400 for an over-long title (>200 chars)', async () => {
+      const id = await createFixture(`${patchSeriesId}-long-title`);
+
+      await request(app.getHttpServer())
+        .patch(`/admin/media/${id}`)
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({ title: 'x'.repeat(201) })
+        .expect(HttpStatus.BAD_REQUEST);
+    });
+
+    it('returns 404 VIDEO_NOT_FOUND for a nonexistent id', async () => {
+      const response = await request(app.getHttpServer())
+        .patch('/admin/media/does-not-exist')
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({ title: 'New Title' })
+        .expect(HttpStatus.NOT_FOUND);
+
+      const body = response.body as ErrorResponseBody;
+      expect(body.code).toBe('VIDEO_NOT_FOUND');
+    });
+  });
 });

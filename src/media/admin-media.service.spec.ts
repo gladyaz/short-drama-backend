@@ -455,4 +455,102 @@ describe('AdminMediaService', () => {
       });
     });
   });
+
+  describe('updateMetadata', () => {
+    async function createMedia(): Promise<string> {
+      storageService.createPresignedPutUrl.mockResolvedValue({
+        url: 'https://signed.example.test/put',
+        key: 'k',
+        expiresAt: new Date(),
+      });
+      const created = await service.createUpload(baseDto);
+      return created.media.id;
+    }
+
+    it('updates a single field and leaves the rest unchanged', async () => {
+      const id = await createMedia();
+
+      const result = await service.updateMetadata(id, {
+        title: 'Updated Title',
+      });
+
+      expect(result.title).toBe('Updated Title');
+      expect(result.caption).toBe(baseDto.caption);
+      expect(result.category).toBe(baseDto.category);
+      expect(result.channelName).toBe(baseDto.channelName);
+      expect(result.sourceLanguage).toBe(baseDto.sourceLanguage);
+      expect(result.episodeNumber).toBe(baseDto.episodeNumber);
+      expect(result.hasEmbeddedIndonesianSubtitle).toBe(
+        baseDto.hasEmbeddedIndonesianSubtitle,
+      );
+    });
+
+    it('updates multiple fields at once and returns the updated DTO', async () => {
+      const id = await createMedia();
+
+      const result = await service.updateMetadata(id, {
+        title: 'New Title',
+        caption: 'New caption',
+        category: 'comedy',
+        channelName: 'New Channel',
+        sourceLanguage: 'en',
+        episodeNumber: 7,
+        hasEmbeddedIndonesianSubtitle: false,
+      });
+
+      expect(result).toMatchObject({
+        id,
+        title: 'New Title',
+        caption: 'New caption',
+        category: 'comedy',
+        channelName: 'New Channel',
+        sourceLanguage: 'en',
+        episodeNumber: 7,
+        hasEmbeddedIndonesianSubtitle: false,
+      });
+    });
+
+    it('leaves lifecycle/object-storage/derived fields untouched', async () => {
+      const id = await createMedia();
+      storageService.objectExists.mockResolvedValue(true);
+      await service.completeUpload(id, {
+        durationSeconds: 42,
+        width: 100,
+        height: 200,
+      });
+      await service.publish(id);
+
+      const before = await service.findById(id);
+
+      const result = await service.updateMetadata(id, { title: 'Retitled' });
+
+      expect(result.title).toBe('Retitled');
+      expect(result.lifecycleState).toBe(before.lifecycleState);
+      expect(result.objectStorageKey).toBe(before.objectStorageKey);
+      expect(result.objectStorageVariant).toBe(before.objectStorageVariant);
+      expect(result.coverImageKey).toBe(before.coverImageKey);
+      expect(result.thumbnailImageKey).toBe(before.thumbnailImageKey);
+      expect(result.durationSeconds).toBe(before.durationSeconds);
+      expect(result.width).toBe(before.width);
+      expect(result.height).toBe(before.height);
+
+      const persisted = await prisma.video.findUnique({ where: { id } });
+      expect(persisted?.likeCount).toBe(0);
+      expect(persisted?.sortOrder).toBe(0);
+    });
+
+    it('rejects an empty body with EMPTY_MEDIA_METADATA_UPDATE', async () => {
+      const id = await createMedia();
+
+      await expect(service.updateMetadata(id, {})).rejects.toMatchObject({
+        code: AppErrorCode.EMPTY_MEDIA_METADATA_UPDATE,
+      });
+    });
+
+    it('rejects VIDEO_NOT_FOUND for an unknown id', async () => {
+      await expect(
+        service.updateMetadata('does-not-exist', { title: 'X' }),
+      ).rejects.toMatchObject({ code: AppErrorCode.VIDEO_NOT_FOUND });
+    });
+  });
 });

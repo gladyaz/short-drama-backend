@@ -5,6 +5,7 @@ import {
   HttpCode,
   HttpStatus,
   Param,
+  Patch,
   Post,
   Query,
   UseGuards,
@@ -16,6 +17,7 @@ import { CompleteMediaUploadDto } from './dto/complete-media-upload.dto';
 import { CreateMediaAssetUploadDto } from './dto/create-media-asset-upload.dto';
 import { CreateMediaUploadDto } from './dto/create-media-upload.dto';
 import { ListAdminMediaQueryDto } from './dto/list-admin-media-query.dto';
+import { UpdateMediaMetadataDto } from './dto/update-media-metadata.dto';
 import {
   AdminMediaDto,
   AdminMediaListResponseDto,
@@ -63,6 +65,21 @@ export class AdminMediaController {
   @Get(':id')
   getById(@Param('id') id: string): Promise<AdminMediaDto> {
     return this.adminMediaService.findById(id);
+  }
+
+  /**
+   * Work unit 11E-2: a partial metadata edit. Body validation (per-field
+   * constraints, "at least one field", the global whitelist rejecting
+   * unknown/immutable fields) all happen before `AdminMediaService` is ever
+   * called — see `UpdateMediaMetadataDto` and
+   * `AdminMediaService.updateMetadata`.
+   */
+  @Patch(':id')
+  updateMetadata(
+    @Param('id') id: string,
+    @Body() body: UpdateMediaMetadataDto,
+  ): Promise<AdminMediaDto> {
+    return this.adminMediaService.updateMetadata(id, body);
   }
 
   @HttpCode(HttpStatus.OK)

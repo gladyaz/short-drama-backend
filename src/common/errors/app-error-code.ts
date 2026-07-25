@@ -99,4 +99,12 @@ export enum AppErrorCode {
    * readable directory (missing, or exists but is a file, not a folder).
    */
   DRY_RUN_FOLDER_NOT_FOUND = 'DRY_RUN_FOLDER_NOT_FOUND',
+  // Phase 11, work unit 11E-2 (admin media metadata edit)
+  /**
+   * Returned by `PATCH /admin/media/:id` when the request body contains
+   * none of the seven updatable metadata fields — `UpdateMediaMetadataDto`
+   * itself has no way to require "at least one of N optional fields" as a
+   * single decorator, so this is checked in `AdminMediaService.updateMetadata`.
+   */
+  EMPTY_MEDIA_METADATA_UPDATE = 'EMPTY_MEDIA_METADATA_UPDATE',
 }

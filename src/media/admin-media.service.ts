@@ -8,6 +8,7 @@ import { CompleteMediaUploadDto } from './dto/complete-media-upload.dto';
 import { CreateMediaAssetUploadDto } from './dto/create-media-asset-upload.dto';
 import { CreateMediaUploadDto } from './dto/create-media-upload.dto';
 import { ListAdminMediaQueryDto } from './dto/list-admin-media-query.dto';
+import { UpdateMediaMetadataDto } from './dto/update-media-metadata.dto';
 import { MediaLifecycleService } from './media-lifecycle.service';
 import {
   buildCoverObjectKey,
@@ -25,6 +26,29 @@ import {
 const MEDIA_ID_PREFIX = 'media';
 /** Free-form label for the one rendition this slice ever creates. */
 const SOURCE_VARIANT = 'source';
+
+/**
+ * Work unit 11E-2: the exhaustive whitelist of `Video` columns
+ * `PATCH /admin/media/:id` may write. Deliberately does NOT include
+ * `lifecycleState`, any object-storage key, `storageKey`, `sortOrder`,
+ * `likeCount`, `durationSeconds`/`width`/`height`, or `accessTierOverride`
+ * (11E-3) — see `UpdateMediaMetadataDto`'s class doc for why each of those
+ * is out of scope here. Used by `buildMetadataUpdateData` below as a second,
+ * defense-in-depth whitelist on top of the global `ValidationPipe`'s
+ * `forbidNonWhitelisted`.
+ */
+const UPDATABLE_METADATA_FIELDS = [
+  'title',
+  'caption',
+  'category',
+  'channelName',
+  'sourceLanguage',
+  'episodeNumber',
+  'hasEmbeddedIndonesianSubtitle',
+] as const;
+
+type UpdatableMetadataField = (typeof UPDATABLE_METADATA_FIELDS)[number];
+type MetadataUpdateData = Partial<Pick<VideoRow, UpdatableMetadataField>>;
 
 type VideoRow = {
   id: string;
@@ -190,6 +214,40 @@ export class AdminMediaService {
   }
 
   /**
+   * Work unit 11E-2: a partial metadata edit. Validates the "at least one
+   * field" rule before touching the database (a pure request-validation
+   * concern — `UpdateMediaMetadataDto` cannot express it declaratively),
+   * then 404s via `findMediaOrThrow` for an unknown id, then writes only
+   * the whitelisted fields present in the body. Every other `Video` column
+   * (lifecycle state, object-storage keys, `storageKey`, `sortOrder`,
+   * `likeCount`, dimensions/duration, `accessTierOverride`) is left
+   * completely untouched by this call.
+   */
+  async updateMetadata(
+    id: string,
+    dto: UpdateMediaMetadataDto,
+  ): Promise<AdminMediaDto> {
+    const data = buildMetadataUpdateData(dto);
+
+    if (Object.keys(data).length === 0) {
+      throw new AppException(
+        AppErrorCode.EMPTY_MEDIA_METADATA_UPDATE,
+        'At least one field must be provided',
+        HttpStatus.BAD_REQUEST,
+      );
+    }
+
+    await this.findMediaOrThrow(id);
+
+    const updated = await this.prisma.video.update({
+      where: { id },
+      data,
+    });
+
+    return toAdminMediaDto(updated);
+  }
+
+  /**
    * Work unit 11E-1: the admin inventory list, across ALL five lifecycle
    * states (unlike `VideosService`, which only ever returns `published`
    * rows to the public feed — see the class doc above). Ordered
@@ -283,6 +341,30 @@ export class AdminMediaService {
 
 function asLifecycleState(value: string): MediaLifecycleState {
   return value as MediaLifecycleState;
+}
+
+/**
+ * Work unit 11E-2: narrows an `UpdateMediaMetadataDto` down to a Prisma
+ * `data` object containing only the fields the caller actually provided
+ * (`undefined` entries are skipped, not written as explicit nulls) —
+ * iterating `UPDATABLE_METADATA_FIELDS` rather than `Object.keys(dto)` means
+ * this can never write a field outside that whitelist, even if a future
+ * change to `UpdateMediaMetadataDto` accidentally added one without updating
+ * the constant.
+ */
+function buildMetadataUpdateData(
+  dto: UpdateMediaMetadataDto,
+): MetadataUpdateData {
+  const data: MetadataUpdateData = {};
+
+  for (const field of UPDATABLE_METADATA_FIELDS) {
+    const value = dto[field];
+    if (value !== undefined) {
+      (data as Record<UpdatableMetadataField, unknown>)[field] = value;
+    }
+  }
+
+  return data;
 }
 
 function toAdminMediaDto(record: VideoRow): AdminMediaDto {

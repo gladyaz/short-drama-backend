@@ -7,6 +7,7 @@ import { StorageService } from '../storage/storage.service';
 import { CompleteMediaUploadDto } from './dto/complete-media-upload.dto';
 import { CreateMediaAssetUploadDto } from './dto/create-media-asset-upload.dto';
 import { CreateMediaUploadDto } from './dto/create-media-upload.dto';
+import { ListAdminMediaQueryDto } from './dto/list-admin-media-query.dto';
 import { MediaLifecycleService } from './media-lifecycle.service';
 import {
   buildCoverObjectKey,
@@ -16,6 +17,7 @@ import {
 import { MediaLifecycleState } from './media-lifecycle.types';
 import {
   AdminMediaDto,
+  AdminMediaListResponseDto,
   CreateMediaUploadResponseDto,
   MediaAssetUploadResponseDto,
 } from './media.types';
@@ -185,6 +187,41 @@ export class AdminMediaService {
 
   async findById(id: string): Promise<AdminMediaDto> {
     return toAdminMediaDto(await this.findMediaOrThrow(id));
+  }
+
+  /**
+   * Work unit 11E-1: the admin inventory list, across ALL five lifecycle
+   * states (unlike `VideosService`, which only ever returns `published`
+   * rows to the public feed — see the class doc above). Ordered
+   * deterministically by `sortOrder` then `id`, matching the existing
+   * public-feed ordering convention (`VideosService.findAll`).
+   */
+  async list(
+    query: ListAdminMediaQueryDto,
+  ): Promise<AdminMediaListResponseDto> {
+    const page = query.page;
+    const pageSize = query.pageSize;
+    const where = {
+      ...(query.status ? { lifecycleState: query.status } : {}),
+      ...(query.seriesId ? { seriesId: query.seriesId } : {}),
+    };
+
+    const [rows, total] = await Promise.all([
+      this.prisma.video.findMany({
+        where,
+        orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }],
+        skip: (page - 1) * pageSize,
+        take: pageSize,
+      }),
+      this.prisma.video.count({ where }),
+    ]);
+
+    return {
+      items: rows.map(toAdminMediaDto),
+      total,
+      page,
+      pageSize,
+    };
   }
 
   private async transitionTo(

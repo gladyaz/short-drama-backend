@@ -7,7 +7,10 @@ import { AppExceptionFilter } from './../src/common/filters/app-exception.filter
 import { PrismaService } from './../src/prisma/prisma.service';
 import { StorageService } from './../src/storage/storage.service';
 import type { AuthResponseDto } from './../src/auth/auth.types';
-import type { AdminMediaDto } from './../src/media/media.types';
+import type {
+  AdminMediaDto,
+  AdminMediaListResponseDto,
+} from './../src/media/media.types';
 
 interface ErrorResponseBody {
   statusCode: number;
@@ -115,7 +118,13 @@ describe('Admin Media (e2e)', () => {
   });
 
   afterAll(async () => {
-    await prisma.video.deleteMany({ where: { seriesId: testSeriesId } });
+    // `startsWith`, not an exact match: the work unit 11E-1 `list` tests
+    // below namespace their fixtures under `${testSeriesId}-11e1-*`, so this
+    // one sweep also cleans those up alongside the `testSeriesId` rows the
+    // "admin happy path" tests above create.
+    await prisma.video.deleteMany({
+      where: { seriesId: { startsWith: testSeriesId } },
+    });
     await prisma.user.deleteMany({
       where: { email: { contains: emailPrefix } },
     });
@@ -315,6 +324,249 @@ describe('Admin Media (e2e)', () => {
 
       const body = response.body as ErrorResponseBody;
       expect(body.code).toBe('VIDEO_NOT_FOUND');
+    });
+  });
+
+  /**
+   * Work unit 11E-1: `GET /admin/media`, the paginated/filterable inventory
+   * list across ALL five lifecycle states. Fixtures are written directly via
+   * `prisma.video.create` (matching the existing `VideosService`/
+   * `interactions.service.spec.ts` precedent for seeding rows an HTTP flow
+   * can't easily reach — there is no admin route that transitions a record
+   * to `failed`), namespaced under `${testSeriesId}-11e1-*` so `afterAll`'s
+   * `startsWith(testSeriesId)` sweep cleans them up alongside every other
+   * fixture in this file; none of the 40 seed rows are touched.
+   */
+  describe('GET /admin/media (list)', () => {
+    const listSeriesId = `${testSeriesId}-11e1-list`;
+    const otherSeriesId = `${testSeriesId}-11e1-other`;
+    const paginationSeriesId = `${testSeriesId}-11e1-pagination`;
+
+    async function createFixture(
+      id: string,
+      seriesId: string,
+      lifecycleState: string,
+      sortOrder = 0,
+    ): Promise<string> {
+      await prisma.video.create({
+        data: {
+          id,
+          seriesId,
+          title: `List fixture ${id}`,
+          episodeNumber: 1,
+          channelName: 'E2E Channel',
+          caption: 'List fixture caption',
+          category: 'drama',
+          storageKey: '',
+          sourceLanguage: 'zh',
+          hasEmbeddedIndonesianSubtitle: true,
+          likeCount: 0,
+          lifecycleState,
+          sortOrder,
+        },
+      });
+      return id;
+    }
+
+    describe('401 — no token', () => {
+      it('returns 401 without a token', async () => {
+        await request(app.getHttpServer())
+          .get('/admin/media')
+          .expect(HttpStatus.UNAUTHORIZED);
+      });
+    });
+
+    describe('403 — authenticated but not an admin', () => {
+      it('returns 403 ADMIN_ROLE_REQUIRED for a non-admin user', async () => {
+        const response = await request(app.getHttpServer())
+          .get('/admin/media')
+          .set('Authorization', `Bearer ${nonAdminAccessToken}`)
+          .expect(HttpStatus.FORBIDDEN);
+
+        const body = response.body as ErrorResponseBody;
+        expect(body.code).toBe('ADMIN_ROLE_REQUIRED');
+      });
+    });
+
+    describe('lifecycle-state coverage and filters', () => {
+      let draftId: string;
+      let readyId: string;
+      let publishedId: string;
+      let unpublishedId: string;
+      let failedId: string;
+      let otherSeriesFixtureId: string;
+
+      beforeAll(async () => {
+        draftId = await createFixture(
+          `${listSeriesId}-draft`,
+          listSeriesId,
+          'draft',
+        );
+        readyId = await createFixture(
+          `${listSeriesId}-ready`,
+          listSeriesId,
+          'ready',
+        );
+        publishedId = await createFixture(
+          `${listSeriesId}-published`,
+          listSeriesId,
+          'published',
+        );
+        unpublishedId = await createFixture(
+          `${listSeriesId}-unpublished`,
+          listSeriesId,
+          'unpublished',
+        );
+        failedId = await createFixture(
+          `${listSeriesId}-failed`,
+          listSeriesId,
+          'failed',
+        );
+        otherSeriesFixtureId = await createFixture(
+          `${otherSeriesId}-draft`,
+          otherSeriesId,
+          'draft',
+        );
+      });
+
+      it('lists media rows across every lifecycle state for the given series', async () => {
+        const response = await request(app.getHttpServer())
+          .get('/admin/media')
+          .query({ seriesId: listSeriesId, pageSize: 50 })
+          .set('Authorization', `Bearer ${adminAccessToken}`)
+          .expect(HttpStatus.OK);
+
+        const body = response.body as AdminMediaListResponseDto;
+        const ids = body.items.map((item) => item.id);
+
+        expect(ids).toEqual(
+          expect.arrayContaining([
+            draftId,
+            readyId,
+            publishedId,
+            unpublishedId,
+            failedId,
+          ]),
+        );
+        expect(ids).not.toContain(otherSeriesFixtureId);
+        expect(body.total).toBe(5);
+        expect(body.page).toBe(1);
+        expect(body.pageSize).toBe(50);
+      });
+
+      it('filters by status', async () => {
+        const response = await request(app.getHttpServer())
+          .get('/admin/media')
+          .query({ seriesId: listSeriesId, status: 'failed' })
+          .set('Authorization', `Bearer ${adminAccessToken}`)
+          .expect(HttpStatus.OK);
+
+        const body = response.body as AdminMediaListResponseDto;
+        expect(body.items.map((item) => item.id)).toEqual([failedId]);
+        expect(body.total).toBe(1);
+      });
+
+      it('rejects an invalid status value with a clean 400', async () => {
+        await request(app.getHttpServer())
+          .get('/admin/media')
+          .query({ status: 'not-a-real-state' })
+          .set('Authorization', `Bearer ${adminAccessToken}`)
+          .expect(HttpStatus.BAD_REQUEST);
+      });
+
+      it('filters by seriesId, excluding rows from other series', async () => {
+        const response = await request(app.getHttpServer())
+          .get('/admin/media')
+          .query({ seriesId: otherSeriesId })
+          .set('Authorization', `Bearer ${adminAccessToken}`)
+          .expect(HttpStatus.OK);
+
+        const body = response.body as AdminMediaListResponseDto;
+        expect(body.items.map((item) => item.id)).toEqual([
+          otherSeriesFixtureId,
+        ]);
+      });
+
+      it('GET /admin/media/:id still resolves correctly (no collision with the collection route)', async () => {
+        const response = await request(app.getHttpServer())
+          .get(`/admin/media/${draftId}`)
+          .set('Authorization', `Bearer ${adminAccessToken}`)
+          .expect(HttpStatus.OK);
+
+        expect((response.body as AdminMediaDto).id).toBe(draftId);
+        expect((response.body as AdminMediaDto).lifecycleState).toBe('draft');
+      });
+    });
+
+    describe('pagination', () => {
+      let firstId: string;
+      let secondId: string;
+      let thirdId: string;
+
+      beforeAll(async () => {
+        // Identical `sortOrder` (the default, 0) for all three, so ordering
+        // falls back to the documented `id` ascending tie-break —
+        // deterministic regardless of insertion order.
+        firstId = await createFixture(
+          `${paginationSeriesId}-a`,
+          paginationSeriesId,
+          'draft',
+        );
+        secondId = await createFixture(
+          `${paginationSeriesId}-b`,
+          paginationSeriesId,
+          'draft',
+        );
+        thirdId = await createFixture(
+          `${paginationSeriesId}-c`,
+          paginationSeriesId,
+          'draft',
+        );
+      });
+
+      it('respects page/pageSize and reports a correct total', async () => {
+        const pageOne = await request(app.getHttpServer())
+          .get('/admin/media')
+          .query({ seriesId: paginationSeriesId, page: 1, pageSize: 2 })
+          .set('Authorization', `Bearer ${adminAccessToken}`)
+          .expect(HttpStatus.OK);
+        const pageTwo = await request(app.getHttpServer())
+          .get('/admin/media')
+          .query({ seriesId: paginationSeriesId, page: 2, pageSize: 2 })
+          .set('Authorization', `Bearer ${adminAccessToken}`)
+          .expect(HttpStatus.OK);
+
+        const bodyOne = pageOne.body as AdminMediaListResponseDto;
+        const bodyTwo = pageTwo.body as AdminMediaListResponseDto;
+
+        expect(bodyOne.items).toHaveLength(2);
+        expect(bodyTwo.items).toHaveLength(1);
+        expect(bodyOne.total).toBe(3);
+        expect(bodyTwo.total).toBe(3);
+        expect(bodyOne.page).toBe(1);
+        expect(bodyTwo.page).toBe(2);
+        expect(bodyOne.pageSize).toBe(2);
+
+        const orderedIds = [...bodyOne.items, ...bodyTwo.items].map(
+          (item) => item.id,
+        );
+        expect(orderedIds).toEqual(
+          [firstId, secondId, thirdId].sort((a, b) => (a < b ? -1 : 1)),
+        );
+      });
+
+      it('defaults to page 1 / pageSize 20 when the query omits them', async () => {
+        const response = await request(app.getHttpServer())
+          .get('/admin/media')
+          .query({ seriesId: paginationSeriesId })
+          .set('Authorization', `Bearer ${adminAccessToken}`)
+          .expect(HttpStatus.OK);
+
+        const body = response.body as AdminMediaListResponseDto;
+        expect(body.page).toBe(1);
+        expect(body.pageSize).toBe(20);
+        expect(body.total).toBe(3);
+      });
     });
   });
 });

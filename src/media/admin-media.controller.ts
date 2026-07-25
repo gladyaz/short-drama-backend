@@ -6,6 +6,7 @@ import {
   HttpStatus,
   Param,
   Post,
+  Query,
   UseGuards,
 } from '@nestjs/common';
 import { AdminGuard } from '../admin/guards/admin.guard';
@@ -14,8 +15,10 @@ import { AdminMediaService } from './admin-media.service';
 import { CompleteMediaUploadDto } from './dto/complete-media-upload.dto';
 import { CreateMediaAssetUploadDto } from './dto/create-media-asset-upload.dto';
 import { CreateMediaUploadDto } from './dto/create-media-upload.dto';
+import { ListAdminMediaQueryDto } from './dto/list-admin-media-query.dto';
 import {
   AdminMediaDto,
+  AdminMediaListResponseDto,
   CreateMediaUploadResponseDto,
   MediaAssetUploadResponseDto,
 } from './media.types';
@@ -39,6 +42,22 @@ export class AdminMediaController {
     @Body() body: CreateMediaUploadDto,
   ): Promise<CreateMediaUploadResponseDto> {
     return this.adminMediaService.createUpload(body);
+  }
+
+  /**
+   * Work unit 11E-1: the admin inventory list. Declared as a bare `@Get()`
+   * (matches only the exact `/admin/media` collection path) ABOVE the
+   * `@Get(':id')` item route below — Nest/Express route matching is
+   * path-shape based, not declaration-order based, for these two (a
+   * one-segment `:id` path never matches the zero-extra-segment collection
+   * path or vice versa), but keeping the collection route first mirrors the
+   * REST convention of listing the collection before a single item.
+   */
+  @Get()
+  list(
+    @Query() query: ListAdminMediaQueryDto,
+  ): Promise<AdminMediaListResponseDto> {
+    return this.adminMediaService.list(query);
   }
 
   @Get(':id')

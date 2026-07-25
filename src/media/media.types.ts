@@ -40,3 +40,16 @@ export interface MediaAssetUploadResponseDto {
   media: AdminMediaDto;
   upload: PresignedUploadDto;
 }
+
+/**
+ * Response of `GET /admin/media` (work unit 11E-1): a paginated slice of
+ * the admin inventory, across ALL lifecycle states (draft/ready/published/
+ * unpublished/failed) — unlike the public feed, which only ever returns
+ * `published` rows.
+ */
+export interface AdminMediaListResponseDto {
+  items: AdminMediaDto[];
+  total: number;
+  page: number;
+  pageSize: number;
+}

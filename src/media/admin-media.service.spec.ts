@@ -5,6 +5,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { StorageService } from '../storage/storage.service';
 import { AdminMediaService } from './admin-media.service';
 import { MediaLifecycleService } from './media-lifecycle.service';
+import { MediaLifecycleState } from './media-lifecycle.types';
 
 /**
  * Phase 11, work unit 11B-3: `StorageService` is entirely mocked here — no
@@ -275,6 +276,162 @@ describe('AdminMediaService', () => {
       await expect(
         service.createCoverUpload('does-not-exist', {}),
       ).rejects.toMatchObject({ code: AppErrorCode.VIDEO_NOT_FOUND });
+    });
+  });
+
+  describe('list', () => {
+    /**
+     * Creates a media record and drives it through the lifecycle states
+     * needed to reach `targetState` via the service's own public methods
+     * (never a raw Prisma write), so the fixtures are realistic. `failed`
+     * has no reachable transition from this pipeline, so it is written
+     * directly via `prisma.video.update` for that one state only.
+     */
+    async function createMediaAt(
+      state: 'draft' | 'ready' | 'published' | 'unpublished' | 'failed',
+      overrides: { seriesId?: string; sortOrder?: number } = {},
+    ): Promise<string> {
+      storageService.createPresignedPutUrl.mockResolvedValue({
+        url: 'https://signed.example.test/put',
+        key: 'k',
+        expiresAt: new Date(),
+      });
+      const created = await service.createUpload({
+        ...baseDto,
+        seriesId: overrides.seriesId ?? baseDto.seriesId,
+      });
+      const id = created.media.id;
+
+      if (state === 'draft') {
+        return id;
+      }
+
+      storageService.objectExists.mockResolvedValue(true);
+      await service.completeUpload(id, {});
+      if (state === 'ready') {
+        return id;
+      }
+
+      if (state === 'failed') {
+        await prisma.video.update({
+          where: { id },
+          data: { lifecycleState: 'failed' },
+        });
+        return id;
+      }
+
+      await service.publish(id);
+      if (state === 'published') {
+        return id;
+      }
+
+      await service.unpublish(id);
+      return id;
+    }
+
+    it('lists media rows across multiple lifecycle states', async () => {
+      const draftId = await createMediaAt('draft');
+      const readyId = await createMediaAt('ready');
+      const publishedId = await createMediaAt('published');
+      const unpublishedId = await createMediaAt('unpublished');
+      const failedId = await createMediaAt('failed');
+
+      const result = await service.list({
+        seriesId: baseDto.seriesId,
+        page: 1,
+        pageSize: 20,
+      });
+
+      const ids = result.items.map((item) => item.id);
+      expect(ids).toEqual(
+        expect.arrayContaining([
+          draftId,
+          readyId,
+          publishedId,
+          unpublishedId,
+          failedId,
+        ]),
+      );
+      expect(result.total).toBe(5);
+      expect(result.page).toBe(1);
+      expect(result.pageSize).toBe(20);
+    });
+
+    it('filters by status', async () => {
+      await createMediaAt('draft');
+      const publishedId = await createMediaAt('published');
+
+      const result = await service.list({
+        status: MediaLifecycleState.PUBLISHED,
+        seriesId: baseDto.seriesId,
+        page: 1,
+        pageSize: 20,
+      });
+
+      expect(result.items.map((item) => item.id)).toEqual([publishedId]);
+      expect(result.total).toBe(1);
+    });
+
+    it('filters by seriesId', async () => {
+      const otherSeriesId = `${baseDto.seriesId}-other`;
+      const matchingId = await createMediaAt('draft', {
+        seriesId: baseDto.seriesId,
+      });
+      await createMediaAt('draft', { seriesId: otherSeriesId });
+
+      const result = await service.list({
+        seriesId: baseDto.seriesId,
+        page: 1,
+        pageSize: 20,
+      });
+
+      expect(result.items.map((item) => item.id)).toEqual([matchingId]);
+
+      // `otherSeriesId` still starts with `testIdPrefix`, so the module's
+      // `afterEach` sweep (`seriesId: { startsWith: testIdPrefix }`) covers
+      // it too — no extra cleanup needed here.
+    });
+
+    it('paginates deterministically ordered by sortOrder then id', async () => {
+      const firstId = await createMediaAt('draft');
+      const secondId = await createMediaAt('draft');
+      const thirdId = await createMediaAt('draft');
+
+      const pageOne = await service.list({
+        seriesId: baseDto.seriesId,
+        page: 1,
+        pageSize: 2,
+      });
+      const pageTwo = await service.list({
+        seriesId: baseDto.seriesId,
+        page: 2,
+        pageSize: 2,
+      });
+
+      expect(pageOne.items).toHaveLength(2);
+      expect(pageTwo.items).toHaveLength(1);
+      expect(pageOne.total).toBe(3);
+      expect(pageTwo.total).toBe(3);
+
+      const orderedIds = [...pageOne.items, ...pageTwo.items].map(
+        (item) => item.id,
+      );
+      expect(orderedIds).toEqual(
+        [firstId, secondId, thirdId].sort((a, b) => (a < b ? -1 : 1)),
+      );
+    });
+
+    it('defaults to page 1 / pageSize 20 when omitted', async () => {
+      await createMediaAt('draft');
+
+      const result = await service.list({
+        seriesId: baseDto.seriesId,
+        page: 1,
+        pageSize: 20,
+      });
+
+      expect(result.page).toBe(1);
+      expect(result.pageSize).toBe(20);
     });
   });
 

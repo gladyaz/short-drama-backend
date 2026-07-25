@@ -230,6 +230,43 @@ describe('VideosService', () => {
     });
   });
 
+  describe('getStreamGuardInfo (work unit 11E-3)', () => {
+    it('returns episodeNumber and a null accessTierOverride for a fixture row created without one', async () => {
+      const info = await service.getStreamGuardInfo(testVideos[0].id);
+      expect(info).toEqual({
+        episodeNumber: testVideos[0].episodeNumber,
+        accessTierOverride: null,
+      });
+    });
+
+    it('returns the raw accessTierOverride value when one is set', async () => {
+      await prisma.video.update({
+        where: { id: testVideos[0].id },
+        data: { accessTierOverride: 'premium' },
+      });
+
+      const info = await service.getStreamGuardInfo(testVideos[0].id);
+      expect(info.accessTierOverride).toBe('premium');
+    });
+
+    it('throws VIDEO_NOT_FOUND for an unknown id', async () => {
+      await expect(
+        service.getStreamGuardInfo('does-not-exist'),
+      ).rejects.toMatchObject({ code: AppErrorCode.VIDEO_NOT_FOUND });
+    });
+
+    it('throws VIDEO_NOT_FOUND for a video that exists but is not "published"', async () => {
+      await prisma.video.update({
+        where: { id: testVideos[0].id },
+        data: { lifecycleState: 'draft' },
+      });
+
+      await expect(
+        service.getStreamGuardInfo(testVideos[0].id),
+      ).rejects.toMatchObject({ code: AppErrorCode.VIDEO_NOT_FOUND });
+    });
+  });
+
   describe('resolveStreamableFile', () => {
     it('returns the absolute path and size when the media file exists', async () => {
       mockedFs.existsSync.mockReturnValue(true);

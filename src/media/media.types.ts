@@ -23,6 +23,14 @@ export interface AdminMediaDto {
   durationSeconds: number | null;
   width: number | null;
   height: number | null;
+  /**
+   * Work unit 11E-3: the raw per-episode access-tier override, exposed here
+   * (the admin-only DTO) and deliberately NOT on the public
+   * `VideoResponseDto` in `../videos/video.types.ts` — the public feed shape
+   * is unchanged by this work unit. `null` means "no override, use the
+   * default `episodeNumber >= FREE_EPISODE_LIMIT` rule".
+   */
+  accessTierOverride: 'free' | 'premium' | null;
 }
 
 export interface PresignedUploadDto {

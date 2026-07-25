@@ -23,10 +23,11 @@ import {
  * Deliberately excludes every other `Video` column — `lifecycleState`,
  * `objectStorageKey`/`objectStorageVariant`, `coverImageKey`/
  * `thumbnailImageKey`, `storageKey`, `sortOrder`, `likeCount`,
- * `durationSeconds`/`width`/`height`, and `accessTierOverride` (11E-3,
- * not yet landed) are all out of scope for this route; each either has its
- * own dedicated route already (lifecycle transitions, asset uploads) or is
- * never admin-editable via this endpoint. The global
+ * `durationSeconds`/`width`/`height`, and `accessTierOverride` are all out
+ * of scope for this route; each either has its own dedicated route already
+ * (lifecycle transitions, asset uploads, or — for `accessTierOverride`,
+ * work unit 11E-3 — `PATCH /admin/media/:id/access-tier`) or is never
+ * admin-editable via this endpoint. The global
  * `ValidationPipe({ whitelist: true, forbidNonWhitelisted: true })` in
  * `main.ts` rejects a request body containing any of those, or any other
  * unrecognized field, with a 400 before this DTO is even constructed.

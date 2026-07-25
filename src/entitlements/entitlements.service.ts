@@ -30,6 +30,38 @@ export class EntitlementsService {
   }
 
   /**
+   * Work unit 11E-3: per-episode admin access-tier override resolution,
+   * used by `VideosController#streamVideo` in place of a direct
+   * `isEpisodePremium` call. `accessTierOverride` is the raw nullable
+   * `Video.accessTierOverride` column value (set/cleared via the guarded
+   * `PATCH /admin/media/:id/access-tier` endpoint): `"premium"` and
+   * `"free"` unconditionally decide the outcome regardless of
+   * `episodeNumber`; anything else (`null`/`undefined` — the state of every
+   * one of the 40 pre-existing rows, and of any row an admin has never
+   * explicitly overridden) falls back UNCHANGED to the existing
+   * `isEpisodePremium` rule below. This is purely additive: `isEpisodePremium`
+   * itself is untouched, so this method's null-override branch always
+   * returns exactly what the old default rule already returned.
+   */
+  resolveEpisodePremium(
+    input: {
+      accessTierOverride: string | null | undefined;
+      episodeNumber: number;
+    },
+    freeEpisodeLimit: number,
+  ): boolean {
+    if (input.accessTierOverride === 'premium') {
+      return true;
+    }
+
+    if (input.accessTierOverride === 'free') {
+      return false;
+    }
+
+    return this.isEpisodePremium(input.episodeNumber, freeEpisodeLimit);
+  }
+
+  /**
    * Whether `userId` currently holds an active premium entitlement. Used
    * both by the stream guard (10-B3) and the status endpoint (10-B4).
    */

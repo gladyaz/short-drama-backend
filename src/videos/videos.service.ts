@@ -73,14 +73,45 @@ export class VideosService {
     return { record, absolutePath, fileSize };
   }
 
+  /**
+   * Work unit 11E-3: the minimal lookup `VideosController#streamVideo` uses
+   * to resolve the premium/free decision for `id`, before any entitlement
+   * check or filesystem access. Deliberately returns only `episodeNumber`
+   * and `accessTierOverride` — NOT the full `VideoRecord`/`VideoResponseDto`
+   * — since `accessTierOverride` must never reach the public API surface
+   * (see `AdminMediaDto` in `src/media/media.types.ts` for its only intended
+   * external exposure). Applies the same "not published -> VIDEO_NOT_FOUND"
+   * rule as `findById`/`resolveStreamableFile` (via the shared
+   * `findPublishedRow` helper), so an unpublished/nonexistent id behaves
+   * identically at this stage of the stream pipeline too.
+   */
+  async getStreamGuardInfo(
+    id: string,
+  ): Promise<{ episodeNumber: number; accessTierOverride: string | null }> {
+    const record = await this.findPublishedRow(id);
+    return {
+      episodeNumber: record.episodeNumber,
+      accessTierOverride: record.accessTierOverride,
+    };
+  }
+
   private async findRecordById(id: string): Promise<VideoRecord> {
+    return this.toVideoRecord(await this.findPublishedRow(id));
+  }
+
+  /**
+   * Shared by `findRecordById` (and transitively `findById`/
+   * `resolveStreamableFile`) and `getStreamGuardInfo`: fetches the raw
+   * Prisma row and enforces the existing "must be published" rule. A row
+   * that exists but is not `published` (Phase 11, work unit 11B-3: a
+   * draft/ready/unpublished/failed row from the admin media pipeline) is
+   * treated identically to a nonexistent one — the same `VIDEO_NOT_FOUND`
+   * outcome, deliberately not a distinct code, so a caller cannot use this
+   * endpoint to enumerate unpublished ids.
+   */
+  private async findPublishedRow(id: string) {
     const record = await this.prisma.video.findUnique({ where: { id } });
-    // A row that exists but is not `published` (Phase 11, work unit 11B-3:
-    // a draft/ready/unpublished/failed row from the admin media pipeline)
-    // is treated identically to a nonexistent one for every public-facing
-    // lookup (`findById`, and transitively `resolveStreamableFile`) — the
-    // same `VIDEO_NOT_FOUND` outcome, deliberately not a distinct code, so
-    // a caller cannot use this endpoint to enumerate unpublished ids.
+
     if (
       !record ||
       record.lifecycleState !== (MediaLifecycleState.PUBLISHED as string)
@@ -91,7 +122,8 @@ export class VideosService {
         HttpStatus.NOT_FOUND,
       );
     }
-    return this.toVideoRecord(record);
+
+    return record;
   }
 
   /**

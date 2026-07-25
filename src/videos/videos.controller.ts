@@ -41,6 +41,14 @@ export class VideosController {
    * below runs before `resolveStreamableFile()` touches the filesystem, so a
    * denied request never opens a file handle for a video it isn't allowed
    * to read.
+   *
+   * Phase 11, work unit 11E-3: the premium/free decision itself now goes
+   * through `EntitlementsService.resolveEpisodePremium`, which honors a
+   * per-episode `accessTierOverride` (set via the admin-guarded
+   * `PATCH /admin/media/:id/access-tier`) when one is set, and otherwise
+   * falls back UNCHANGED to the original `episodeNumber >=
+   * FREE_EPISODE_LIMIT` rule — every one of the 40 pre-existing rows has no
+   * override, so this is behavior-preserving for them.
    */
   @UseGuards(JwtAuthGuard)
   @Get(':id/stream')
@@ -50,11 +58,11 @@ export class VideosController {
     @Req() req: Request,
     @Res() res: Response,
   ): Promise<void> {
-    const video = await this.videosService.findById(id);
+    const guardInfo = await this.videosService.getStreamGuardInfo(id);
 
     if (
-      this.entitlementsService.isEpisodePremium(
-        video.episodeNumber,
+      this.entitlementsService.resolveEpisodePremium(
+        guardInfo,
         FREE_EPISODE_LIMIT,
       ) &&
       !(await this.entitlementsService.isEntitled(user.id))

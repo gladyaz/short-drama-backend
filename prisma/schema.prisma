@@ -106,6 +106,23 @@ model Video {
   /// column default (which exists for backfill safety, not as the intended
   /// state for freshly created rows).
   lifecycleState                String  @default("published")
+  /// Phase 11, work unit 11E-3: per-episode admin access-tier override.
+  /// Nullable with NO default, so every one of the 40 pre-existing rows (and
+  /// every caller that creates/updates a `Video` without specifying it, e.g.
+  /// `seed.ts`, `AdminMediaService.createUpload`) keeps compiling and
+  /// backfills to `null` — the additive migration for this column changes no
+  /// existing row's value. `null` means "no override, use the default
+  /// `episodeNumber >= FREE_EPISODE_LIMIT` rule" (see
+  /// `EntitlementsService.resolveEpisodePremium`, which is the ONLY code path
+  /// that reads this column); `"premium"`/`"free"` unconditionally decide the
+  /// outcome regardless of `episodeNumber`. A plain string, not a Postgres
+  /// enum, matching the existing `Video.category`/`Entitlement.tier`
+  /// precedent — set/cleared only via the guarded
+  /// `PATCH /admin/media/:id/access-tier` endpoint
+  /// (`UpdateAccessTierDto` validates it to exactly `"free" | "premium" |
+  /// null`). Deliberately NOT exposed on the public `VideoResponseDto` — see
+  /// `AdminMediaDto` for its only intended external exposure.
+  accessTierOverride            String?
 
   @@index([seriesId])
   @@index([sortOrder])

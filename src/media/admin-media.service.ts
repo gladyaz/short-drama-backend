@@ -8,6 +8,7 @@ import { CompleteMediaUploadDto } from './dto/complete-media-upload.dto';
 import { CreateMediaAssetUploadDto } from './dto/create-media-asset-upload.dto';
 import { CreateMediaUploadDto } from './dto/create-media-upload.dto';
 import { ListAdminMediaQueryDto } from './dto/list-admin-media-query.dto';
+import { UpdateAccessTierDto } from './dto/update-access-tier.dto';
 import { UpdateMediaMetadataDto } from './dto/update-media-metadata.dto';
 import { MediaLifecycleService } from './media-lifecycle.service';
 import {
@@ -47,6 +48,15 @@ const UPDATABLE_METADATA_FIELDS = [
   'hasEmbeddedIndonesianSubtitle',
 ] as const;
 
+/**
+ * Work unit 11E-3: the three values `Video.accessTierOverride` may hold.
+ * `null` clears the override. `UpdateAccessTierDto`'s `@IsIn` already
+ * rejects anything outside this set before `updateAccessTier` below is
+ * ever called, so casting the validated `dto.tier` to this type here is
+ * safe.
+ */
+type AccessTierOverride = 'free' | 'premium' | null;
+
 type UpdatableMetadataField = (typeof UPDATABLE_METADATA_FIELDS)[number];
 type MetadataUpdateData = Partial<Pick<VideoRow, UpdatableMetadataField>>;
 
@@ -68,6 +78,7 @@ type VideoRow = {
   durationSeconds: number | null;
   width: number | null;
   height: number | null;
+  accessTierOverride: string | null;
 };
 
 /**
@@ -248,6 +259,30 @@ export class AdminMediaService {
   }
 
   /**
+   * Work unit 11E-3: sets or clears the per-episode `accessTierOverride`.
+   * `dto.tier` has already been validated by `UpdateAccessTierDto`'s
+   * `@IsIn(['free', 'premium', null])` to be exactly one of those three
+   * values before this method is ever called. 404s via `findMediaOrThrow`
+   * for an unknown id, matching `updateMetadata`'s precedent. Writes ONLY
+   * `accessTierOverride` — every other `Video` column (lifecycle state,
+   * object-storage keys, metadata fields, `sortOrder`, `likeCount`,
+   * dimensions/duration) is left completely untouched by this call.
+   */
+  async updateAccessTier(
+    id: string,
+    dto: UpdateAccessTierDto,
+  ): Promise<AdminMediaDto> {
+    await this.findMediaOrThrow(id);
+
+    const updated = await this.prisma.video.update({
+      where: { id },
+      data: { accessTierOverride: dto.tier },
+    });
+
+    return toAdminMediaDto(updated);
+  }
+
+  /**
    * Work unit 11E-1: the admin inventory list, across ALL five lifecycle
    * states (unlike `VideosService`, which only ever returns `published`
    * rows to the public feed — see the class doc above). Ordered
@@ -386,7 +421,19 @@ function toAdminMediaDto(record: VideoRow): AdminMediaDto {
     durationSeconds: record.durationSeconds,
     width: record.width,
     height: record.height,
+    accessTierOverride: asAccessTierOverride(record.accessTierOverride),
   };
+}
+
+/**
+ * Narrows the DB column's plain `string | null` type to the DTO's
+ * `'free' | 'premium' | null` union. Safe because `updateAccessTier` is the
+ * only write path for this column (besides the additive migration, which
+ * only ever produces `null`) and it is gated by `UpdateAccessTierDto`'s
+ * `@IsIn(['free', 'premium', null])`.
+ */
+function asAccessTierOverride(value: string | null): AccessTierOverride {
+  return value as AccessTierOverride;
 }
 
 function toPresignedUploadDto(presigned: {

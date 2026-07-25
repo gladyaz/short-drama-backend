@@ -17,6 +17,7 @@ import { CompleteMediaUploadDto } from './dto/complete-media-upload.dto';
 import { CreateMediaAssetUploadDto } from './dto/create-media-asset-upload.dto';
 import { CreateMediaUploadDto } from './dto/create-media-upload.dto';
 import { ListAdminMediaQueryDto } from './dto/list-admin-media-query.dto';
+import { UpdateAccessTierDto } from './dto/update-access-tier.dto';
 import { UpdateMediaMetadataDto } from './dto/update-media-metadata.dto';
 import {
   AdminMediaDto,
@@ -80,6 +81,24 @@ export class AdminMediaController {
     @Body() body: UpdateMediaMetadataDto,
   ): Promise<AdminMediaDto> {
     return this.adminMediaService.updateMetadata(id, body);
+  }
+
+  /**
+   * Work unit 11E-3: sets or clears the per-episode `accessTierOverride`
+   * (`tier: "free" | "premium" | null`). A distinct, more specific route
+   * than `PATCH /admin/media/:id` above (Nest/Express route matching is
+   * path-shape based: `:id/access-tier` never collides with the bare `:id`
+   * route), kept separate deliberately — the two-segment path shape mirrors
+   * the existing `:id/complete-upload`, `:id/publish`, `:id/unpublish`
+   * lifecycle-transition routes rather than folding a monetization-sensitive
+   * field into the general metadata-edit body.
+   */
+  @Patch(':id/access-tier')
+  updateAccessTier(
+    @Param('id') id: string,
+    @Body() body: UpdateAccessTierDto,
+  ): Promise<AdminMediaDto> {
+    return this.adminMediaService.updateAccessTier(id, body);
   }
 
   @HttpCode(HttpStatus.OK)

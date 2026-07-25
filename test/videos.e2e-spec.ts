@@ -205,4 +205,190 @@ describe('Videos (e2e)', () => {
       await prisma.entitlement.deleteMany({ where: { userId } });
     });
   });
+
+  /**
+   * Work unit 11E-3: per-episode `accessTierOverride`. Fixtures are created
+   * directly via `prisma.video.create` (mirroring `admin-media.e2e-spec.ts`'s
+   * fixture pattern) with an empty `storageKey` — there is no real file on
+   * disk for a synthetic id, so a request that gets PAST the entitlement gate
+   * reaches `MEDIA_FILE_NOT_FOUND` (404) rather than 206, exactly the
+   * "206 or a file-not-found" outcome the work unit's acceptance criteria
+   * calls for. What matters for every assertion below is 403
+   * (`ENTITLEMENT_REQUIRED`) vs. NOT 403 — the override's only real job is
+   * deciding whether the entitlement gate applies at all.
+   *
+   * Setup for each override value uses direct `prisma.video.create`/`update`
+   * calls, not the real `PATCH /admin/media/:id/access-tier` HTTP endpoint —
+   * that endpoint's own request/response contract (guards, validation,
+   * persistence) is independently covered end-to-end in
+   * `test/admin-media.e2e-spec.ts`. Together the two files cover both halves
+   * of the feature: does the admin endpoint correctly persist the override,
+   * and does the stream guard correctly honor whatever is persisted.
+   */
+  describe('GET /videos/:id/stream — per-episode access-tier override (Phase 11, work unit 11E-3)', () => {
+    const overrideSeriesId = `${emailPrefix}-11e3-override`;
+
+    async function createOverrideFixture(
+      idSuffix: string,
+      episodeNumber: number,
+      accessTierOverride: string | null,
+    ): Promise<string> {
+      const id = `${overrideSeriesId}-${idSuffix}`;
+      await prisma.video.create({
+        data: {
+          id,
+          seriesId: overrideSeriesId,
+          title: `Override fixture ${id}`,
+          episodeNumber,
+          channelName: 'E2E Channel',
+          caption: 'Override fixture caption',
+          category: 'drama',
+          storageKey: '',
+          sourceLanguage: 'zh',
+          hasEmbeddedIndonesianSubtitle: true,
+          likeCount: 0,
+          lifecycleState: 'published',
+          accessTierOverride,
+        },
+      });
+      return id;
+    }
+
+    afterAll(async () => {
+      await prisma.video.deleteMany({
+        where: { seriesId: overrideSeriesId },
+      });
+    });
+
+    it('the 40 pre-existing seed rows backfilled to a null accessTierOverride (migration additivity)', async () => {
+      const free = await prisma.video.findUnique({
+        where: { id: freeEpisodeId },
+      });
+      const premium = await prisma.video.findUnique({
+        where: { id: premiumEpisodeId },
+      });
+
+      expect(free?.accessTierOverride).toBeNull();
+      expect(premium?.accessTierOverride).toBeNull();
+    });
+
+    it('CRITICAL default-preserving: a free episode (episodeNumber <= FREE_EPISODE_LIMIT) with a null override still streams without an entitlement, exactly as today', async () => {
+      const id = await createOverrideFixture('free-null', 1, null);
+
+      const response = await request(app.getHttpServer())
+        .get(`/videos/${id}/stream`)
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.NOT_FOUND); // no real file — but crucially NOT 403
+
+      const body = response.body as ErrorResponseBody;
+      expect(body.code).toBe('MEDIA_FILE_NOT_FOUND');
+    });
+
+    it('CRITICAL default-preserving: a premium episode (episodeNumber > FREE_EPISODE_LIMIT) with a null override still requires an entitlement, exactly as today', async () => {
+      const id = await createOverrideFixture('premium-null', 6, null);
+
+      const response = await request(app.getHttpServer())
+        .get(`/videos/${id}/stream`)
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.FORBIDDEN);
+
+      const body = response.body as ErrorResponseBody;
+      expect(body.code).toBe('ENTITLEMENT_REQUIRED');
+    });
+
+    it('override "premium" on an otherwise-free episode now requires an entitlement (403 without, past the gate with)', async () => {
+      const id = await createOverrideFixture('forced-premium', 1, 'premium');
+
+      const withoutEntitlement = await request(app.getHttpServer())
+        .get(`/videos/${id}/stream`)
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.FORBIDDEN);
+      expect((withoutEntitlement.body as ErrorResponseBody).code).toBe(
+        'ENTITLEMENT_REQUIRED',
+      );
+
+      await prisma.entitlement.create({
+        data: { userId, tier: 'premium', source: 'dev-grant' },
+      });
+
+      const withEntitlement = await request(app.getHttpServer())
+        .get(`/videos/${id}/stream`)
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.NOT_FOUND); // past the entitlement gate, no real file
+      expect((withEntitlement.body as ErrorResponseBody).code).toBe(
+        'MEDIA_FILE_NOT_FOUND',
+      );
+
+      await prisma.entitlement.deleteMany({ where: { userId } });
+    });
+
+    it('override "free" on an otherwise-premium episode is streamable without an entitlement (gets past the 403)', async () => {
+      const id = await createOverrideFixture('forced-free', 6, 'free');
+
+      const response = await request(app.getHttpServer())
+        .get(`/videos/${id}/stream`)
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.NOT_FOUND); // no entitlement, no real file — but crucially NOT 403
+
+      const body = response.body as ErrorResponseBody;
+      expect(body.code).toBe('MEDIA_FILE_NOT_FOUND');
+    });
+
+    it('clearing the override (accessTierOverride -> null) reverts a premium-forced episode back to the default rule', async () => {
+      const id = await createOverrideFixture('clear-reverts', 6, 'free');
+
+      // sanity: the "free" override currently gets past the entitlement gate.
+      const overridden = await request(app.getHttpServer())
+        .get(`/videos/${id}/stream`)
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.NOT_FOUND);
+      expect((overridden.body as ErrorResponseBody).code).toBe(
+        'MEDIA_FILE_NOT_FOUND',
+      );
+
+      await prisma.video.update({
+        where: { id },
+        data: { accessTierOverride: null },
+      });
+
+      // reverted: episode 6 > FREE_EPISODE_LIMIT (5) -> premium again, per the
+      // unchanged default rule.
+      const reverted = await request(app.getHttpServer())
+        .get(`/videos/${id}/stream`)
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.FORBIDDEN);
+      expect((reverted.body as ErrorResponseBody).code).toBe(
+        'ENTITLEMENT_REQUIRED',
+      );
+    });
+
+    it('clearing the override reverts a free-forced episode back to streaming without an entitlement', async () => {
+      const id = await createOverrideFixture(
+        'clear-reverts-to-free',
+        1,
+        'premium',
+      );
+
+      // sanity: the "premium" override currently requires an entitlement.
+      await request(app.getHttpServer())
+        .get(`/videos/${id}/stream`)
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.FORBIDDEN);
+
+      await prisma.video.update({
+        where: { id },
+        data: { accessTierOverride: null },
+      });
+
+      // reverted: episode 1 <= FREE_EPISODE_LIMIT (5) -> free again, per the
+      // unchanged default rule.
+      const reverted = await request(app.getHttpServer())
+        .get(`/videos/${id}/stream`)
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.NOT_FOUND);
+      expect((reverted.body as ErrorResponseBody).code).toBe(
+        'MEDIA_FILE_NOT_FOUND',
+      );
+    });
+  });
 });

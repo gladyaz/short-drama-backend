@@ -215,7 +215,10 @@ describe('Admin Media (e2e)', () => {
         .set('Authorization', `Bearer ${adminAccessToken}`)
         .expect(HttpStatus.OK);
 
-      expect((response.body as AdminMediaDto).lifecycleState).toBe('draft');
+      const body = response.body as AdminMediaDto;
+      expect(body.lifecycleState).toBe('draft');
+      // Work unit 11E-3: a freshly created row has no override yet.
+      expect(body.accessTierOverride).toBeNull();
     });
 
     it('the draft is invisible to the public feed and GET /videos/:id', async () => {
@@ -768,6 +771,172 @@ describe('Admin Media (e2e)', () => {
         .patch('/admin/media/does-not-exist')
         .set('Authorization', `Bearer ${adminAccessToken}`)
         .send({ title: 'New Title' })
+        .expect(HttpStatus.NOT_FOUND);
+
+      const body = response.body as ErrorResponseBody;
+      expect(body.code).toBe('VIDEO_NOT_FOUND');
+    });
+  });
+
+  /**
+   * Work unit 11E-3: `PATCH /admin/media/:id/access-tier`, setting/clearing
+   * the per-episode `accessTierOverride`. Fixtures are namespaced under
+   * `${testSeriesId}-11e3-*`, covered by the same `afterAll`
+   * `startsWith(testSeriesId)` sweep as every other fixture in this file;
+   * none of the 40 seed rows are touched. The stream-guard integration
+   * itself (does the override actually change 403 vs. non-403 behavior) is
+   * covered separately in `test/videos.e2e-spec.ts`, since that requires
+   * the `/videos/:id/stream` route, not this admin route.
+   */
+  describe('PATCH /admin/media/:id/access-tier (access-tier override)', () => {
+    const accessTierSeriesId = `${testSeriesId}-11e3-access-tier`;
+
+    async function createFixture(
+      id: string,
+      overrides: Partial<{ accessTierOverride: string | null }> = {},
+    ): Promise<string> {
+      await prisma.video.create({
+        data: {
+          id,
+          seriesId: accessTierSeriesId,
+          title: `Access-tier fixture ${id}`,
+          episodeNumber: 1,
+          channelName: 'E2E Channel',
+          caption: 'Access-tier fixture caption',
+          category: 'drama',
+          storageKey: '',
+          sourceLanguage: 'zh',
+          hasEmbeddedIndonesianSubtitle: true,
+          likeCount: 0,
+          lifecycleState: 'published',
+          accessTierOverride: overrides.accessTierOverride ?? null,
+        },
+      });
+      return id;
+    }
+
+    describe('401 — no token', () => {
+      it('returns 401 without a token', async () => {
+        const id = await createFixture(`${accessTierSeriesId}-401`);
+        await request(app.getHttpServer())
+          .patch(`/admin/media/${id}/access-tier`)
+          .send({ tier: 'premium' })
+          .expect(HttpStatus.UNAUTHORIZED);
+      });
+    });
+
+    describe('403 — authenticated but not an admin', () => {
+      it('returns 403 ADMIN_ROLE_REQUIRED for a non-admin user', async () => {
+        const id = await createFixture(`${accessTierSeriesId}-403`);
+        const response = await request(app.getHttpServer())
+          .patch(`/admin/media/${id}/access-tier`)
+          .set('Authorization', `Bearer ${nonAdminAccessToken}`)
+          .send({ tier: 'premium' })
+          .expect(HttpStatus.FORBIDDEN);
+
+        const body = response.body as ErrorResponseBody;
+        expect(body.code).toBe('ADMIN_ROLE_REQUIRED');
+      });
+    });
+
+    it('sets the override to "premium" and returns it on the updated AdminMediaDto', async () => {
+      const id = await createFixture(`${accessTierSeriesId}-set-premium`);
+
+      const response = await request(app.getHttpServer())
+        .patch(`/admin/media/${id}/access-tier`)
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({ tier: 'premium' })
+        .expect(HttpStatus.OK);
+
+      const body = response.body as AdminMediaDto;
+      expect(body.id).toBe(id);
+      expect(body.accessTierOverride).toBe('premium');
+
+      const persisted = await prisma.video.findUnique({ where: { id } });
+      expect(persisted?.accessTierOverride).toBe('premium');
+    });
+
+    it('sets the override to "free" and returns it on the updated AdminMediaDto', async () => {
+      const id = await createFixture(`${accessTierSeriesId}-set-free`, {
+        accessTierOverride: 'premium',
+      });
+
+      const response = await request(app.getHttpServer())
+        .patch(`/admin/media/${id}/access-tier`)
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({ tier: 'free' })
+        .expect(HttpStatus.OK);
+
+      expect((response.body as AdminMediaDto).accessTierOverride).toBe('free');
+    });
+
+    it('clears the override with tier: null', async () => {
+      const id = await createFixture(`${accessTierSeriesId}-clear`, {
+        accessTierOverride: 'premium',
+      });
+
+      const response = await request(app.getHttpServer())
+        .patch(`/admin/media/${id}/access-tier`)
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({ tier: null })
+        .expect(HttpStatus.OK);
+
+      expect((response.body as AdminMediaDto).accessTierOverride).toBeNull();
+
+      const persisted = await prisma.video.findUnique({ where: { id } });
+      expect(persisted?.accessTierOverride).toBeNull();
+    });
+
+    it('leaves every other field untouched', async () => {
+      const id = await createFixture(`${accessTierSeriesId}-untouched`);
+
+      const response = await request(app.getHttpServer())
+        .patch(`/admin/media/${id}/access-tier`)
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({ tier: 'premium' })
+        .expect(HttpStatus.OK);
+
+      const body = response.body as AdminMediaDto;
+      expect(body.title).toBe(`Access-tier fixture ${id}`);
+      expect(body.lifecycleState).toBe('published');
+      expect(body.episodeNumber).toBe(1);
+    });
+
+    it('returns 400 for an invalid tier value', async () => {
+      const id = await createFixture(`${accessTierSeriesId}-invalid`);
+
+      await request(app.getHttpServer())
+        .patch(`/admin/media/${id}/access-tier`)
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({ tier: 'gold' })
+        .expect(HttpStatus.BAD_REQUEST);
+    });
+
+    it('returns 400 when the tier field is missing entirely', async () => {
+      const id = await createFixture(`${accessTierSeriesId}-missing`);
+
+      await request(app.getHttpServer())
+        .patch(`/admin/media/${id}/access-tier`)
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({})
+        .expect(HttpStatus.BAD_REQUEST);
+    });
+
+    it('returns 400 for a non-whitelisted extra field', async () => {
+      const id = await createFixture(`${accessTierSeriesId}-extra-field`);
+
+      await request(app.getHttpServer())
+        .patch(`/admin/media/${id}/access-tier`)
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({ tier: 'premium', notARealField: 'nope' })
+        .expect(HttpStatus.BAD_REQUEST);
+    });
+
+    it('returns 404 VIDEO_NOT_FOUND for a nonexistent id', async () => {
+      const response = await request(app.getHttpServer())
+        .patch('/admin/media/does-not-exist/access-tier')
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({ tier: 'premium' })
         .expect(HttpStatus.NOT_FOUND);
 
       const body = response.body as ErrorResponseBody;

@@ -53,6 +53,89 @@ describe('EntitlementsService', () => {
     });
   });
 
+  describe('resolveEpisodePremium (work unit 11E-3)', () => {
+    it('CRITICAL: with a null override, a free episode resolves free, exactly matching isEpisodePremium (default-preserving)', () => {
+      expect(
+        service.resolveEpisodePremium(
+          { accessTierOverride: null, episodeNumber: 1 },
+          5,
+        ),
+      ).toBe(service.isEpisodePremium(1, 5));
+      expect(
+        service.resolveEpisodePremium(
+          { accessTierOverride: null, episodeNumber: 1 },
+          5,
+        ),
+      ).toBe(false);
+    });
+
+    it('CRITICAL: with a null override, a premium episode resolves premium, exactly matching isEpisodePremium (default-preserving)', () => {
+      expect(
+        service.resolveEpisodePremium(
+          { accessTierOverride: null, episodeNumber: 6 },
+          5,
+        ),
+      ).toBe(service.isEpisodePremium(6, 5));
+      expect(
+        service.resolveEpisodePremium(
+          { accessTierOverride: null, episodeNumber: 6 },
+          5,
+        ),
+      ).toBe(true);
+    });
+
+    it('with an undefined override (same as null — every pre-11E-3 caller shape), falls back to the default rule', () => {
+      expect(
+        service.resolveEpisodePremium(
+          { accessTierOverride: undefined, episodeNumber: 1 },
+          5,
+        ),
+      ).toBe(false);
+      expect(
+        service.resolveEpisodePremium(
+          { accessTierOverride: undefined, episodeNumber: 6 },
+          5,
+        ),
+      ).toBe(true);
+    });
+
+    it('override "premium" forces premium on an otherwise-free episode', () => {
+      expect(
+        service.resolveEpisodePremium(
+          { accessTierOverride: 'premium', episodeNumber: 1 },
+          5,
+        ),
+      ).toBe(true);
+    });
+
+    it('override "free" forces free on an otherwise-premium episode', () => {
+      expect(
+        service.resolveEpisodePremium(
+          { accessTierOverride: 'free', episodeNumber: 6 },
+          5,
+        ),
+      ).toBe(false);
+    });
+
+    it('override "premium" still applies at the exact free-limit boundary episode', () => {
+      expect(
+        service.resolveEpisodePremium(
+          { accessTierOverride: 'premium', episodeNumber: 5 },
+          5,
+        ),
+      ).toBe(true);
+    });
+
+    it('override "free" still applies to episode 1', () => {
+      expect(
+        service.resolveEpisodePremium(
+          { accessTierOverride: 'free', episodeNumber: 1 },
+          5,
+        ),
+      ).toBe(false);
+    });
+  });
+
   describe('isEntitled / getStatus', () => {
     it('returns not-entitled for a user with no entitlement rows', async () => {
       expect(await service.isEntitled(userId)).toBe(false);

@@ -2,6 +2,7 @@ import { randomUUID } from 'crypto';
 import { HttpStatus, Injectable } from '@nestjs/common';
 import { AppErrorCode } from '../common/errors/app-error-code';
 import { AppException } from '../common/errors/app.exception';
+import { deriveAccessTier } from '../entitlements/entitlement.constants';
 import { PrismaService } from '../prisma/prisma.service';
 import { StorageService } from '../storage/storage.service';
 import { CompleteMediaUploadDto } from './dto/complete-media-upload.dto';
@@ -143,6 +144,15 @@ export class AdminMediaService {
         objectStorageKey,
         objectStorageVariant: SOURCE_VARIANT,
         lifecycleState: MediaLifecycleState.DRAFT,
+        // Work unit 11F-4: every newly created row gets an explicit
+        // access tier at creation time, derived from `episodeNumber`
+        // exactly like the backfill migration and `prisma/seed.ts` do —
+        // no admin-created row is left `null`. Admins can still change it
+        // afterward via the existing `PATCH /admin/media/:id/access-tier`
+        // endpoint (`updateAccessTier` below), which remains the only way
+        // to set an override that intentionally disagrees with
+        // `episodeNumber`.
+        accessTierOverride: deriveAccessTier(dto.episodeNumber),
       },
     });
 

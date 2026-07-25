@@ -158,7 +158,13 @@ video id could stream the file directly. Episodes 1-5 (`FREE_EPISODE_LIMIT`)
 stream for any authenticated user; episode 6+ additionally requires an
 active premium entitlement (see "Entitlements API" below), checked before
 the file is even opened. A denied request returns `403
-ENTITLEMENT_REQUIRED`.
+ENTITLEMENT_REQUIRED`. This is the outcome for every video today, but as
+of work unit 11F-4 it is actually decided by the row's explicit
+`Video.accessTierOverride` DB value (which every row carries, backfilled
+to match this exact rule for existing content), not derived solely from
+`episodeNumber` at request time — see "`PATCH
+/admin/media/:id/access-tier`" under the admin content-management API
+below for the full explanation.
 
 Error codes used across the video API: `VIDEO_NOT_FOUND`, `MEDIA_FILE_NOT_FOUND`,
 `INVALID_MEDIA_RANGE`, `INVALID_STORAGE_PATH`, `INVALID_ACCESS_TOKEN`,
@@ -644,10 +650,8 @@ returns `404 VIDEO_NOT_FOUND`. Returns `200` with the updated
 
 ### `PATCH /admin/media/:id/access-tier`
 
-Sets or clears a per-episode access-tier override (work unit 11E-3) — an
-**additive, opt-in mechanism layered on top of** the existing
-account-wide `FREE_EPISODE_LIMIT` free-episode rule (see "Entitlements
-API" above), which is otherwise completely unchanged. Body:
+Sets or clears a per-episode access-tier override (work unit 11E-3, made
+the explicit DB-backed source of truth by 11F-4 — see below). Body:
 
 ```json
 { "tier": "free" }
@@ -660,23 +664,62 @@ or `null`:
   regardless of `episodeNumber`.
 - `"free"` — this episode always streams without an entitlement,
   regardless of `episodeNumber`.
-- `null` — clears the override; the episode reverts to the existing
-  default rule (`episodeNumber > FREE_EPISODE_LIMIT` requires an
-  entitlement).
+- `null` — clears the override, reverting the row to `null` until the
+  next backfill/create/reseed sets it explicitly again (see below) — in
+  practice this means the row falls back to the
+  `episodeNumber > FREE_EPISODE_LIMIT` derivation the very next time it's
+  read, via `EntitlementsService.resolveEpisodePremium`'s null-safety
+  fallback.
 
 Persisted on the additive `Video.accessTierOverride` column (nullable
 `String?`, no default — added by a single-column `ADD COLUMN` migration
-with no drop/default/backfill/data change). All 40 pre-existing `Video`
-rows migrated to `NULL`, so `GET /videos/:id/stream`'s behavior for
-existing content is unchanged by this work unit: the stream guard
-(`EntitlementsService.resolveEpisodePremium`) consults the override only
-when it is non-null; a `null`/missing override always falls through to
-the unchanged `isEpisodePremium(episodeNumber, FREE_EPISODE_LIMIT)`
-check. An invalid/missing `tier`, or any non-whitelisted extra field,
-returns a clean `400`; an unknown `id` returns `404 VIDEO_NOT_FOUND`.
-Returns `200` with the updated `AdminMediaDto` — `accessTierOverride` is
-exposed only on this admin-only DTO, never on the public
-`VideoResponseDto`.
+with no drop/default/backfill/data change). An invalid/missing `tier`,
+or any non-whitelisted extra field, returns a clean `400`; an unknown
+`id` returns `404 VIDEO_NOT_FOUND`. Returns `200` with the updated
+`AdminMediaDto` — `accessTierOverride` is exposed only on this
+admin-only DTO, never on the public `VideoResponseDto`.
+
+**Explicit DB-backed access tier (work unit 11F-4).** Every `Video` row
+now carries an explicit `"free"` or `"premium"` value in this column,
+not just rows an admin has manually touched:
+
+- **Backfill migration** (`prisma/migrations/*_backfill_video_access_tier_override`,
+  data-only, additive, no DDL change): a one-time `UPDATE ... WHERE
+  "accessTierOverride" IS NULL` that filled every previously-`NULL` row
+  (all 40 pre-existing rows, at the time it ran) with the value the old
+  default rule already derived for it (`episodeNumber >
+  FREE_EPISODE_LIMIT` → `"premium"`, else `"free"`). The `WHERE ... IS
+  NULL` guard means it can never touch a row that already had an
+  explicit override set via this endpoint. Reversible (re-nulling the
+  column fully undoes it, since the underlying `episodeNumber` values are
+  never modified).
+- **`prisma/seed.ts`** now sets `accessTierOverride` to the same derived
+  value on every freshly-created (not re-updated) seed row, so a fresh
+  `prisma migrate reset` + seed also yields explicit tiers rather than
+  relying on the one-time migration alone.
+- **`POST /admin/media`** (`createUpload`) now derives and sets an
+  explicit tier from the submitted `episodeNumber` at creation time, so
+  every newly admin-created row also starts with a non-null tier. This
+  endpoint's own `PATCH .../access-tier` above remains the only way to
+  set a tier that intentionally disagrees with `episodeNumber`.
+- **Enforcement reads the DB value.** `EntitlementsService
+  .resolveEpisodePremium` (used by the `GET /videos/:id/stream` guard)
+  treats `accessTierOverride = "premium"`/`"free"` as authoritative
+  regardless of `episodeNumber` — this was already true since 11E-3, and
+  after the 11F-4 backfill it applies to every real row, not just
+  admin-touched ones. `episodeNumber`-based derivation
+  (`isEpisodePremium`) is retained only (a) as the value the
+  backfill/seed/create-time default derives from, and (b) as a
+  null-safety fallback for a row that is somehow still `null` (there
+  should be none post-backfill, since the column has no `NOT NULL`
+  constraint). In other words: **premium access is no longer derived
+  solely from `episodeNumber` at request time** — it is read from
+  `Video.accessTierOverride`, which every row now carries explicitly.
+- **Existing-row gating is unchanged.** For all 40 pre-existing rows the
+  backfilled DB value is, by construction, identical to what the old
+  `episodeNumber`-only rule already produced — this changes only what is
+  *stored*, never the streaming/entitlement *outcome* for any row that
+  predates this work unit.
 
 ### `GET` / `POST` / `PATCH` / `DELETE /admin/series`, archive/unarchive
 

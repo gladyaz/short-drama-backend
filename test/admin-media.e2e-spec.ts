@@ -289,8 +289,13 @@ describe('Admin Media (e2e)', () => {
 
       const body = response.body as AdminMediaDto;
       expect(body.lifecycleState).toBe('draft');
-      // Work unit 11E-3: a freshly created row has no override yet.
-      expect(body.accessTierOverride).toBeNull();
+      // Work unit 11F-4: `createUpload` now derives an explicit tier from
+      // `episodeNumber` at creation time — `validCreateBody.episodeNumber`
+      // is 1, at/below FREE_EPISODE_LIMIT (5), so it derives to "free", not
+      // null. See the dedicated 11F-4 describe block below for the
+      // above-the-limit ("premium") case and unit coverage in
+      // `admin-media.service.spec.ts`.
+      expect(body.accessTierOverride).toBe('free');
     });
 
     it('the draft is invisible to the public feed and GET /videos/:id', async () => {
@@ -399,6 +404,55 @@ describe('Admin Media (e2e)', () => {
 
       const body = response.body as ErrorResponseBody;
       expect(body.code).toBe('VIDEO_NOT_FOUND');
+    });
+  });
+
+  /**
+   * Work unit 11F-4: `POST /admin/media` now derives an explicit
+   * `accessTierOverride` from `episodeNumber` at creation time (via
+   * `deriveAccessTier`, the same free/premium boundary as
+   * `EntitlementsService.isEpisodePremium`/`FREE_EPISODE_LIMIT`), instead of
+   * leaving every freshly created row `null`. Namespaced under
+   * `${testSeriesId}-11f4-create-tier`, covered by the same `afterAll`
+   * `startsWith(testSeriesId)` sweep as every other fixture in this file.
+   */
+  describe('POST /admin/media — create-time access-tier default (work unit 11F-4)', () => {
+    const tierSeriesId = `${testSeriesId}-11f4-create-tier`;
+
+    it('derives "free" for an episodeNumber at/below FREE_EPISODE_LIMIT (5)', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/admin/media')
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({ ...validCreateBody, seriesId: tierSeriesId, episodeNumber: 5 })
+        .expect(HttpStatus.CREATED);
+
+      const body = response.body as CreateUploadResponseBody & {
+        media: AdminMediaDto;
+      };
+      expect(body.media.accessTierOverride).toBe('free');
+
+      const persisted = await prisma.video.findUnique({
+        where: { id: body.media.id },
+      });
+      expect(persisted?.accessTierOverride).toBe('free');
+    });
+
+    it('derives "premium" for an episodeNumber above FREE_EPISODE_LIMIT (5)', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/admin/media')
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({ ...validCreateBody, seriesId: tierSeriesId, episodeNumber: 6 })
+        .expect(HttpStatus.CREATED);
+
+      const body = response.body as CreateUploadResponseBody & {
+        media: AdminMediaDto;
+      };
+      expect(body.media.accessTierOverride).toBe('premium');
+
+      const persisted = await prisma.video.findUnique({
+        where: { id: body.media.id },
+      });
+      expect(persisted?.accessTierOverride).toBe('premium');
     });
   });
 

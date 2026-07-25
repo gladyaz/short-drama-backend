@@ -6,6 +6,11 @@ import { AppModule } from './../src/app.module';
 import { AppExceptionFilter } from './../src/common/filters/app-exception.filter';
 import { PrismaService } from './../src/prisma/prisma.service';
 import type { AuthResponseDto } from './../src/auth/auth.types';
+import {
+  deriveAccessTier,
+  FREE_EPISODE_LIMIT,
+} from './../src/entitlements/entitlement.constants';
+import { VIDEOS } from './../src/videos/videos.data';
 import type { VideoResponseDto } from './../src/videos/video.types';
 
 interface ErrorResponseBody {
@@ -224,6 +229,16 @@ describe('Videos (e2e)', () => {
    * `test/admin-media.e2e-spec.ts`. Together the two files cover both halves
    * of the feature: does the admin endpoint correctly persist the override,
    * and does the stream guard correctly honor whatever is persisted.
+   *
+   * Work unit 11F-4: the "override" tests below (forced-premium,
+   * forced-free, and the two clear-reverts-to-default cases) already prove,
+   * unchanged, that enforcement reads `accessTierOverride` from the DB
+   * rather than deriving purely from `episodeNumber` — a fixture whose DB
+   * tier disagrees with what `episodeNumber` alone would derive gates
+   * exactly per the DB value in every case. What changes in 11F-4 is only
+   * what the 40 REAL pre-existing rows carry in that column by default: see
+   * the first test below, updated from asserting `null` (pre-11F-4) to
+   * asserting each row's explicit, correctly-derived tier (post-backfill).
    */
   describe('GET /videos/:id/stream — per-episode access-tier override (Phase 11, work unit 11E-3)', () => {
     const overrideSeriesId = `${emailPrefix}-11e3-override`;
@@ -260,16 +275,41 @@ describe('Videos (e2e)', () => {
       });
     });
 
-    it('the 40 pre-existing seed rows backfilled to a null accessTierOverride (migration additivity)', async () => {
-      const free = await prisma.video.findUnique({
-        where: { id: freeEpisodeId },
-      });
-      const premium = await prisma.video.findUnique({
-        where: { id: premiumEpisodeId },
-      });
+    /**
+     * Work unit 11F-4: supersedes the pre-11F-4 assertion that these rows
+     * were `null`. A one-time additive backfill migration
+     * (`prisma/migrations/*_backfill_video_access_tier_override`) filled
+     * every pre-existing `NULL` `accessTierOverride` with the value the old
+     * default rule (`isEpisodePremium`) already derived for it — so every
+     * one of the 40 real seed rows now carries an EXPLICIT tier, not null.
+     * This is the "behavior preservation" proof: for every seed row (none of
+     * which has ever gone through the admin override endpoint), the stored
+     * value must equal exactly what `deriveAccessTier` (the same boundary as
+     * `isEpisodePremium`/`FREE_EPISODE_LIMIT`) computes from its
+     * `episodeNumber` — i.e. the backfill changed WHAT IS STORED, never
+     * WHAT THE GATING OUTCOME IS.
+     */
+    it('every one of the 40 pre-existing seed rows now carries an explicit accessTierOverride matching its derived value (11F-4 backfill)', async () => {
+      const seedIds = VIDEOS.map((video) => video.id);
+      expect(seedIds.length).toBe(40);
 
-      expect(free?.accessTierOverride).toBeNull();
-      expect(premium?.accessTierOverride).toBeNull();
+      const rows = await prisma.video.findMany({
+        where: { id: { in: seedIds } },
+        select: { id: true, episodeNumber: true, accessTierOverride: true },
+      });
+      expect(rows).toHaveLength(40);
+
+      for (const row of rows) {
+        expect(row.accessTierOverride).not.toBeNull();
+        expect(row.accessTierOverride).toBe(
+          deriveAccessTier(row.episodeNumber, FREE_EPISODE_LIMIT),
+        );
+      }
+
+      const free = rows.find((row) => row.id === freeEpisodeId);
+      const premium = rows.find((row) => row.id === premiumEpisodeId);
+      expect(free?.accessTierOverride).toBe('free');
+      expect(premium?.accessTierOverride).toBe('premium');
     });
 
     it('CRITICAL default-preserving: a free episode (episodeNumber <= FREE_EPISODE_LIMIT) with a null override still streams without an entitlement, exactly as today', async () => {

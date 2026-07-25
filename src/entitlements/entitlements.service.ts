@@ -36,12 +36,26 @@ export class EntitlementsService {
    * `Video.accessTierOverride` column value (set/cleared via the guarded
    * `PATCH /admin/media/:id/access-tier` endpoint): `"premium"` and
    * `"free"` unconditionally decide the outcome regardless of
-   * `episodeNumber`; anything else (`null`/`undefined` — the state of every
-   * one of the 40 pre-existing rows, and of any row an admin has never
-   * explicitly overridden) falls back UNCHANGED to the existing
-   * `isEpisodePremium` rule below. This is purely additive: `isEpisodePremium`
-   * itself is untouched, so this method's null-override branch always
-   * returns exactly what the old default rule already returned.
+   * `episodeNumber`.
+   *
+   * Work unit 11F-4: this DB column is now the enforcement source of truth
+   * for every real row, not just an opt-in override. A one-time additive
+   * backfill migration filled `accessTierOverride` for all 40 pre-existing
+   * rows with their previously-derived value (see
+   * `prisma/migrations/*_backfill_video_access_tier_override/migration.sql`),
+   * `prisma/seed.ts` now sets it explicitly on every freshly seeded row, and
+   * `AdminMediaService.createUpload` sets it explicitly on every newly
+   * created row — so in normal operation this method's two `if` branches
+   * above are the ONLY code path that matters; `episodeNumber` is no longer
+   * consulted for gating an override-bearing row. The `isEpisodePremium`
+   * fallback below is retained solely as a **null-safety fallback** for a
+   * row that is somehow still `null` (there should be none after the
+   * backfill, but the column has no NOT NULL constraint, so this keeps the
+   * gate fail-safe rather than throwing). This is purely additive:
+   * `isEpisodePremium` itself is untouched, so this method's null-override
+   * branch always returns exactly what the old default rule already
+   * returned for any row that predates this work unit and was somehow left
+   * `null`.
    */
   resolveEpisodePremium(
     input: {

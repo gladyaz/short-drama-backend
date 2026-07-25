@@ -110,6 +110,47 @@ describe('AdminMediaService', () => {
       expect(first.media.id).not.toBe(second.media.id);
     });
 
+    // Work unit 11F-4: create-time `accessTierOverride` default, derived
+    // from `episodeNumber` — proves `POST /admin/media` never leaves a
+    // freshly created row's tier `null`.
+    describe('create-time access-tier default', () => {
+      beforeEach(() => {
+        storageService.createPresignedPutUrl.mockResolvedValue({
+          url: 'https://signed.example.test/put',
+          key: 'k',
+          expiresAt: new Date(),
+        });
+      });
+
+      it('derives "free" for an episodeNumber at/below FREE_EPISODE_LIMIT (5)', async () => {
+        const result = await service.createUpload({
+          ...baseDto,
+          episodeNumber: 5,
+        });
+
+        expect(result.media.accessTierOverride).toBe('free');
+
+        const persisted = await prisma.video.findUnique({
+          where: { id: result.media.id },
+        });
+        expect(persisted?.accessTierOverride).toBe('free');
+      });
+
+      it('derives "premium" for an episodeNumber above FREE_EPISODE_LIMIT (5)', async () => {
+        const result = await service.createUpload({
+          ...baseDto,
+          episodeNumber: 6,
+        });
+
+        expect(result.media.accessTierOverride).toBe('premium');
+
+        const persisted = await prisma.video.findUnique({
+          where: { id: result.media.id },
+        });
+        expect(persisted?.accessTierOverride).toBe('premium');
+      });
+    });
+
     // Work unit 11F-3: duplicate episode-number-within-series validation.
     describe('duplicate episode-number-within-series validation', () => {
       beforeEach(() => {

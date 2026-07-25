@@ -28,11 +28,41 @@ describe('SeriesService', () => {
   });
 
   afterEach(async () => {
+    // Work unit 11F-1: `remove`'s tests create namespaced `Video` fixtures
+    // (never the 40 seed rows) to exercise the published-episode guard —
+    // clean those up too, alongside the `Series` rows every describe block
+    // already creates.
+    await prisma.video.deleteMany({
+      where: { id: { startsWith: testIdPrefix } },
+    });
     await prisma.series.deleteMany({
       where: { id: { startsWith: testIdPrefix } },
     });
     await prisma.onModuleDestroy();
   });
+
+  async function createVideoFixture(
+    id: string,
+    seriesId: string,
+    lifecycleState: string,
+  ): Promise<void> {
+    await prisma.video.create({
+      data: {
+        id,
+        seriesId,
+        title: `Fixture ${id}`,
+        episodeNumber: 1,
+        channelName: 'Spec Channel',
+        caption: 'Spec fixture caption',
+        category: 'drama',
+        storageKey: '',
+        sourceLanguage: 'zh',
+        hasEmbeddedIndonesianSubtitle: true,
+        likeCount: 0,
+        lifecycleState,
+      },
+    });
+  }
 
   describe('create', () => {
     it('creates a series and returns a SeriesDto', async () => {
@@ -115,6 +145,66 @@ describe('SeriesService', () => {
       const matching = result.filter((s) => s.id.startsWith(testIdPrefix));
       expect(matching).toEqual([]);
     });
+
+    it('excludes archived series by default (work unit 11F-1)', async () => {
+      const activeId = `${testIdPrefix}-list-archive-active`;
+      const archivedId = `${testIdPrefix}-list-archive-archived`;
+      await service.create({ id: activeId, title: 'Active' });
+      await service.create({ id: archivedId, title: 'Archived' });
+      await service.archive(archivedId);
+
+      const result = await service.list();
+      const ids = result
+        .filter((s) => s.id.startsWith(testIdPrefix))
+        .map((s) => s.id);
+
+      expect(ids).toContain(activeId);
+      expect(ids).not.toContain(archivedId);
+    });
+
+    it('includes archived series when includeArchived is true', async () => {
+      const activeId = `${testIdPrefix}-list-includearchived-active`;
+      const archivedId = `${testIdPrefix}-list-includearchived-archived`;
+      await service.create({ id: activeId, title: 'Active' });
+      await service.create({ id: archivedId, title: 'Archived' });
+      await service.archive(archivedId);
+
+      const result = await service.list({ includeArchived: true });
+      const ids = result
+        .filter((s) => s.id.startsWith(testIdPrefix))
+        .map((s) => s.id);
+
+      expect(ids).toContain(activeId);
+      expect(ids).toContain(archivedId);
+    });
+  });
+
+  describe('findById', () => {
+    it('returns the SeriesDto for an existing series', async () => {
+      const id = `${testIdPrefix}-findbyid-basic`;
+      await service.create({ id, title: 'Findable' });
+
+      const result = await service.findById(id);
+
+      expect(result).toMatchObject({ id, title: 'Findable', archivedAt: null });
+    });
+
+    it('returns an archived series too (unlike the default list view)', async () => {
+      const id = `${testIdPrefix}-findbyid-archived`;
+      await service.create({ id, title: 'Archived Findable' });
+      await service.archive(id);
+
+      const result = await service.findById(id);
+
+      expect(result.id).toBe(id);
+      expect(result.archivedAt).not.toBeNull();
+    });
+
+    it('rejects an unknown id with 404 SERIES_NOT_FOUND', async () => {
+      await expect(
+        service.findById(`${testIdPrefix}-findbyid-does-not-exist`),
+      ).rejects.toMatchObject({ code: AppErrorCode.SERIES_NOT_FOUND });
+    });
   });
 
   describe('update', () => {
@@ -188,6 +278,143 @@ describe('SeriesService', () => {
     it('rejects an unknown id with 404 SERIES_NOT_FOUND', async () => {
       await expect(
         service.update(`${testIdPrefix}-does-not-exist`, { title: 'X' }),
+      ).rejects.toMatchObject({ code: AppErrorCode.SERIES_NOT_FOUND });
+    });
+  });
+
+  describe('archive', () => {
+    it('sets archivedAt to a non-null ISO timestamp', async () => {
+      const id = `${testIdPrefix}-archive-basic`;
+      await service.create({ id, title: 'To Archive' });
+
+      const result = await service.archive(id);
+
+      expect(result.archivedAt).not.toBeNull();
+      expect(typeof result.archivedAt).toBe('string');
+
+      const persisted = await prisma.series.findUnique({ where: { id } });
+      expect(persisted?.archivedAt).not.toBeNull();
+    });
+
+    it('is idempotent: archiving an already-archived series returns it unchanged', async () => {
+      const id = `${testIdPrefix}-archive-idempotent`;
+      await service.create({ id, title: 'Idempotent' });
+      const first = await service.archive(id);
+
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      const second = await service.archive(id);
+
+      expect(second.archivedAt).toBe(first.archivedAt);
+      expect(second.updatedAt).toBe(first.updatedAt);
+    });
+
+    it('rejects an unknown id with 404 SERIES_NOT_FOUND', async () => {
+      await expect(
+        service.archive(`${testIdPrefix}-archive-does-not-exist`),
+      ).rejects.toMatchObject({ code: AppErrorCode.SERIES_NOT_FOUND });
+    });
+  });
+
+  describe('unarchive', () => {
+    it('clears archivedAt back to null', async () => {
+      const id = `${testIdPrefix}-unarchive-basic`;
+      await service.create({ id, title: 'To Unarchive' });
+      await service.archive(id);
+
+      const result = await service.unarchive(id);
+
+      expect(result.archivedAt).toBeNull();
+
+      const persisted = await prisma.series.findUnique({ where: { id } });
+      expect(persisted?.archivedAt).toBeNull();
+    });
+
+    it('is idempotent: unarchiving an already-active series returns it unchanged', async () => {
+      const id = `${testIdPrefix}-unarchive-idempotent`;
+      const created = await service.create({ id, title: 'Never Archived' });
+
+      const result = await service.unarchive(id);
+
+      expect(result.archivedAt).toBeNull();
+      expect(result.updatedAt).toBe(created.updatedAt);
+    });
+
+    it('rejects an unknown id with 404 SERIES_NOT_FOUND', async () => {
+      await expect(
+        service.unarchive(`${testIdPrefix}-unarchive-does-not-exist`),
+      ).rejects.toMatchObject({ code: AppErrorCode.SERIES_NOT_FOUND });
+    });
+  });
+
+  describe('remove (guarded hard delete)', () => {
+    it('refuses with 409 SERIES_HAS_PUBLISHED_EPISODES when a published episode exists for that seriesId', async () => {
+      const id = `${testIdPrefix}-remove-has-published`;
+      const videoId = `${testIdPrefix}-remove-published-video`;
+      await service.create({ id, title: 'Has Published Episode' });
+      await createVideoFixture(videoId, id, 'published');
+
+      let caught: unknown;
+      try {
+        await service.remove(id);
+      } catch (error) {
+        caught = error;
+      }
+
+      expect(caught).toBeInstanceOf(AppException);
+      expect((caught as AppException).code).toBe(
+        AppErrorCode.SERIES_HAS_PUBLISHED_EPISODES,
+      );
+      expect((caught as AppException).getStatus()).toBe(409);
+
+      // Nothing was deleted or modified.
+      const persistedSeries = await prisma.series.findUnique({
+        where: { id },
+      });
+      expect(persistedSeries).not.toBeNull();
+      const persistedVideo = await prisma.video.findUnique({
+        where: { id: videoId },
+      });
+      expect(persistedVideo?.seriesId).toBe(id);
+      expect(persistedVideo?.lifecycleState).toBe('published');
+    });
+
+    it('is allowed when no published episode exists (draft/unpublished episodes do not block it)', async () => {
+      const id = `${testIdPrefix}-remove-no-published`;
+      const draftVideoId = `${testIdPrefix}-remove-draft-video`;
+      await service.create({ id, title: 'No Published Episode' });
+      await createVideoFixture(draftVideoId, id, 'draft');
+
+      await service.remove(id);
+
+      const persistedSeries = await prisma.series.findUnique({
+        where: { id },
+      });
+      expect(persistedSeries).toBeNull();
+
+      // The unrelated (non-published) Video row and its seriesId are
+      // completely unaffected by the Series delete — relationships are
+      // preserved, `Video` is never touched.
+      const persistedVideo = await prisma.video.findUnique({
+        where: { id: draftVideoId },
+      });
+      expect(persistedVideo).not.toBeNull();
+      expect(persistedVideo?.seriesId).toBe(id);
+      expect(persistedVideo?.lifecycleState).toBe('draft');
+    });
+
+    it('is allowed when the series has no Video rows at all', async () => {
+      const id = `${testIdPrefix}-remove-no-videos`;
+      await service.create({ id, title: 'No Episodes' });
+
+      await service.remove(id);
+
+      const persisted = await prisma.series.findUnique({ where: { id } });
+      expect(persisted).toBeNull();
+    });
+
+    it('rejects an unknown id with 404 SERIES_NOT_FOUND', async () => {
+      await expect(
+        service.remove(`${testIdPrefix}-remove-does-not-exist`),
       ).rejects.toMatchObject({ code: AppErrorCode.SERIES_NOT_FOUND });
     });
   });

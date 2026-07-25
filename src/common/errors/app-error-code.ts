@@ -125,4 +125,15 @@ export enum AppErrorCode {
    * `EMPTY_MEDIA_METADATA_UPDATE` precedent (work unit 11E-2).
    */
   EMPTY_SERIES_UPDATE = 'EMPTY_SERIES_UPDATE',
+  // Phase 11, work unit 11F-1 (series read-detail + safe archive + guarded hard-delete)
+  /**
+   * Returned by `DELETE /admin/series/:id` when at least one `Video` row
+   * with that `seriesId` is currently `lifecycleState: "published"` — the
+   * hard delete is refused (the row is NOT deleted) rather than silently
+   * orphaning a still-live episode's grouping. Deleting the metadata-only
+   * `Series` row is safe only once no published episode references it;
+   * archiving (`POST /admin/series/:id/archive`) is the reversible,
+   * always-available alternative that never has this restriction.
+   */
+  SERIES_HAS_PUBLISHED_EPISODES = 'SERIES_HAS_PUBLISHED_EPISODES',
 }

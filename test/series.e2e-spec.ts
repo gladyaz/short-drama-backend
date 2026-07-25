@@ -15,13 +15,16 @@ interface ErrorResponseBody {
 }
 
 /**
- * e2e coverage for the Phase 11 (work unit 11E-4) admin-guarded
- * `/admin/series` metadata CRUD, hitting the real HTTP layer against the
- * real test database. `DEV_TOOLS_ENABLED=true` for the whole file, needed
- * only to bootstrap an admin user via the 11B-2 dev-grant route (a real
- * admin-provisioning flow does not exist yet). This suite never touches the
- * `Video` table or the 40 pre-existing seed rows — `Series` is a wholly
- * separate, additive table with no FK to `Video`.
+ * e2e coverage for the Phase 11 (work unit 11E-4, extended in 11F-1)
+ * admin-guarded `/admin/series` metadata surface, hitting the real HTTP
+ * layer against the real test database. `DEV_TOOLS_ENABLED=true` for the
+ * whole file, needed only to bootstrap an admin user via the 11B-2
+ * dev-grant route (a real admin-provisioning flow does not exist yet).
+ * `Series` is a wholly separate, additive table with no FK to `Video` — the
+ * ONLY place this suite touches `Video` is the namespaced fixtures the
+ * "DELETE /admin/series/:id (guarded hard delete)" tests below create
+ * directly via `prisma.video.create`, to exercise the published-episode
+ * guard; the 40 pre-existing seed rows are never touched.
  */
 describe('Series admin CRUD (e2e)', () => {
   let app: INestApplication<App>;
@@ -33,6 +36,29 @@ describe('Series admin CRUD (e2e)', () => {
   const seriesIdPrefix = `${emailPrefix}-series`;
   const uniqueEmail = (label: string): string =>
     `${emailPrefix}-${label}-${Date.now()}-${Math.random().toString(36).slice(2)}@example.test`;
+
+  async function createVideoFixture(
+    id: string,
+    seriesId: string,
+    lifecycleState: string,
+  ): Promise<void> {
+    await prisma.video.create({
+      data: {
+        id,
+        seriesId,
+        title: `E2E fixture ${id}`,
+        episodeNumber: 1,
+        channelName: 'E2E Channel',
+        caption: 'E2E fixture caption',
+        category: 'drama',
+        storageKey: '',
+        sourceLanguage: 'zh',
+        hasEmbeddedIndonesianSubtitle: true,
+        likeCount: 0,
+        lifecycleState,
+      },
+    });
+  }
 
   beforeAll(async () => {
     process.env.DEV_TOOLS_ENABLED = 'true';
@@ -74,6 +100,13 @@ describe('Series admin CRUD (e2e)', () => {
   });
 
   afterAll(async () => {
+    // Work unit 11F-1: the guarded hard-delete tests create namespaced
+    // `Video` fixtures — clean those up too, alongside every `Series` row
+    // this suite creates. None of the 40 pre-existing seed rows match this
+    // prefix.
+    await prisma.video.deleteMany({
+      where: { seriesId: { startsWith: seriesIdPrefix } },
+    });
     await prisma.series.deleteMany({
       where: { id: { startsWith: seriesIdPrefix } },
     });
@@ -133,6 +166,74 @@ describe('Series admin CRUD (e2e)', () => {
         .patch(`/admin/series/${seriesIdPrefix}-guard-patch-403`)
         .set('Authorization', `Bearer ${nonAdminAccessToken}`)
         .send({ title: 'New' })
+        .expect(HttpStatus.FORBIDDEN);
+
+      expect((response.body as ErrorResponseBody).code).toBe(
+        'ADMIN_ROLE_REQUIRED',
+      );
+    });
+
+    it('GET /admin/series/:id returns 401 without a token', async () => {
+      await request(app.getHttpServer())
+        .get(`/admin/series/${seriesIdPrefix}-guard-getbyid`)
+        .expect(HttpStatus.UNAUTHORIZED);
+    });
+
+    it('GET /admin/series/:id returns 403 ADMIN_ROLE_REQUIRED for a non-admin user', async () => {
+      const response = await request(app.getHttpServer())
+        .get(`/admin/series/${seriesIdPrefix}-guard-getbyid-403`)
+        .set('Authorization', `Bearer ${nonAdminAccessToken}`)
+        .expect(HttpStatus.FORBIDDEN);
+
+      expect((response.body as ErrorResponseBody).code).toBe(
+        'ADMIN_ROLE_REQUIRED',
+      );
+    });
+
+    it('POST /admin/series/:id/archive returns 401 without a token', async () => {
+      await request(app.getHttpServer())
+        .post(`/admin/series/${seriesIdPrefix}-guard-archive/archive`)
+        .expect(HttpStatus.UNAUTHORIZED);
+    });
+
+    it('POST /admin/series/:id/archive returns 403 ADMIN_ROLE_REQUIRED for a non-admin user', async () => {
+      const response = await request(app.getHttpServer())
+        .post(`/admin/series/${seriesIdPrefix}-guard-archive-403/archive`)
+        .set('Authorization', `Bearer ${nonAdminAccessToken}`)
+        .expect(HttpStatus.FORBIDDEN);
+
+      expect((response.body as ErrorResponseBody).code).toBe(
+        'ADMIN_ROLE_REQUIRED',
+      );
+    });
+
+    it('POST /admin/series/:id/unarchive returns 401 without a token', async () => {
+      await request(app.getHttpServer())
+        .post(`/admin/series/${seriesIdPrefix}-guard-unarchive/unarchive`)
+        .expect(HttpStatus.UNAUTHORIZED);
+    });
+
+    it('POST /admin/series/:id/unarchive returns 403 ADMIN_ROLE_REQUIRED for a non-admin user', async () => {
+      const response = await request(app.getHttpServer())
+        .post(`/admin/series/${seriesIdPrefix}-guard-unarchive-403/unarchive`)
+        .set('Authorization', `Bearer ${nonAdminAccessToken}`)
+        .expect(HttpStatus.FORBIDDEN);
+
+      expect((response.body as ErrorResponseBody).code).toBe(
+        'ADMIN_ROLE_REQUIRED',
+      );
+    });
+
+    it('DELETE /admin/series/:id returns 401 without a token', async () => {
+      await request(app.getHttpServer())
+        .delete(`/admin/series/${seriesIdPrefix}-guard-delete`)
+        .expect(HttpStatus.UNAUTHORIZED);
+    });
+
+    it('DELETE /admin/series/:id returns 403 ADMIN_ROLE_REQUIRED for a non-admin user', async () => {
+      const response = await request(app.getHttpServer())
+        .delete(`/admin/series/${seriesIdPrefix}-guard-delete-403`)
+        .set('Authorization', `Bearer ${nonAdminAccessToken}`)
         .expect(HttpStatus.FORBIDDEN);
 
       expect((response.body as ErrorResponseBody).code).toBe(
@@ -281,6 +382,306 @@ describe('Series admin CRUD (e2e)', () => {
         .filter((id) => id.startsWith(listPrefix));
 
       expect(ids).toEqual([idFirst, idA, idB]);
+    });
+
+    it('excludes archived series by default (work unit 11F-1)', async () => {
+      const activeId = `${listPrefix}-archive-active`;
+      const archivedId = `${listPrefix}-archive-archived`;
+      await request(app.getHttpServer())
+        .post('/admin/series')
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({ id: activeId, title: 'Active' })
+        .expect(HttpStatus.CREATED);
+      await request(app.getHttpServer())
+        .post('/admin/series')
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({ id: archivedId, title: 'Archived' })
+        .expect(HttpStatus.CREATED);
+      await request(app.getHttpServer())
+        .post(`/admin/series/${archivedId}/archive`)
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .expect(HttpStatus.OK);
+
+      const response = await request(app.getHttpServer())
+        .get('/admin/series')
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .expect(HttpStatus.OK);
+
+      const ids = (response.body as SeriesDto[]).map((s) => s.id);
+      expect(ids).toContain(activeId);
+      expect(ids).not.toContain(archivedId);
+    });
+
+    it('includes archived series when includeArchived=true is passed', async () => {
+      const activeId = `${listPrefix}-includearchived-active`;
+      const archivedId = `${listPrefix}-includearchived-archived`;
+      await request(app.getHttpServer())
+        .post('/admin/series')
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({ id: activeId, title: 'Active' })
+        .expect(HttpStatus.CREATED);
+      await request(app.getHttpServer())
+        .post('/admin/series')
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({ id: archivedId, title: 'Archived' })
+        .expect(HttpStatus.CREATED);
+      await request(app.getHttpServer())
+        .post(`/admin/series/${archivedId}/archive`)
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .expect(HttpStatus.OK);
+
+      const response = await request(app.getHttpServer())
+        .get('/admin/series')
+        .query({ includeArchived: 'true' })
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .expect(HttpStatus.OK);
+
+      const ids = (response.body as SeriesDto[]).map((s) => s.id);
+      expect(ids).toContain(activeId);
+      expect(ids).toContain(archivedId);
+    });
+
+    it('returns 400 for an invalid includeArchived value', async () => {
+      await request(app.getHttpServer())
+        .get('/admin/series')
+        .query({ includeArchived: 'yes' })
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .expect(HttpStatus.BAD_REQUEST);
+    });
+  });
+
+  describe('GET /admin/series/:id (read-detail)', () => {
+    const detailPrefix = `${seriesIdPrefix}-detail`;
+
+    it('returns 200 with the SeriesDto for an existing series', async () => {
+      const id = `${detailPrefix}-found`;
+      await request(app.getHttpServer())
+        .post('/admin/series')
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({ id, title: 'Detail Fixture', sortOrder: 3 })
+        .expect(HttpStatus.CREATED);
+
+      const response = await request(app.getHttpServer())
+        .get(`/admin/series/${id}`)
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .expect(HttpStatus.OK);
+
+      const body = response.body as SeriesDto;
+      expect(body).toMatchObject({
+        id,
+        title: 'Detail Fixture',
+        sortOrder: 3,
+        archivedAt: null,
+      });
+    });
+
+    it('returns 404 SERIES_NOT_FOUND for an unknown id', async () => {
+      const response = await request(app.getHttpServer())
+        .get(`/admin/series/${detailPrefix}-does-not-exist`)
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .expect(HttpStatus.NOT_FOUND);
+
+      expect((response.body as ErrorResponseBody).code).toBe(
+        'SERIES_NOT_FOUND',
+      );
+    });
+  });
+
+  describe('POST /admin/series/:id/archive and /unarchive', () => {
+    const archivePrefix = `${seriesIdPrefix}-archive-crud`;
+
+    it('archive sets archivedAt on the returned SeriesDto', async () => {
+      const id = `${archivePrefix}-basic`;
+      await request(app.getHttpServer())
+        .post('/admin/series')
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({ id, title: 'Archive Me' })
+        .expect(HttpStatus.CREATED);
+
+      const response = await request(app.getHttpServer())
+        .post(`/admin/series/${id}/archive`)
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .expect(HttpStatus.OK);
+
+      const body = response.body as SeriesDto;
+      expect(body.id).toBe(id);
+      expect(body.archivedAt).not.toBeNull();
+
+      // GET /admin/series/:id reflects the archived state directly.
+      const detail = await request(app.getHttpServer())
+        .get(`/admin/series/${id}`)
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .expect(HttpStatus.OK);
+      expect((detail.body as SeriesDto).archivedAt).toBe(body.archivedAt);
+    });
+
+    it('archive is idempotent (calling it twice does not error)', async () => {
+      const id = `${archivePrefix}-idempotent`;
+      await request(app.getHttpServer())
+        .post('/admin/series')
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({ id, title: 'Idempotent Archive' })
+        .expect(HttpStatus.CREATED);
+
+      await request(app.getHttpServer())
+        .post(`/admin/series/${id}/archive`)
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .expect(HttpStatus.OK);
+
+      const second = await request(app.getHttpServer())
+        .post(`/admin/series/${id}/archive`)
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .expect(HttpStatus.OK);
+
+      expect((second.body as SeriesDto).archivedAt).not.toBeNull();
+    });
+
+    it('unarchive clears archivedAt back to null', async () => {
+      const id = `${archivePrefix}-unarchive`;
+      await request(app.getHttpServer())
+        .post('/admin/series')
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({ id, title: 'Unarchive Me' })
+        .expect(HttpStatus.CREATED);
+      await request(app.getHttpServer())
+        .post(`/admin/series/${id}/archive`)
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .expect(HttpStatus.OK);
+
+      const response = await request(app.getHttpServer())
+        .post(`/admin/series/${id}/unarchive`)
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .expect(HttpStatus.OK);
+
+      expect((response.body as SeriesDto).archivedAt).toBeNull();
+
+      // Reflected in the default (excludes-archived) list again.
+      const listResponse = await request(app.getHttpServer())
+        .get('/admin/series')
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .expect(HttpStatus.OK);
+      const ids = (listResponse.body as SeriesDto[]).map((s) => s.id);
+      expect(ids).toContain(id);
+    });
+
+    it('returns 404 SERIES_NOT_FOUND for archive on an unknown id', async () => {
+      const response = await request(app.getHttpServer())
+        .post(`/admin/series/${archivePrefix}-does-not-exist/archive`)
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .expect(HttpStatus.NOT_FOUND);
+
+      expect((response.body as ErrorResponseBody).code).toBe(
+        'SERIES_NOT_FOUND',
+      );
+    });
+
+    it('returns 404 SERIES_NOT_FOUND for unarchive on an unknown id', async () => {
+      const response = await request(app.getHttpServer())
+        .post(`/admin/series/${archivePrefix}-does-not-exist/unarchive`)
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .expect(HttpStatus.NOT_FOUND);
+
+      expect((response.body as ErrorResponseBody).code).toBe(
+        'SERIES_NOT_FOUND',
+      );
+    });
+  });
+
+  describe('DELETE /admin/series/:id (guarded hard delete)', () => {
+    const deletePrefix = `${seriesIdPrefix}-delete`;
+
+    it('refuses with 409 SERIES_HAS_PUBLISHED_EPISODES when a published episode exists for that seriesId', async () => {
+      const id = `${deletePrefix}-has-published`;
+      const videoId = `${deletePrefix}-published-video`;
+      await request(app.getHttpServer())
+        .post('/admin/series')
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({ id, title: 'Has Published Episode' })
+        .expect(HttpStatus.CREATED);
+      await createVideoFixture(videoId, id, 'published');
+
+      const response = await request(app.getHttpServer())
+        .delete(`/admin/series/${id}`)
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .expect(HttpStatus.CONFLICT);
+
+      expect((response.body as ErrorResponseBody).code).toBe(
+        'SERIES_HAS_PUBLISHED_EPISODES',
+      );
+
+      // Nothing was deleted or modified — the Series row and the Video
+      // row's seriesId/lifecycleState are both untouched.
+      const persistedSeries = await prisma.series.findUnique({
+        where: { id },
+      });
+      expect(persistedSeries).not.toBeNull();
+      const persistedVideo = await prisma.video.findUnique({
+        where: { id: videoId },
+      });
+      expect(persistedVideo?.seriesId).toBe(id);
+      expect(persistedVideo?.lifecycleState).toBe('published');
+    });
+
+    it('is allowed when no published episode exists, and leaves the Video row(s) for that seriesId completely unchanged', async () => {
+      const id = `${deletePrefix}-no-published`;
+      const draftVideoId = `${deletePrefix}-draft-video`;
+      await request(app.getHttpServer())
+        .post('/admin/series')
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({ id, title: 'No Published Episode' })
+        .expect(HttpStatus.CREATED);
+      await createVideoFixture(draftVideoId, id, 'draft');
+
+      const beforeDelete = await prisma.video.findUnique({
+        where: { id: draftVideoId },
+      });
+
+      await request(app.getHttpServer())
+        .delete(`/admin/series/${id}`)
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .expect(HttpStatus.NO_CONTENT);
+
+      const persistedSeries = await prisma.series.findUnique({
+        where: { id },
+      });
+      expect(persistedSeries).toBeNull();
+
+      // The Video row for this seriesId is completely unchanged — the
+      // episode's seriesId (relationship) and every other field are
+      // preserved exactly, proving the Series delete never touches Video.
+      const afterDelete = await prisma.video.findUnique({
+        where: { id: draftVideoId },
+      });
+      expect(afterDelete).toEqual(beforeDelete);
+      expect(afterDelete?.seriesId).toBe(id);
+    });
+
+    it('is allowed when the series has no Video rows at all', async () => {
+      const id = `${deletePrefix}-no-videos`;
+      await request(app.getHttpServer())
+        .post('/admin/series')
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({ id, title: 'No Episodes' })
+        .expect(HttpStatus.CREATED);
+
+      await request(app.getHttpServer())
+        .delete(`/admin/series/${id}`)
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .expect(HttpStatus.NO_CONTENT);
+
+      const persisted = await prisma.series.findUnique({ where: { id } });
+      expect(persisted).toBeNull();
+    });
+
+    it('returns 404 SERIES_NOT_FOUND for an unknown id', async () => {
+      const response = await request(app.getHttpServer())
+        .delete(`/admin/series/${deletePrefix}-does-not-exist`)
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .expect(HttpStatus.NOT_FOUND);
+
+      expect((response.body as ErrorResponseBody).code).toBe(
+        'SERIES_NOT_FOUND',
+      );
     });
   });
 
@@ -478,6 +879,36 @@ describe('Series admin CRUD (e2e)', () => {
       expect(body).not.toHaveProperty('accessTierOverride');
       expect(body).not.toHaveProperty('coverImageKey');
       expect(body.id).toBe(knownSeedVideoId);
+    });
+  });
+
+  /**
+   * Work unit 11F-1 migration additivity: confirms the new `archivedAt`
+   * column on `Series` is real and additive (defaults to `null`, matching
+   * the schema comment) without touching `Video` at all, and that the
+   * 40-video seed catalog is still exactly 40 rows.
+   */
+  describe('migration additivity — Series.archivedAt column', () => {
+    it('a newly created Series row defaults archivedAt to null', async () => {
+      const id = `${seriesIdPrefix}-migration-archivedat-default`;
+
+      const response = await request(app.getHttpServer())
+        .post('/admin/series')
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({ id, title: 'Default ArchivedAt' })
+        .expect(HttpStatus.CREATED);
+
+      expect((response.body as SeriesDto).archivedAt).toBeNull();
+
+      const persisted = await prisma.series.findUnique({ where: { id } });
+      expect(persisted?.archivedAt).toBeNull();
+    });
+
+    it('the 40-video seed catalog is untouched by the archivedAt migration', async () => {
+      const seedVideoCount = await prisma.video.count({
+        where: { id: { startsWith: 'video-' } },
+      });
+      expect(seedVideoCount).toBe(40);
     });
   });
 });

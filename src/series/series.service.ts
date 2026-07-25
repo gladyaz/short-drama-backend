@@ -2,8 +2,10 @@ import { HttpStatus, Injectable } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { AppErrorCode } from '../common/errors/app-error-code';
 import { AppException } from '../common/errors/app.exception';
+import { MediaLifecycleState } from '../media/media-lifecycle.types';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateSeriesDto } from './dto/create-series.dto';
+import { ListAdminSeriesQueryDto } from './dto/list-admin-series-query.dto';
 import { UpdateSeriesDto } from './dto/update-series.dto';
 import { SeriesDto } from './series.types';
 
@@ -32,39 +34,60 @@ type SeriesRow = {
   sortOrder: number;
   createdAt: Date;
   updatedAt: Date;
+  archivedAt: Date | null;
 };
 
 /** Postgres unique-violation error code, per Prisma's documented mapping. */
 const UNIQUE_CONSTRAINT_VIOLATION = 'P2002';
 
 /**
- * Phase 11, work unit 11E-4: additive `Series` metadata CRUD (no delete —
- * out of scope). A `Series` row purely ANNOTATES an existing/planned
- * `Video.seriesId` grouping (display title, cover image, manual ordering);
- * it never reads or writes any `Video` row, and no route in this service is
- * reachable from the public API — every method here is called only from
- * `SeriesController`, guarded by `JwtAuthGuard`+`AdminGuard`. The public
- * `/videos/feed` grouping (still computed client-side from `Video.seriesId`)
- * is completely unaffected by anything in this file.
+ * Phase 11, work unit 11E-4 (extended in 11F-1 with read-detail, safe
+ * archive/unarchive, and a guarded hard delete): a `Series` row purely
+ * ANNOTATES an existing/planned `Video.seriesId` grouping (display title,
+ * cover image, manual ordering, archive state); it never reads or writes
+ * any `Video` row EXCEPT for the read-only published-episode COUNT
+ * `remove` performs to decide whether a hard delete is safe (see `remove`'s
+ * doc). No route in this service is reachable from the public API — every
+ * method here is called only from `SeriesController`, guarded by
+ * `JwtAuthGuard`+`AdminGuard`. The public `/videos/feed` grouping (still
+ * computed client-side from `Video.seriesId`) is completely unaffected by
+ * anything in this file.
  */
 @Injectable()
 export class SeriesService {
   constructor(private readonly prisma: PrismaService) {}
 
   /**
-   * Work unit 11E-4: lists every `Series` row, ordered deterministically by
-   * `sortOrder` then `id`, matching the existing `AdminMediaService.list`/
-   * public-feed ordering convention (`VideosService.findAll`). No
-   * pagination — the frozen contract marks it optional and not required,
-   * and there is no expected row-count pressure here (one row per curated
-   * series, not per episode).
+   * Work unit 11E-4 (extended in 11F-1): lists `Series` rows, ordered
+   * deterministically by `sortOrder` then `id`, matching the existing
+   * `AdminMediaService.list`/public-feed ordering convention
+   * (`VideosService.findAll`). No pagination — the frozen contract marks it
+   * optional and not required, and there is no expected row-count pressure
+   * here (one row per curated series, not per episode).
+   *
+   * Archived rows (`archivedAt` non-null) are EXCLUDED by default — safe
+   * archive is the primary "delete" action, so a plain list should read
+   * like an "active series" view. Passing `includeArchived=true` includes
+   * them alongside active rows, still in the same deterministic order.
    */
-  async list(): Promise<SeriesDto[]> {
+  async list(query: ListAdminSeriesQueryDto = {}): Promise<SeriesDto[]> {
     const rows = await this.prisma.series.findMany({
+      where: query.includeArchived === true ? {} : { archivedAt: null },
       orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }],
     });
 
     return rows.map(toSeriesDto);
+  }
+
+  /**
+   * Work unit 11F-1: `GET /admin/series/:id` read-detail. Returns an
+   * archived series too (unlike `list`'s default exclusion) — a caller that
+   * already has the id (e.g. from an `includeArchived=true` list, or one
+   * they created themselves) can always look it up directly; only the
+   * *default* list view hides archived rows.
+   */
+  async findById(id: string): Promise<SeriesDto> {
+    return toSeriesDto(await this.findSeriesOrThrow(id));
   }
 
   /**
@@ -136,6 +159,82 @@ export class SeriesService {
     return toSeriesDto(updated);
   }
 
+  /**
+   * Work unit 11F-1: safe (soft) archive — the PRIMARY "delete" action.
+   * Sets `archivedAt` to now; idempotent by construction — if the series is
+   * already archived, this returns the row UNCHANGED (no second write, no
+   * `archivedAt` timestamp drift, no `updatedAt` bump) rather than
+   * re-stamping it on every repeated call. 404s via `findSeriesOrThrow` for
+   * an unknown id.
+   */
+  async archive(id: string): Promise<SeriesDto> {
+    const series = await this.findSeriesOrThrow(id);
+
+    if (series.archivedAt !== null) {
+      return toSeriesDto(series);
+    }
+
+    const updated = await this.prisma.series.update({
+      where: { id },
+      data: { archivedAt: new Date() },
+    });
+
+    return toSeriesDto(updated);
+  }
+
+  /**
+   * Work unit 11F-1: reverses `archive` by clearing `archivedAt`.
+   * Idempotent by the same construction as `archive` — if the series is
+   * already active (not archived), this returns the row UNCHANGED. 404s via
+   * `findSeriesOrThrow` for an unknown id.
+   */
+  async unarchive(id: string): Promise<SeriesDto> {
+    const series = await this.findSeriesOrThrow(id);
+
+    if (series.archivedAt === null) {
+      return toSeriesDto(series);
+    }
+
+    const updated = await this.prisma.series.update({
+      where: { id },
+      data: { archivedAt: null },
+    });
+
+    return toSeriesDto(updated);
+  }
+
+  /**
+   * Work unit 11F-1: the guarded HARD delete — actually removes the
+   * `Series` metadata row. 404s via `findSeriesOrThrow` for an unknown id.
+   * Before deleting, counts `Video` rows sharing this `seriesId` that are
+   * currently `lifecycleState: "published"`; if that count is greater than
+   * zero, the delete is REFUSED with a 409 (`SERIES_HAS_PUBLISHED_EPISODES`)
+   * and NOTHING is written. This is the only place in this service that
+   * reads the `Video` table, and it is read-only (a `count`) — deleting a
+   * `Series` row NEVER touches, updates, or deletes any `Video` row, so an
+   * episode's `seriesId` and every other field are preserved exactly,
+   * whether or not the delete itself succeeds. Archived series are deletable
+   * too (archive state does not affect this check) as long as they have no
+   * published episodes.
+   */
+  async remove(id: string): Promise<void> {
+    await this.findSeriesOrThrow(id);
+
+    const publishedEpisodeCount = await this.prisma.video.count({
+      where: { seriesId: id, lifecycleState: MediaLifecycleState.PUBLISHED },
+    });
+
+    if (publishedEpisodeCount > 0) {
+      throw new AppException(
+        AppErrorCode.SERIES_HAS_PUBLISHED_EPISODES,
+        'Series has published episodes and cannot be deleted',
+        HttpStatus.CONFLICT,
+      );
+    }
+
+    await this.prisma.series.delete({ where: { id } });
+  }
+
   private async findSeriesOrThrow(id: string): Promise<SeriesRow> {
     const series = await this.prisma.series.findUnique({ where: { id } });
 
@@ -195,5 +294,6 @@ function toSeriesDto(record: SeriesRow): SeriesDto {
     sortOrder: record.sortOrder,
     createdAt: record.createdAt.toISOString(),
     updatedAt: record.updatedAt.toISOString(),
+    archivedAt: record.archivedAt ? record.archivedAt.toISOString() : null,
   };
 }

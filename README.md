@@ -678,14 +678,15 @@ Returns `200` with the updated `AdminMediaDto` — `accessTierOverride` is
 exposed only on this admin-only DTO, never on the public
 `VideoResponseDto`.
 
-### `GET` / `POST` / `PATCH /admin/series`
+### `GET` / `POST` / `PATCH` / `DELETE /admin/series`, archive/unarchive
 
-A lightweight, **additive** `Series` metadata model (work unit 11E-4) — a
-new Prisma table, not an extension of `Video`. Purely optional annotation
-of an existing `Video.seriesId` grouping: there is no database-level FK
-from `Video` to `Series`, and `GET /videos/feed`'s grouping/playback and
-the public `VideoResponseDto` shape are completely unaffected. No delete
-route (out of scope for this work unit).
+A lightweight, **additive** `Series` metadata model (work unit 11E-4;
+extended in 11F-1 with read-detail, safe archive/unarchive, and a guarded
+hard delete) — a new Prisma table, not an extension of `Video`. Purely
+optional annotation of an existing `Video.seriesId` grouping: there is no
+database-level FK from `Video` to `Series`, and `GET /videos/feed`'s
+grouping/playback and the public `VideoResponseDto` shape are completely
+unaffected.
 
 | Field | Type | Notes |
 |---|---|---|
@@ -694,9 +695,16 @@ route (out of scope for this work unit).
 | `coverImageKey` | string, 1–500 chars, optional | |
 | `sortOrder` | integer, `>= 0`, optional | defaults to `0` |
 | `createdAt` / `updatedAt` | ISO-8601 timestamps | server-managed |
+| `archivedAt` | ISO-8601 timestamp or `null` | work unit 11F-1; `null` = active. Set/cleared only via the archive/unarchive routes below. |
 
-- **`GET /admin/series`** — returns `200` with every `Series` row as
-  `SeriesDto[]`, ordered by `sortOrder` then `id`.
+- **`GET /admin/series`** — returns `200` with `Series` rows as
+  `SeriesDto[]`, ordered by `sortOrder` then `id`. **Excludes archived rows
+  by default** (work unit 11F-1) — pass `?includeArchived=true` (a
+  validated boolean; any value other than exactly `true`/`false`,
+  case-insensitive, is rejected with `400`) to include them too.
+- **`GET /admin/series/:id`** — work unit 11F-1 read-detail. Returns `200`
+  with the `SeriesDto` (archived or not), or `404 SERIES_NOT_FOUND` for an
+  unknown id.
 - **`POST /admin/series`** — body `{ "id", "title", "coverImageKey"?,
   "sortOrder"? }`. Returns `201` with the created `SeriesDto`. A
   duplicate `id` returns a clean `409 SERIES_ALREADY_EXISTS` (pre-checked,
@@ -708,9 +716,30 @@ route (out of scope for this work unit).
   immutable). At least one field must be present, or `400
   EMPTY_SERIES_UPDATE`. An unknown `id` returns `404 SERIES_NOT_FOUND`.
   Returns `200` with the updated `SeriesDto`.
+- **`POST /admin/series/:id/archive`** — work unit 11F-1: safe (soft)
+  archive, the PRIMARY "delete" action — sets `archivedAt` to now. No data
+  loss, fully reversible via `unarchive`. **Idempotent**: calling it again
+  on an already-archived series is a no-op (returns the row unchanged, no
+  timestamp drift). Returns `200` with the (now-archived) `SeriesDto`. An
+  unknown `id` returns `404 SERIES_NOT_FOUND`.
+- **`POST /admin/series/:id/unarchive`** — reverses `archive` by clearing
+  `archivedAt`. Idempotent the same way. Returns `200` with the
+  `SeriesDto`. An unknown `id` returns `404 SERIES_NOT_FOUND`.
+- **`DELETE /admin/series/:id`** — work unit 11F-1: the guarded HARD
+  delete — actually removes the `Series` metadata row. Before deleting,
+  counts `Video` rows sharing this `seriesId` with
+  `lifecycleState: "published"`; if that count is greater than zero, the
+  delete is **refused** with `409 SERIES_HAS_PUBLISHED_EPISODES` and
+  nothing is written. This is the only `Series` route that reads the
+  `Video` table, and it is read-only (a count) — a successful delete never
+  touches, updates, or deletes any `Video` row, so every episode's
+  `seriesId` and every other field is preserved exactly. Returns `204 No
+  Content` on success; an unknown `id` returns `404 SERIES_NOT_FOUND`. For
+  a series that still has published episodes, prefer `archive` instead —
+  it is always available and has no such restriction.
 
-No new environment variables were needed for this work unit — all four
-routes read/write the existing `DATABASE_URL` Postgres connection only.
+No new environment variables were needed for this work unit — every route
+reads/writes the existing `DATABASE_URL` Postgres connection only.
 
 ## Testing
 

@@ -152,6 +152,20 @@ model Series {
   sortOrder     Int      @default(0)
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
+  /// Phase 11, work unit 11F-1: safe (soft) archive — the PRIMARY "delete"
+  /// action for a `Series` row. Nullable with NO default, so every
+  /// pre-existing row (and every caller that creates/updates a `Series`
+  /// without specifying it) keeps compiling and backfills to `null`
+  /// ("active, not archived") — this additive migration changes no existing
+  /// row's value. Non-null means "archived at this timestamp"; archiving
+  /// and unarchiving only ever set/clear this column (no data loss, fully
+  /// reversible) via `POST /admin/series/:id/archive`/`:id/unarchive`.
+  /// `GET /admin/series` excludes archived rows by default and only
+  /// includes them when `includeArchived=true` is explicitly passed. This
+  /// is distinct from the guarded HARD `DELETE /admin/series/:id`, which
+  /// actually removes the row and is refused (409) whenever the series
+  /// still has published episodes.
+  archivedAt    DateTime?
 
   @@index([sortOrder])
 }

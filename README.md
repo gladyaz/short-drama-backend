@@ -580,6 +580,138 @@ library — remains gated behind R2 credential activation (11A-3 /
 11D-2-real / 11D-1-real), same as the rest of this phase's credential-free
 scope.
 
+## Admin content management API (Phase 11, work units 11E-1..11E-4)
+
+Four admin-guarded routes across two controllers, layered on top of the
+existing 11B-2/11B-3 admin auth-and-upload foundation described above.
+Every route in this section requires **both** a valid access token
+(`Authorization: Bearer <accessToken>`, `JwtAuthGuard`) **and** the
+caller's `User.role` to be `"admin"` (`AdminGuard`, work unit 11B-2) —
+`JwtAuthGuard` always runs first so `AdminGuard` can read `request.user`.
+A missing/invalid/expired token returns `401 INVALID_ACCESS_TOKEN`; a
+valid token belonging to a non-admin user returns `403
+ADMIN_ROLE_REQUIRED`.
+
+### `GET /admin/media`
+
+The admin inventory list (work unit 11E-1) — unlike the public
+`GET /videos/feed`, which only ever returns `published` rows, this returns
+rows across **all five** lifecycle states (`draft`, `ready`, `published`,
+`unpublished`, `failed`). Query params, all optional:
+
+| Param | Type | Notes |
+|---|---|---|
+| `status` | one of the five lifecycle states | filters to that state; an invalid value returns a clean `400` |
+| `seriesId` | string | filters to that series |
+| `page` | integer, `>= 1` | default `1` |
+| `pageSize` | integer, `1..100` | default `20` |
+
+Returns `200`:
+
+```json
+{ "items": [ /* AdminMediaDto[] */ ], "total": 0, "page": 1, "pageSize": 20 }
+```
+
+Ordered deterministically by `sortOrder` then `id`, matching the existing
+public-feed ordering convention. No schema change — this route only reads.
+
+### `PATCH /admin/media/:id`
+
+A partial metadata edit (work unit 11E-2). Body (`UpdateMediaMetadataDto`)
+accepts any subset of these seven fields, each mirroring the same
+`class-validator` constraint the original `POST /admin/media` create route
+already applies:
+
+- `title` (string, 1–200 chars)
+- `caption` (string, 1–2000 chars)
+- `category` (string, 1–100 chars)
+- `channelName` (string, 1–200 chars)
+- `sourceLanguage` (string, 1–20 chars)
+- `episodeNumber` (integer, `>= 1`)
+- `hasEmbeddedIndonesianSubtitle` (boolean)
+
+At least one field must be present — an empty body returns `400
+EMPTY_MEDIA_METADATA_UPDATE`. Every other `Video` column
+(`lifecycleState`, the object-storage/cover/thumbnail keys, `storageKey`,
+`sortOrder`, `likeCount`, `durationSeconds`/`width`/`height`,
+`accessTierOverride`) is immutable via this route: the global
+`ValidationPipe({ whitelist: true, forbidNonWhitelisted: true })` rejects
+a body containing any of them (or any other unrecognized field) with a
+`400` before the service is even called, and the service applies a
+second, independent whitelist as defense-in-depth. An unknown `id`
+returns `404 VIDEO_NOT_FOUND`. Returns `200` with the updated
+`AdminMediaDto`.
+
+### `PATCH /admin/media/:id/access-tier`
+
+Sets or clears a per-episode access-tier override (work unit 11E-3) — an
+**additive, opt-in mechanism layered on top of** the existing
+account-wide `FREE_EPISODE_LIMIT` free-episode rule (see "Entitlements
+API" above), which is otherwise completely unchanged. Body:
+
+```json
+{ "tier": "free" }
+```
+
+`tier` is **required** and must be exactly one of `"free"`, `"premium"`,
+or `null`:
+
+- `"premium"` — this episode always requires an active entitlement,
+  regardless of `episodeNumber`.
+- `"free"` — this episode always streams without an entitlement,
+  regardless of `episodeNumber`.
+- `null` — clears the override; the episode reverts to the existing
+  default rule (`episodeNumber > FREE_EPISODE_LIMIT` requires an
+  entitlement).
+
+Persisted on the additive `Video.accessTierOverride` column (nullable
+`String?`, no default — added by a single-column `ADD COLUMN` migration
+with no drop/default/backfill/data change). All 40 pre-existing `Video`
+rows migrated to `NULL`, so `GET /videos/:id/stream`'s behavior for
+existing content is unchanged by this work unit: the stream guard
+(`EntitlementsService.resolveEpisodePremium`) consults the override only
+when it is non-null; a `null`/missing override always falls through to
+the unchanged `isEpisodePremium(episodeNumber, FREE_EPISODE_LIMIT)`
+check. An invalid/missing `tier`, or any non-whitelisted extra field,
+returns a clean `400`; an unknown `id` returns `404 VIDEO_NOT_FOUND`.
+Returns `200` with the updated `AdminMediaDto` — `accessTierOverride` is
+exposed only on this admin-only DTO, never on the public
+`VideoResponseDto`.
+
+### `GET` / `POST` / `PATCH /admin/series`
+
+A lightweight, **additive** `Series` metadata model (work unit 11E-4) — a
+new Prisma table, not an extension of `Video`. Purely optional annotation
+of an existing `Video.seriesId` grouping: there is no database-level FK
+from `Video` to `Series`, and `GET /videos/feed`'s grouping/playback and
+the public `VideoResponseDto` shape are completely unaffected. No delete
+route (out of scope for this work unit).
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | string, 1–200 chars | the existing plain-string `seriesId` convention (e.g. `"series-104"`); client-provided on create, immutable afterward |
+| `title` | string, 1–200 chars | required on create |
+| `coverImageKey` | string, 1–500 chars, optional | |
+| `sortOrder` | integer, `>= 0`, optional | defaults to `0` |
+| `createdAt` / `updatedAt` | ISO-8601 timestamps | server-managed |
+
+- **`GET /admin/series`** — returns `200` with every `Series` row as
+  `SeriesDto[]`, ordered by `sortOrder` then `id`.
+- **`POST /admin/series`** — body `{ "id", "title", "coverImageKey"?,
+  "sortOrder"? }`. Returns `201` with the created `SeriesDto`. A
+  duplicate `id` returns a clean `409 SERIES_ALREADY_EXISTS` (pre-checked,
+  and also caught if a race loses to a raw Prisma unique-constraint
+  violation) rather than an unstructured 500.
+- **`PATCH /admin/series/:id`** — a partial edit: any subset of `title`,
+  `coverImageKey`, `sortOrder` (same constraints as create). `id` itself
+  is not accepted in the body (rejected by the global whitelist — it is
+  immutable). At least one field must be present, or `400
+  EMPTY_SERIES_UPDATE`. An unknown `id` returns `404 SERIES_NOT_FOUND`.
+  Returns `200` with the updated `SeriesDto`.
+
+No new environment variables were needed for this work unit — all four
+routes read/write the existing `DATABASE_URL` Postgres connection only.
+
 ## Testing
 
 ```bash

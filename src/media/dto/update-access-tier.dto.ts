@@ -10,7 +10,7 @@ import { IsIn } from 'class-validator';
  * - `"free"` — always streamable without an entitlement, regardless of
  *   `episodeNumber`.
  * - `null` — clears the override, reverting to the existing default
- *   `episodeNumber >= FREE_EPISODE_LIMIT` rule (`isEpisodePremium`).
+ *   `episodeNumber > FREE_EPISODE_LIMIT` rule (`isEpisodePremium`).
  *
  * `@IsIn` (class-validator's own array-membership check, not the
  * string-only `validator` package one) compares with `===`, so `null` is a

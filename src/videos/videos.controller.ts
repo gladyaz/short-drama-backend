@@ -46,7 +46,7 @@ export class VideosController {
    * through `EntitlementsService.resolveEpisodePremium`, which honors a
    * per-episode `accessTierOverride` (set via the admin-guarded
    * `PATCH /admin/media/:id/access-tier`) when one is set, and otherwise
-   * falls back UNCHANGED to the original `episodeNumber >=
+   * falls back UNCHANGED to the original `episodeNumber >
    * FREE_EPISODE_LIMIT` rule — every one of the 40 pre-existing rows has no
    * override, so this is behavior-preserving for them.
    */

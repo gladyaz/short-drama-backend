@@ -60,10 +60,34 @@ mobile app (Expo/React Native)  -->  NestJS backend  -->  local company storage 
 | `DATABASE_URL_TEST`   | Prisma connection string for a **dedicated** PostgreSQL test database (e.g. `.../short_drama_test`) — added in Phase 8P so `npm run test:e2e` never runs against dev data; required, or e2e tests fail loudly at startup (see "Database" below) |
 | `JWT_ACCESS_SECRET`   | Secret used to sign/verify short-lived (~15 min) access tokens — added in Phase 8 |
 | `JWT_REFRESH_SECRET`  | Secret used to key the HMAC-SHA256 hash of refresh tokens before they're persisted — added in Phase 8 |
+| `STORAGE_DRIVER`      | Which storage backend is active: `local` (default; unset/empty also resolves to `local`) or `r2` — added in Phase 11, work unit 11G-3. See "Storage driver (`STORAGE_DRIVER`)" below. |
 
 Configuration is validated at startup: the app refuses to start if any
 required variable is missing, or if `STORAGE_ROOT` does not exist / is not a
 directory, with a clear error message.
+
+### Storage driver (`STORAGE_DRIVER`)
+
+`STORAGE_DRIVER=local` (the default) preserves this project's existing
+behavior byte-for-byte and only requires `STORAGE_ROOT` above —
+`OBJECT_STORAGE_*` variables stay fully optional. `STORAGE_DRIVER=r2` is a
+feature flag only: it makes the app fail fast at startup (a clear,
+secret-free message naming the missing variable, never its value) if any
+`OBJECT_STORAGE_*` variable is unset, plus a shape-only check that
+`OBJECT_STORAGE_ENDPOINT` is a valid `http(s)` URL. Neither mode makes a
+network call at startup, and setting `STORAGE_DRIVER=r2` does not yet change
+what `StorageService` actually does — real request-time R2 wiring is a
+separate, later, human-gated step. See `docs/r2-readiness.md` for the full
+rollback and credential-insertion runbook.
+
+An opt-in, real-network disposable-object smoke test
+(`src/storage/storage-r2-smoke.spec.ts`, work unit 11G-4) round-trips a
+single uniquely-named object (`put` → `head` → `delete`) against an
+**already-existing** bucket. It **auto-skips with zero network calls**
+unless both `RUN_R2_SMOKE=1` is set explicitly AND every `OBJECT_STORAGE_*`
+variable is present — the default state in every environment, including
+CI. It never creates a bucket. See `docs/r2-readiness.md` section 3 for the
+key-naming and cleanup discipline.
 
 `JWT_ACCESS_SECRET` and `JWT_REFRESH_SECRET` must be two **different** random
 values (see `.env.example` for how to generate real ones locally). Real
@@ -135,7 +159,16 @@ The mobile app never receives an absolute filesystem path — only the relative
 
 ### `GET /videos/feed`
 
-Returns all registered video metadata records.
+Returns registered video metadata records that are both `published` and
+playable: rows in `draft`/`ready`/`unpublished`/`failed` lifecycle state are
+excluded, and — closing a residual leak the lifecycle filter alone doesn't
+cover (work unit 11G-1) — so is any `published` row with **no playable
+source at all**: an empty local `storageKey` (`""`) AND a null
+`objectStorageKey`. A row is kept if either source is present. Every one of
+the 40 original curated rows has a non-empty `storageKey`, so this is a
+no-op for existing content; it only matters for rows created by the admin
+media pipeline (see "Admin content management API" below) that are marked
+`published` before any real file exists.
 
 ### `GET /videos/:id`
 
@@ -463,6 +496,27 @@ Dev-only (`404 DEV_TOOLS_DISABLED` unless `DEV_TOOLS_ENABLED=true`, same
 gate as the entitlement dev routes). Returns uptime, DB reachability,
 node/app version — an operator signal beyond the public liveness ping at
 `GET /health`.
+
+As of Phase 11, work unit 11G-4, it also includes a `storage` section — a
+secret-free storage-readiness signal:
+
+```json
+{ "storage": { "driver": "local", "ready": true, "configPresent": true } }
+```
+
+- `driver` — the active `STORAGE_DRIVER` (`"local"` or `"r2"`).
+- `configPresent` — whether the required config variable **names** for the
+  active driver are all set (`local` → `STORAGE_ROOT`; `r2` → every
+  `OBJECT_STORAGE_*` name) — presence only, never a value.
+- `ready` — `local`: `STORAGE_ROOT` exists and is a readable directory (a
+  local `fs.stat`, never a network call). `r2`: always equal to
+  `configPresent` — this endpoint deliberately never makes a live network/R2
+  probe, so `ready: true` in `r2` mode means "the required config names are
+  set," not "R2 was successfully contacted."
+
+Booleans and the driver enum only — never the endpoint URL, bucket name,
+region, access key, secret, or any absolute storage path. See
+`docs/r2-readiness.md` for the full runbook.
 
 ## Media operations (Phase 11 — credential-free)
 

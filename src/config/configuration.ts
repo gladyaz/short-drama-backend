@@ -15,20 +15,37 @@ export interface AuthConfig {
 }
 
 /**
+ * Phase 11, work unit 11G-3: which storage backend the app is configured
+ * for. `local` is the default (unset/empty `STORAGE_DRIVER` resolves to
+ * `local`) and preserves today's existing behavior byte-for-byte — nothing
+ * in this slice changes what `StorageService`/`StorageModule` actually do
+ * with this value; wiring real R2 usage behind `driver === 'r2'` is a
+ * separate, later, human-gated unit. `r2` is only meaningful once
+ * `env.validation.ts` has confirmed (name-presence only, never value) that
+ * every `OBJECT_STORAGE_*` variable required by `StorageService` is set.
+ */
+export type StorageDriver = 'local' | 'r2';
+
+export const STORAGE_DRIVERS: readonly StorageDriver[] = ['local', 'r2'];
+
+export const DEFAULT_STORAGE_DRIVER: StorageDriver = 'local';
+
+/**
  * Phase 11, work unit 11A-1: provider-agnostic S3-compatible object storage
  * config, read by `StorageModule`/`StorageService`. Named generically
  * (`OBJECT_STORAGE_*`, not `R2_*`) because the service itself is
  * provider-agnostic even though Cloudflare R2 is the approved target
  * provider (see DECISIONS.md "Phase 11 (Production Media Storage...)
- * approved..." entry). Deliberately NOT added to `env.validation.ts`'s
- * `REQUIRED_KEYS`: this credential-free slice never constructs a real,
- * network-reaching client (unit tests inject a mocked client; nothing in
- * this slice wires `StorageService` up to routes that call the real AWS
- * SDK against these values) — see DECISIONS.md "Phase 11 runbook
- * reviewed..." entry. Real credentials are a human action deferred to
+ * approved..." entry). Real credentials are a human action deferred to
  * 11A-3, out of scope here.
+ *
+ * Phase 11, work unit 11G-3 update: `OBJECT_STORAGE_*` variable NAMES are
+ * now required by `env.validation.ts`, but ONLY when `STORAGE_DRIVER=r2`
+ * (see `driver` below); in the default `local` mode they remain fully
+ * optional, exactly as before this unit.
  */
 export interface StorageConfig {
+  driver: StorageDriver;
   endpoint: string;
   region: string;
   bucket: string;
@@ -59,6 +76,7 @@ export default (): RootConfig => ({
     jwtRefreshSecret: process.env.JWT_REFRESH_SECRET ?? '',
   },
   storage: {
+    driver: resolveStorageDriver(),
     endpoint: process.env.OBJECT_STORAGE_ENDPOINT ?? '',
     region: process.env.OBJECT_STORAGE_REGION ?? 'auto',
     bucket: process.env.OBJECT_STORAGE_BUCKET ?? '',
@@ -67,3 +85,14 @@ export default (): RootConfig => ({
     publicBaseUrl: process.env.OBJECT_STORAGE_PUBLIC_BASE_URL ?? '',
   },
 });
+
+/**
+ * Phase 11, work unit 11G-3: resolves `STORAGE_DRIVER` unset/empty/`local`
+ * to `local` (the default). `env.validation.ts` runs before this factory
+ * (see `ConfigModule.forRoot`'s `validate` option in `app.module.ts`) and
+ * already fails the app's boot for any value other than `local`/`r2`, so by
+ * the time this runs the only other possible value is the literal `r2`.
+ */
+function resolveStorageDriver(): StorageDriver {
+  return process.env.STORAGE_DRIVER === 'r2' ? 'r2' : DEFAULT_STORAGE_DRIVER;
+}

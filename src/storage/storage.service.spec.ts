@@ -24,6 +24,7 @@ import { StorageService } from './storage.service';
 jest.mock('@aws-sdk/s3-request-presigner');
 
 const TEST_STORAGE_CONFIG: RootConfig['storage'] = {
+  driver: 'local',
   endpoint: 'https://mock.r2.example.test',
   region: 'auto',
   bucket: 'mock-bucket',

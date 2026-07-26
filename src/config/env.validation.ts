@@ -24,8 +24,14 @@ const REQUIRED_KEYS = [
  * and `publicBaseUrl` (`StorageService.buildPublicUrl`). This is
  * presence/name validation only — no value is ever read into an error
  * message and no network call is made here.
+ *
+ * Exported (Phase 11, work unit 11G-4) so `StorageReadinessService` and the
+ * opt-in disposable-object smoke test can reuse the exact same list of
+ * variable NAMES instead of duplicating it — neither ever reads this
+ * constant as anything but a list of names to check presence/env-var access
+ * for.
  */
-const REQUIRED_R2_KEYS = [
+export const REQUIRED_R2_KEYS = [
   'OBJECT_STORAGE_ENDPOINT',
   'OBJECT_STORAGE_REGION',
   'OBJECT_STORAGE_BUCKET',

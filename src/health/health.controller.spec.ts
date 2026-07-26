@@ -2,18 +2,34 @@ import { ConfigService } from '@nestjs/config';
 import { Test, TestingModule } from '@nestjs/testing';
 import { PrismaService } from '../prisma/prisma.service';
 import { HealthController } from './health.controller';
+import { StorageReadinessService } from './storage-readiness.service';
+import { StorageReadinessResponse } from './storage-readiness.types';
 
 describe('HealthController', () => {
   let controller: HealthController;
   let queryRaw: jest.Mock;
+  let checkStorageReadiness: jest.Mock<StorageReadinessResponse, []>;
+
+  const fixtureReadiness: StorageReadinessResponse = {
+    driver: 'local',
+    ready: true,
+    configPresent: true,
+  };
 
   beforeEach(async () => {
     queryRaw = jest.fn().mockResolvedValue([{ '?column?': 1 }]);
+    checkStorageReadiness = jest
+      .fn<StorageReadinessResponse, []>()
+      .mockReturnValue(fixtureReadiness);
 
     const module: TestingModule = await Test.createTestingModule({
       controllers: [HealthController],
       providers: [
         { provide: PrismaService, useValue: { $queryRaw: queryRaw } },
+        {
+          provide: StorageReadinessService,
+          useValue: { check: checkStorageReadiness },
+        },
         // Route-level @UseGuards(DevToolsGuard) resolves through DI even in
         // unit tests, and the guard's only dependency is ConfigService.
         {
@@ -52,5 +68,15 @@ describe('HealthController', () => {
 
     expect(details.status).toBe('ok');
     expect(details.database).toBe('unreachable');
+  });
+
+  // Phase 11, work unit 11G-4. `StorageReadinessService` itself is unit
+  // tested in `storage-readiness.service.spec.ts`; here we only confirm the
+  // controller wires its result through untouched, under the `storage` key.
+  it('includes the storage-readiness result from StorageReadinessService', async () => {
+    const details = await controller.getDetails();
+
+    expect(checkStorageReadiness).toHaveBeenCalledTimes(1);
+    expect(details.storage).toEqual(fixtureReadiness);
   });
 });

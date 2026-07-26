@@ -1,6 +1,8 @@
 import { Controller, Get, UseGuards } from '@nestjs/common';
 import { DevToolsGuard } from '../entitlements/guards/dev-tools.guard';
 import { PrismaService } from '../prisma/prisma.service';
+import { StorageReadinessService } from './storage-readiness.service';
+import { StorageReadinessResponse } from './storage-readiness.types';
 
 interface HealthResponse {
   status: 'ok';
@@ -15,11 +17,21 @@ interface HealthDetailsResponse {
   nodeVersion: string;
   /** From npm's env when started via an npm script; null under plain `node`. */
   version: string | null;
+  /**
+   * Phase 11, work unit 11G-4: secret-free storage-readiness signal — see
+   * `StorageReadinessResponse` for the exact (booleans + driver enum only)
+   * shape. Never the endpoint, bucket, region, access key, secret, or any
+   * absolute storage path.
+   */
+  storage: StorageReadinessResponse;
 }
 
 @Controller('health')
 export class HealthController {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly storageReadiness: StorageReadinessService,
+  ) {}
 
   @Get()
   getHealth(): HealthResponse {
@@ -53,6 +65,7 @@ export class HealthController {
       database,
       nodeVersion: process.version,
       version: process.env.npm_package_version ?? null,
+      storage: this.storageReadiness.check(),
     };
   }
 }

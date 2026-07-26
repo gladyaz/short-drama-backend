@@ -5,6 +5,7 @@ import { AppErrorCode } from '../common/errors/app-error-code';
 import { AppException } from '../common/errors/app.exception';
 import { PrismaService } from '../prisma/prisma.service';
 import { VideosService } from './videos.service';
+import { VIDEOS } from './videos.data';
 
 // Only `existsSync`/`statSync` are mocked, and they fall back to the real
 // implementation by default. Prisma's query engine needs the real `fs`
@@ -189,6 +190,54 @@ describe('VideosService', () => {
 
       expect(specVideoIds).not.toContain(testVideos[0].id);
       expect(specVideoIds).toContain(testVideos[1].id);
+    });
+
+    describe('non-playable published rows (Phase 11, work unit 11G-1)', () => {
+      it('excludes a published row with an empty storageKey and no objectStorageKey', async () => {
+        await prisma.video.update({
+          where: { id: testVideos[0].id },
+          data: { storageKey: '', objectStorageKey: null },
+        });
+
+        const videos = await service.findAll();
+        const specVideoIds = videos.map((video) => video.id);
+
+        expect(specVideoIds).not.toContain(testVideos[0].id);
+        expect(specVideoIds).toContain(testVideos[1].id);
+      });
+
+      it('keeps a published row with a non-empty storageKey (the existing/default shape)', async () => {
+        const videos = await service.findAll();
+        const specVideoIds = videos.map((video) => video.id);
+
+        // testVideos[0] already has a non-empty storageKey and no
+        // objectStorageKey from the beforeEach fixture — this is the
+        // baseline "still works" case for the OR filter.
+        expect(specVideoIds).toContain(testVideos[0].id);
+      });
+
+      it('keeps a published row with an empty storageKey but a non-null objectStorageKey', async () => {
+        await prisma.video.update({
+          where: { id: testVideos[0].id },
+          data: { storageKey: '', objectStorageKey: 'r2/spec-video-one.mp4' },
+        });
+
+        const videos = await service.findAll();
+        const specVideoIds = videos.map((video) => video.id);
+
+        expect(specVideoIds).toContain(testVideos[0].id);
+      });
+
+      it('does not change feed length behavior for the real 40 seed rows (all still present)', async () => {
+        const videos = await service.findAll();
+        const returnedIds = new Set(videos.map((video) => video.id));
+        const seedIds = VIDEOS.map((video) => video.id);
+
+        expect(seedIds).toHaveLength(40);
+        for (const seedId of seedIds) {
+          expect(returnedIds.has(seedId)).toBe(true);
+        }
+      });
     });
   });
 

@@ -41,8 +41,23 @@ export class VideosService {
     // real, streamable file yet. Every one of the 40 pre-existing rows
     // already defaults to `"published"` (11A-2's migration), so this is a
     // no-op for them and does not change `findAll`'s existing behavior.
+    //
+    // The `OR` (Phase 11, work unit 11G-1): closes a residual leak the
+    // `lifecycleState` filter above does not cover — a row can be marked
+    // `published` (e.g. by a future/partial admin flow) while still having
+    // no playable source at all: an empty local `storageKey` (`""`, the
+    // fallback used by non-file fixtures — see e.g.
+    // `test/videos.e2e-spec.ts`'s `createOverrideFixture`) AND no
+    // `objectStorageKey` (the R2/S3 pipeline column added in 11A-2, still
+    // unused for real playback — see 11A-3/11B). A row is kept if EITHER
+    // source is present; it is excluded only when both are absent. Every one
+    // of the 40 pre-existing seed rows has a non-empty `storageKey`, so this
+    // is a no-op for them and does not change `findAll`'s existing behavior.
     const records = await this.prisma.video.findMany({
-      where: { lifecycleState: MediaLifecycleState.PUBLISHED },
+      where: {
+        lifecycleState: MediaLifecycleState.PUBLISHED,
+        OR: [{ storageKey: { not: '' } }, { objectStorageKey: { not: null } }],
+      },
       orderBy: { sortOrder: 'asc' },
     });
     return records.map((record) =>

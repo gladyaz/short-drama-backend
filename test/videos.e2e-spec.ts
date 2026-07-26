@@ -102,6 +102,71 @@ describe('Videos (e2e)', () => {
     }
   });
 
+  /**
+   * Phase 11, work unit 11G-1: `VideosService.findAll` also excludes a
+   * `published` row that has no playable source at all (empty `storageKey`
+   * AND null `objectStorageKey`) — closing the 11B-3 placeholder-leak gap
+   * (`lifecycleState: published` alone does not guarantee a real file). The
+   * fixture below is created directly via `prisma.video.create` (mirroring
+   * the 11E-3 `createOverrideFixture` pattern) with a uniquely prefixed
+   * `id`/`seriesId` and removed in `afterAll`, so it never pollutes the
+   * shared `short_drama_test` database beyond this describe block.
+   */
+  describe('GET /videos/feed — non-playable published rows (Phase 11, work unit 11G-1)', () => {
+    const nonPlayableSeriesId = `${emailPrefix}-11g1-non-playable`;
+    const nonPlayableId = `${nonPlayableSeriesId}-01`;
+
+    afterAll(async () => {
+      await prisma.video.deleteMany({
+        where: { seriesId: nonPlayableSeriesId },
+      });
+    });
+
+    it('returns exactly the 40 published seed rows and excludes a published row with no playable source', async () => {
+      await prisma.video.create({
+        data: {
+          id: nonPlayableId,
+          seriesId: nonPlayableSeriesId,
+          title: 'Non-playable fixture',
+          episodeNumber: 1,
+          channelName: 'E2E Channel',
+          caption: 'No playable source',
+          category: 'drama',
+          storageKey: '',
+          sourceLanguage: 'zh',
+          hasEmbeddedIndonesianSubtitle: true,
+          likeCount: 0,
+          lifecycleState: 'published',
+          // objectStorageKey intentionally omitted -> defaults to null.
+        },
+      });
+
+      const response = await request(app.getHttpServer())
+        .get('/videos/feed')
+        .expect(HttpStatus.OK);
+
+      const videos = response.body as VideoResponseDto[];
+      const videoIds = videos.map((video) => video.id);
+
+      // The non-playable published row must never leak into the feed.
+      expect(videoIds).not.toContain(nonPlayableId);
+
+      // Every one of the 40 real seed rows is still present — their
+      // storageKey has always been non-empty, so the new filter is a no-op
+      // for them. Scoped to the known seed ids rather than the raw response
+      // array length: other e2e spec files run concurrently in separate
+      // Jest workers against the same `short_drama_test` database and may
+      // have their own transient `published` fixtures in flight at the same
+      // instant, which would make an assertion on the total array length
+      // flaky.
+      const seedIds = VIDEOS.map((video) => video.id);
+      expect(seedIds).toHaveLength(40);
+      const returnedSeedIds = videoIds.filter((id) => seedIds.includes(id));
+      expect(returnedSeedIds).toHaveLength(40);
+      expect(new Set(returnedSeedIds)).toEqual(new Set(seedIds));
+    });
+  });
+
   it('GET /videos/:id returns the matching video', async () => {
     const response = await request(app.getHttpServer())
       .get('/videos/video-104-01')

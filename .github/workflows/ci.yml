@@ -1,0 +1,154 @@
+name: CI
+
+# CI-1 (Early CI Quality-Gate Baseline — DECISIONS.md, 2026-07-27; runbook
+# .claude/plans/rfc-dag-safe-ci-baseline.md in the control workspace). This
+# workflow is inert until this repo is pushed to GitHub — pushing and
+# branch-protection configuration are separate, later human steps (CI-4).
+#
+# No production secrets, no real R2/object storage, no deploy, no push, no
+# auto-merge. Every credential below (Postgres password, JWT signing
+# secrets) is a literal, test-only value — never a real secret — and
+# STORAGE_DRIVER=local means no OBJECT_STORAGE_* variable is ever required
+# or read.
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  quality-gate:
+    name: Build, lint, unit + e2e tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      # Literal, throwaway, test-only credentials — not a real credential.
+      # Two logical databases (short_drama_dev / short_drama_test) live on
+      # this single service container, mirroring the two-database dev/test
+      # split used locally (see .env.example). The `short_drama_test`
+      # database is created explicitly in a later step; Postgres only
+      # creates POSTGRES_DB on first boot.
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: ci_local_test_only
+          POSTGRES_PASSWORD: ci_local_test_only
+          POSTGRES_DB: short_drama_dev
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U ci_local_test_only -d short_drama_dev"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+
+    env:
+      # Two databases on the one postgres:16 service above. DATABASE_URL is
+      # used directly by unit tests (src/**/*.spec.ts, which hit Prisma
+      # directly, matching existing local-dev precedent); DATABASE_URL_TEST
+      # is the dedicated database test/jest-e2e.setup.ts redirects
+      # DATABASE_URL to for the duration of the e2e run only, exactly as it
+      # does locally.
+      DATABASE_URL: postgresql://ci_local_test_only:ci_local_test_only@localhost:5432/short_drama_dev
+      DATABASE_URL_TEST: postgresql://ci_local_test_only:ci_local_test_only@localhost:5432/short_drama_test
+      # local driver -> no OBJECT_STORAGE_*/R2 variable is required or read
+      # (see src/config/env.validation.ts's validateStorageDriver).
+      STORAGE_DRIVER: local
+      STORAGE_ROOT: ${{ github.workspace }}/.ci-storage
+      PORT: 3000
+      PUBLIC_BASE_URL: http://localhost:3000
+      CORS_ORIGINS: http://localhost:8081
+      # Dummy, non-secret, test-only values — never real JWT signing
+      # secrets. Clearly labeled so they are never mistaken for one.
+      JWT_ACCESS_SECRET: ci-test-only-access-secret-not-a-real-credential
+      JWT_REFRESH_SECRET: ci-test-only-refresh-secret-not-a-real-credential
+      DEV_TOOLS_ENABLED: 'false'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Prepare log directory (for failure-only artifact upload)
+        run: mkdir -p ci-logs
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Create second database (short_drama_test)
+        env:
+          PGPASSWORD: ci_local_test_only
+        run: |
+          psql -h localhost -U ci_local_test_only -d short_drama_dev \
+            -c 'CREATE DATABASE short_drama_test;'
+
+      - name: Run migrations (short_drama_dev)
+        run: npx prisma migrate deploy
+
+      - name: Run migrations (short_drama_test)
+        env:
+          DATABASE_URL: ${{ env.DATABASE_URL_TEST }}
+        run: npx prisma migrate deploy
+
+      - name: Seed short_drama_dev (idempotent)
+        run: npm run db:seed
+
+      - name: Seed short_drama_test (idempotent)
+        env:
+          DATABASE_URL: ${{ env.DATABASE_URL_TEST }}
+        run: npm run db:seed
+
+      # Company MP4s are never committed (see .gitignore's `*.mp4` rule) and
+      # do not exist on this runner. This generates minimal, non-real
+      # placeholder files at every seeded storageKey under STORAGE_ROOT so
+      # the byte-range stream e2e tests can exercise a real 206 response.
+      # See scripts/generate-media-fixtures.ts for the full investigation
+      # and the "never overwrites an existing file" safety property.
+      - name: Generate placeholder media fixtures
+        run: npm run media:fixtures
+
+      - name: Build (typecheck/compile gate)
+        run: |
+          set -o pipefail
+          npm run build 2>&1 | tee ci-logs/build.log
+
+      - name: Lint (verify only — no --fix in CI)
+        run: |
+          set -o pipefail
+          npm run lint:ci 2>&1 | tee ci-logs/lint.log
+
+      - name: Unit tests
+        run: |
+          set -o pipefail
+          npm test 2>&1 | tee ci-logs/unit-test.log
+
+      - name: E2E tests
+        run: |
+          set -o pipefail
+          npm run test:e2e 2>&1 | tee ci-logs/e2e-test.log
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-logs/
+          if-no-files-found: ignore
+          retention-days: 5

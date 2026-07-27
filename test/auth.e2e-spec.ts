@@ -2,6 +2,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { HttpStatus, INestApplication, ValidationPipe } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
+import { getStorageToken, ThrottlerStorageService } from '@nestjs/throttler';
 import request from 'supertest';
 import { App } from 'supertest/types';
 import { AppModule } from './../src/app.module';
@@ -28,6 +29,7 @@ describe('Auth (e2e)', () => {
   let prisma: PrismaService;
   let jwtService: JwtService;
   let configService: ConfigService<RootConfig>;
+  let throttlerStorage: ThrottlerStorageService;
 
   const emailPrefix = 'auth-e2e-spec+8b5';
   const uniqueEmail = (label: string): string =>
@@ -52,6 +54,26 @@ describe('Auth (e2e)', () => {
     prisma = moduleFixture.get<PrismaService>(PrismaService);
     jwtService = moduleFixture.get<JwtService>(JwtService);
     configService = moduleFixture.get<ConfigService<RootConfig>>(ConfigService);
+    // `ThrottlerModule.forRoot` registers its storage provider under the
+    // `ThrottlerStorage` injection token (a symbol), not the
+    // `ThrottlerStorageService` class itself — `getStorageToken()` is the
+    // package's own exported helper for looking it up.
+    throttlerStorage =
+      moduleFixture.get<ThrottlerStorageService>(getStorageToken());
+  });
+
+  // Phase 12, work unit 12A-B1: `/auth/register|login|refresh` are now
+  // IP-rate-limited (see `rate-limit.constants.ts`). This whole spec file
+  // shares a single `app` instance (and therefore a single in-memory
+  // `ThrottlerStorageService`) across many `it()` blocks that each
+  // legitimately call these routes — clearing the tracked-request storage
+  // before every test keeps each test's own request count isolated, so the
+  // PRE-EXISTING functional assertions below (register/login/refresh/logout
+  // behavior) are unaffected by the new rate limits. Dedicated rate-limit
+  // *exceeding* behavior is covered by
+  // `auth-rate-limit-lockout.e2e-spec.ts`, which does not share this reset.
+  beforeEach(() => {
+    throttlerStorage.storage.clear();
   });
 
   afterAll(async () => {

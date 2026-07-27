@@ -8,6 +8,7 @@ import { RootConfig } from '../config/configuration';
 import { AppErrorCode } from '../common/errors/app-error-code';
 import { AppException } from '../common/errors/app.exception';
 import { PrismaService } from '../prisma/prisma.service';
+import { AccountLockoutService } from './account-lockout.service';
 import {
   ACCESS_TOKEN_TTL,
   BCRYPT_COST_FACTOR,
@@ -45,6 +46,7 @@ export class AuthService {
     private readonly prisma: PrismaService,
     private readonly jwtService: JwtService,
     private readonly configService: ConfigService<RootConfig>,
+    private readonly accountLockoutService: AccountLockoutService,
   ) {}
 
   async register(dto: RegisterDto): Promise<AuthResponseDto> {
@@ -88,16 +90,40 @@ export class AuthService {
     // against a fixed dummy hash. This keeps the response latency for
     // "email not found" and "wrong password" statistically indistinguishable,
     // defending against timing-based user enumeration. The error thrown
-    // below is identical in both cases regardless.
+    // below is identical in all cases regardless (wrong password, no such
+    // account, or a locked account — see below).
     const passwordMatches = await bcrypt.compare(
       dto.password,
       user?.passwordHash ?? DUMMY_HASH_FOR_TIMING_PARITY,
     );
 
-    if (!user || !passwordMatches) {
+    if (!user) {
       throw invalidCredentials();
     }
 
+    // Phase 12, work unit 12A-B1: persistent account lockout (DECISIONS.md
+    // "Phase 12 ... approved..." entry, decision 4). This check — and the
+    // `AccountLockoutService` calls below — only ever run for an email that
+    // already resolved to a real `User` row above, so a nonexistent email
+    // never creates or touches lockout state (no enumeration surface). While
+    // locked, login is refused with the SAME generic error even if
+    // `passwordMatches` is true: a correct password must not unlock the
+    // account early or reveal that the password was in fact correct. Note
+    // this one extra indexed lookup (present only for existing accounts) is
+    // a bounded, deliberately accepted timing signal, dwarfed by the bcrypt
+    // comparison above — see this method's existing dummy-hash comment for
+    // the same "statistically indistinguishable, not perfectly
+    // constant-time" tradeoff already made by this code.
+    if (await this.accountLockoutService.isLocked(user.id)) {
+      throw invalidCredentials();
+    }
+
+    if (!passwordMatches) {
+      await this.accountLockoutService.recordFailure(user.id);
+      throw invalidCredentials();
+    }
+
+    await this.accountLockoutService.recordSuccess(user.id);
     return this.issueTokensAndSession(user);
   }
 

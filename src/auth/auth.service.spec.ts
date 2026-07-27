@@ -6,6 +6,7 @@ import type { Session } from '@prisma/client';
 import { AppErrorCode } from '../common/errors/app-error-code';
 import { AppException } from '../common/errors/app.exception';
 import { PrismaService } from '../prisma/prisma.service';
+import { AccountLockoutService } from './account-lockout.service';
 import { AuthService } from './auth.service';
 
 const TEST_AUTH_CONFIG = {
@@ -36,6 +37,7 @@ describe('AuthService', () => {
       providers: [
         AuthService,
         PrismaService,
+        AccountLockoutService,
         {
           provide: ConfigService,
           useValue: { get: jest.fn().mockReturnValue(TEST_AUTH_CONFIG) },
@@ -50,6 +52,13 @@ describe('AuthService', () => {
   });
 
   afterEach(async () => {
+    // `AccountLockout`/`Session` both cascade-delete with their `User`
+    // (Phase 12 additive migration, `onDelete: Cascade`), but this is
+    // explicit rather than relying on that alone, matching the existing
+    // `session.deleteMany` line's own precedent below.
+    await prisma.accountLockout.deleteMany({
+      where: { user: { email: { contains: emailPrefix } } },
+    });
     await prisma.session.deleteMany({
       where: { user: { email: { contains: emailPrefix } } },
     });
@@ -216,6 +225,103 @@ describe('AuthService', () => {
       expect((nonexistentEmailError as AppException).message).toBe(
         (wrongPasswordError as AppException).message,
       );
+    });
+
+    /**
+     * Phase 12, work unit 12A-B1: persistent account lockout, exercised
+     * through the real `AuthService.login` path (not just
+     * `AccountLockoutService` in isolation — see `account-lockout.service.spec.ts`
+     * for the lockout-logic-only coverage of increments/threshold/window/
+     * reset). This proves the two are actually wired together correctly.
+     */
+    it('locks the account after 10 failed logins and rejects a SUBSEQUENT CORRECT password with the identical generic error while locked', async () => {
+      const email = uniqueEmail('login-lockout');
+      const correctPassword = 'correct-horse-battery';
+      await service.register({ email, password: correctPassword });
+
+      let wrongPasswordError: unknown;
+      for (let i = 0; i < 10; i += 1) {
+        try {
+          await service.login({ email, password: 'totally-wrong-password' });
+        } catch (error) {
+          wrongPasswordError = error;
+        }
+      }
+
+      // The 10th failure should have locked the account — even the
+      // genuinely correct password is now rejected.
+      let lockedCorrectPasswordError: unknown;
+      try {
+        await service.login({ email, password: correctPassword });
+      } catch (error) {
+        lockedCorrectPasswordError = error;
+      }
+
+      expect(lockedCorrectPasswordError).toBeInstanceOf(AppException);
+      expect(wrongPasswordError).toBeInstanceOf(AppException);
+      expect((lockedCorrectPasswordError as AppException).code).toBe(
+        (wrongPasswordError as AppException).code,
+      );
+      expect((lockedCorrectPasswordError as AppException).message).toBe(
+        (wrongPasswordError as AppException).message,
+      );
+      expect((lockedCorrectPasswordError as AppException).code).toBe(
+        AppErrorCode.INVALID_CREDENTIALS,
+      );
+
+      const lockout = await prisma.accountLockout.findFirst({
+        where: { user: { email } },
+      });
+      expect(lockout?.lockedUntil).not.toBeNull();
+    });
+
+    it('allows login again once the lock window has elapsed (simulated via the stored timestamp)', async () => {
+      const email = uniqueEmail('login-lockout-expired');
+      const correctPassword = 'correct-horse-battery';
+      const registered = await service.register({
+        email,
+        password: correctPassword,
+      });
+
+      await prisma.accountLockout.create({
+        data: {
+          userId: registered.user.id,
+          failedCount: 10,
+          windowStartedAt: new Date(Date.now() - 20 * 60 * 1000),
+          lockedUntil: new Date(Date.now() - 1000), // already elapsed
+        },
+      });
+
+      const result = await service.login({ email, password: correctPassword });
+      expect(result.user.email).toBe(email);
+
+      const lockout = await prisma.accountLockout.findFirst({
+        where: { user: { email } },
+      });
+      expect(lockout?.failedCount).toBe(0);
+      expect(lockout?.lockedUntil).toBeNull();
+    });
+
+    it('a successful login resets the failure count so it does not carry over toward a future lock', async () => {
+      const email = uniqueEmail('login-reset-on-success');
+      const correctPassword = 'correct-horse-battery';
+      await service.register({ email, password: correctPassword });
+
+      for (let i = 0; i < 9; i += 1) {
+        await expect(
+          service.login({ email, password: 'totally-wrong-password' }),
+        ).rejects.toBeInstanceOf(AppException);
+      }
+
+      // The 10th attempt succeeds and must reset the counter — otherwise a
+      // 10th call here would already be the lockout-triggering failure.
+      await service.login({ email, password: correctPassword });
+
+      const lockout = await prisma.accountLockout.findFirst({
+        where: { user: { email } },
+      });
+      expect(lockout?.failedCount).toBe(0);
+      expect(lockout?.lockedUntil).toBeNull();
     });
   });
 

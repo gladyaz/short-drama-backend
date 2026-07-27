@@ -1,11 +1,17 @@
 import { MiddlewareConsumer, Module, NestModule } from '@nestjs/common';
+import { APP_GUARD } from '@nestjs/core';
 import { ConfigModule } from '@nestjs/config';
+import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { AdminModule } from './admin/admin.module';
 import { AnalyticsModule } from './analytics/analytics.module';
 import { AuthModule } from './auth/auth.module';
 import { RequestLoggingMiddleware } from './common/logging/request-logging.middleware';
+import {
+  DEFAULT_THROTTLE_LIMIT,
+  DEFAULT_THROTTLE_TTL_MS,
+} from './common/rate-limit.constants';
 import configuration from './config/configuration';
 import { validateEnv } from './config/env.validation';
 import { EntitlementsModule } from './entitlements/entitlements.module';
@@ -25,6 +31,25 @@ import { VideosModule } from './videos/videos.module';
       load: [configuration],
       validate: validateEnv,
     }),
+    // Phase 12, work unit 12A-B1: coarse, in-memory, per-IP request
+    // throttling (DECISIONS.md "Phase 12 ... approved..." entry, decision
+    // 4). A single named ("default") throttler with a generous global limit
+    // — `@Throttle({ default: { limit, ttl } })` on
+    // `/auth/login|register|refresh` in `AuthController` OVERRIDES this
+    // limit for just those three routes, it does not add a second
+    // globally-applied throttler. Every other route (`/videos/*`,
+    // `/admin/*`, `/health`, etc.) is subject only to this generous default,
+    // so existing/legitimate traffic patterns never trip it.
+    ThrottlerModule.forRoot({
+      throttlers: [
+        {
+          name: 'default',
+          ttl: DEFAULT_THROTTLE_TTL_MS,
+          limit: DEFAULT_THROTTLE_LIMIT,
+        },
+      ],
+      errorMessage: 'Too many requests. Please try again later.',
+    }),
     PrismaModule,
     HealthModule,
     VideosModule,
@@ -39,7 +64,7 @@ import { VideosModule } from './videos/videos.module';
     SeriesModule,
   ],
   controllers: [AppController],
-  providers: [AppService],
+  providers: [AppService, { provide: APP_GUARD, useClass: ThrottlerGuard }],
 })
 export class AppModule implements NestModule {
   // Phase 11, work unit 11-B1: structured request-completion logging on

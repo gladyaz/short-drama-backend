@@ -49,3 +49,15 @@ export const REFRESH_TOKEN_BYTES = 32;
  */
 export const DUMMY_HASH_FOR_TIMING_PARITY =
   '$2b$12$N7tlODmEntCTP6fs4ftUg.LlMkEyHyu.r94/xQvgBVT48bIxb8Djq';
+
+/**
+ * Phase 12, work unit 12A-B1: persistent PostgreSQL account-lockout
+ * thresholds (see DECISIONS.md "Phase 12 ... approved..." entry, decision
+ * 4). An existing account is locked for `LOCKOUT_DURATION_MS` after
+ * `LOCKOUT_FAILURE_THRESHOLD` failed login attempts within a rolling
+ * `LOCKOUT_WINDOW_MS` window. See `AccountLockoutService` for the full
+ * rolling-window/lock logic.
+ */
+export const LOCKOUT_FAILURE_THRESHOLD = 10;
+export const LOCKOUT_WINDOW_MS = 15 * 60 * 1000;
+export const LOCKOUT_DURATION_MS = 15 * 60 * 1000;

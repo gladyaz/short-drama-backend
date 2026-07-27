@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { JwtModule } from '@nestjs/jwt';
+import { AccountLockoutService } from './account-lockout.service';
 import { AuthController } from './auth.controller';
 import { AuthService } from './auth.service';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
@@ -15,7 +16,7 @@ import { JwtAuthGuard } from './guards/jwt-auth.guard';
 @Module({
   imports: [JwtModule.register({})],
   controllers: [AuthController],
-  providers: [AuthService, JwtAuthGuard],
+  providers: [AuthService, JwtAuthGuard, AccountLockoutService],
   // `JwtModule` is re-exported alongside `JwtAuthGuard` so that any module
   // importing `AuthModule` purely to reuse `JwtAuthGuard` (e.g. Phase 9's
   // `InteractionsModule`/`ProgressModule`) also has `JwtService` available

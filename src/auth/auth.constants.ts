@@ -61,3 +61,41 @@ export const DUMMY_HASH_FOR_TIMING_PARITY =
 export const LOCKOUT_FAILURE_THRESHOLD = 10;
 export const LOCKOUT_WINDOW_MS = 15 * 60 * 1000;
 export const LOCKOUT_DURATION_MS = 15 * 60 * 1000;
+
+/**
+ * Phase 12, work unit 12B-B3: `POST /auth/password-reset/request` /
+ * `POST /auth/password-reset/confirm` (DECISIONS.md "Phase 12 ...
+ * approved..." entry, decision 3). Same entropy as `REFRESH_TOKEN_BYTES`
+ * (32 bytes = 256 bits, hex-encoded) — a separate named constant rather than
+ * reusing `REFRESH_TOKEN_BYTES` directly, since a reset token and a refresh
+ * token are conceptually different values that just happen to want the same
+ * byte length today; a future change to one must not silently change the
+ * other.
+ */
+export const PASSWORD_RESET_TOKEN_BYTES = 32;
+
+/**
+ * One hour. Short enough to bound the window a leaked/intercepted reset
+ * token (e.g. from an email client, shoulder-surfed, or a shared device's
+ * browser history) remains usable, long enough that a real user acting on
+ * their own request does not routinely hit it. This is a common default in
+ * the industry (many implementations use 15 minutes to a few hours) and is
+ * not otherwise mandated by DECISIONS.md's decision 3, which leaves the
+ * exact TTL to the implementer.
+ */
+export const PASSWORD_RESET_TOKEN_TTL_MS = 60 * 60 * 1000;
+
+/**
+ * Fix cycle 1 (Phase 12, 12B-B3 review finding 2 — missing HMAC domain
+ * separation): a fixed, non-secret domain-separation tag mixed into
+ * `AuthService.hashPasswordResetToken`'s HMAC input ONLY — never
+ * `hashRefreshToken`'s (see that method's doc comment for why it must stay
+ * byte-for-byte unmodified). Its only purpose is to make a password-reset
+ * token's keyed hash computable from a DIFFERENT input than a refresh
+ * token's, even though both currently reuse `jwtRefreshSecret` as the HMAC
+ * key — so a future refactor that (for example) looks up "any bearer token
+ * by hash" across both tables cannot accidentally treat one value as the
+ * other. Value/format is not sensitive (it is not a secret — the key is);
+ * it only needs to be fixed and distinct from an empty prefix.
+ */
+export const PASSWORD_RESET_TOKEN_HASH_DOMAIN = 'password-reset-token:v1:';

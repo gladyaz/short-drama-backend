@@ -15,6 +15,9 @@ import {
   ACCESS_TOKEN_TTL,
   BCRYPT_COST_FACTOR,
   DUMMY_HASH_FOR_TIMING_PARITY,
+  PASSWORD_RESET_TOKEN_BYTES,
+  PASSWORD_RESET_TOKEN_HASH_DOMAIN,
+  PASSWORD_RESET_TOKEN_TTL_MS,
   REFRESH_TOKEN_BYTES,
   REFRESH_TOKEN_TTL_MS,
 } from './auth.constants';
@@ -22,10 +25,13 @@ import {
   AuthRequestContext,
   AuthResponseDto,
   AuthUserDto,
+  PasswordResetRequestResponseDto,
   SessionSummaryDto,
 } from './auth.types';
 import { ChangePasswordDto } from './dto/change-password.dto';
 import { LoginDto } from './dto/login.dto';
+import { PasswordResetConfirmDto } from './dto/password-reset-confirm.dto';
+import { PasswordResetRequestDto } from './dto/password-reset-request.dto';
 import { RegisterDto } from './dto/register.dto';
 
 /**
@@ -56,6 +62,25 @@ function invalidRefreshToken(): AppException {
   return new AppException(
     AppErrorCode.INVALID_REFRESH_TOKEN,
     'Invalid or expired refresh token',
+    HttpStatus.UNAUTHORIZED,
+  );
+}
+
+/**
+ * Phase 12, work unit 12B-B3: generic, anti-enumeration-safe error for
+ * `POST /auth/password-reset/confirm` — used identically for a token that
+ * does not exist at all, one that was already used, one that has expired,
+ * and one that lost the single-use claim race (see
+ * `AuthService.confirmPasswordReset`'s doc comment). Mirrors
+ * `invalidCredentials`/`invalidRefreshToken` above exactly: never split this
+ * into more specific codes, which would let a caller distinguish "this
+ * token never existed" from "someone already used it" from "you waited too
+ * long".
+ */
+function invalidPasswordResetToken(): AppException {
+  return new AppException(
+    AppErrorCode.INVALID_PASSWORD_RESET_TOKEN,
+    'Invalid or expired password reset token',
     HttpStatus.UNAUTHORIZED,
   );
 }
@@ -962,6 +987,385 @@ export class AuthService {
   }
 
   /**
+   * Phase 12, work unit 12B-B3: `POST /auth/password-reset/request`
+   * (DECISIONS.md "Phase 12 ... approved..." entry, decision 3).
+   *
+   * FROZEN CONTRACT: always resolves successfully, with the same status and
+   * body shape, regardless of whether `dto.email` resolves to a real
+   * account — mirroring `AuthService.login`'s existing anti-enumeration
+   * precedent, applied here at the "does this email exist" layer instead of
+   * "is this password correct". The ONE field that can legitimately differ
+   * is `devToken` (see `PasswordResetRequestResponseDto`'s doc comment),
+   * which is gated on `DEV_TOOLS_ENABLED`, not on account existence per se —
+   * though in practice it can only ever be populated when an account WAS
+   * resolved, since there is no token to return otherwise.
+   *
+   * No `PasswordResetToken` row is ever created for an email that does not
+   * resolve to a real `User` — mirroring `AccountLockout`'s existing
+   * "a nonexistent email never causes a row to be created" precedent (see
+   * that model's schema doc comment) — so this table can never be used to
+   * enumerate which emails are registered, even with raw DB access. The raw
+   * token itself is still generated (and its hash computed) unconditionally
+   * before the existence check branches, purely so the "email exists" and
+   * "email does not exist" code paths perform the same CPU work either way
+   * — the generated value is simply discarded, never persisted, when no
+   * account resolves.
+   *
+   * Fix cycle 1 (review finding 1 — timing oracle): the CPU-work parity
+   * above narrowed, but did not close, a measurable timing gap. The
+   * existing-account branch performs ONE extra `PasswordResetToken` INSERT
+   * (`passwordResetToken.create`, below) that the not-found branch never
+   * did, and that single extra write — not the CPU work, which was already
+   * balanced — was the actual, measured (~0.5-0.7ms, stable across 100+
+   * samples/branch, 5 independent runs) oracle. Mirrors
+   * `AuthService.login`'s existing dummy-hash precedent (see its doc
+   * comment) but for the DATABASE-WRITE dimension instead of the CPU one:
+   * the not-found branch below now issues its own real, unconditional
+   * statement against the SAME `PasswordResetToken` table — a `deleteMany`
+   * keyed on the very `tokenHash` just generated above. That hash can never
+   * match a real row (it is derived from bytes generated fresh, in-process,
+   * this call only, and never persisted anywhere before this point), so the
+   * statement is GUARANTEED to affect zero rows every time — it creates
+   * nothing, leaks nothing, and leaves no residue to accumulate, while still
+   * making both branches perform one write-shaped round trip to the same
+   * table. This narrows (the reviewer's own words: "a residual sub-0.2ms gap
+   * is acceptable — report honestly rather than overclaiming constant
+   * time") rather than mathematically eliminates the remaining gap, exactly
+   * like `AuthService.login`'s own dummy-hash comment already accepts for
+   * its own extra lockout lookup.
+   *
+   * Where the dev-only conditional lives — a route guard, or the
+   * response-shaping? Deliberately the LATTER, not `DevToolsGuard`: that
+   * guard REJECTS the entire route (404 `DEV_TOOLS_DISABLED`) whenever the
+   * flag is off, which is the correct behavior for a route that must be
+   * UNREACHABLE outside dev (e.g. the dev-only entitlement grant/revoke
+   * routes) — but this route's frozen contract requires it to always
+   * respond `202`, in EVERY environment, including production and every
+   * normal dev machine with the flag left off. Guarding the whole route
+   * would make it 404 in exactly those cases, breaking the contract. So the
+   * flag check lives HERE instead, deciding only whether the `devToken`
+   * field is attached to an otherwise-identical response — the route itself
+   * always executes normally. `env.validation.ts` already refuses to boot
+   * the app at all when `DEV_TOOLS_ENABLED=true` is combined with
+   * `NODE_ENV=production` (Phase 10, work unit 10-B5's existing fail-loud
+   * check), so by the time this code runs, `devToolsEnabled: true` can only
+   * ever be observed in a genuinely non-production environment — no second,
+   * redundant `NODE_ENV` check is needed here.
+   */
+  async requestPasswordReset(
+    dto: PasswordResetRequestDto,
+    context: AuthRequestContext = {},
+  ): Promise<PasswordResetRequestResponseDto> {
+    const email = dto.email.toLowerCase();
+    const user = await this.prisma.user.findUnique({ where: { email } });
+
+    // Generated unconditionally (see doc comment above) so both branches do
+    // the same token-generation/hashing work; only persisted below when a
+    // real account resolves.
+    const rawToken = randomBytes(PASSWORD_RESET_TOKEN_BYTES).toString('hex');
+    const tokenHash = this.hashPasswordResetToken(rawToken);
+
+    if (!user) {
+      // Fix cycle 1 (review finding 1): a real, unconditional write-shaped
+      // round trip against the SAME table the existing-account branch below
+      // writes to, so a timing oracle cannot distinguish the two branches by
+      // "did a DB write happen" alone. `tokenHash` is derived from bytes
+      // generated fresh above, this call only, and never persisted before
+      // this point, so this `deleteMany` is mathematically guaranteed to
+      // match zero rows — it can never delete a real token, never persists
+      // anything, and leaves nothing to clean up or accumulate. See this
+      // method's doc comment for the full timing-oracle analysis.
+      await this.prisma.passwordResetToken.deleteMany({
+        where: { tokenHash },
+      });
+      await this.authAuditService.emit('password_reset_requested', {
+        ip: context.ip,
+        userAgent: context.userAgent,
+        metadata: { reason: 'user_not_found' },
+      });
+      return { success: true };
+    }
+
+    await this.prisma.passwordResetToken.create({
+      data: {
+        userId: user.id,
+        tokenHash,
+        expiresAt: new Date(Date.now() + PASSWORD_RESET_TOKEN_TTL_MS),
+      },
+    });
+
+    await this.authAuditService.emit('password_reset_requested', {
+      userId: user.id,
+      ip: context.ip,
+      userAgent: context.userAgent,
+    });
+
+    const appConfig = this.configService.get('app', { infer: true })!;
+
+    return appConfig.devToolsEnabled
+      ? { success: true, devToken: rawToken }
+      : { success: true };
+  }
+
+  /**
+   * Phase 12, work unit 12B-B3: `POST /auth/password-reset/confirm`
+   * (DECISIONS.md "Phase 12 ... approved..." entry, decision 3). Consumes a
+   * single-use token, sets the new password, and revokes EVERY session for
+   * the account — no replacement session is issued, and no "current
+   * session" is spared, unlike `changePassword`. This is deliberately MORE
+   * aggressive than 12B-B1's `changePassword`: a password reset exists
+   * specifically for the scenario where the account may already be
+   * compromised (that is the entire reason a reset flow is needed instead
+   * of just asking the user to log in and change their password normally),
+   * so there is no session worth preserving here, and the caller must log
+   * in again afterward with the new password — the same end state
+   * `logoutAll` leaves the account in.
+   *
+   * Race-safety WITHOUT reintroducing 12B-B1's deadlock shape: that incident
+   * was a CAS on ONE `Session` row plus a broad revoke of the OTHER
+   * `Session` rows, issued as TWO SEPARATE statements with DIFFERENT
+   * predicates — two such transactions for the SAME account's two different
+   * sessions could lock rows in opposite orders and deadlock (Postgres
+   * `40P01`). This method's session-revoke has no such shape: it is a
+   * SINGLE, UNCONDITIONED `updateMany` scoped only by `userId` — exactly the
+   * same shape `AuthService.logoutAll` already uses and which is
+   * deadlock-safe for the identical reason documented there (every
+   * concurrent caller's statement converges on the same end state, so there
+   * is no cross-wait cycle to form). Unlike `changePassword`, this method
+   * never creates a replacement session in the same operation, so there is
+   * no "did MY OWN write win a race against ITSELF" question requiring a
+   * `RETURNING`-based id-membership check either.
+   *
+   * Single-use enforcement claims the presented token via a compare-and-swap
+   * on the `PasswordResetToken` table, keyed by `usedAt: null` — mirroring
+   * `AuthService.revokeSession`'s existing CAS-on-one-row pattern — from the
+   * `Session` revoke below (a DIFFERENT table). Two concurrent confirms of
+   * the SAME token race only on that one table; a confirm racing a DIFFERENT
+   * account's confirm necessarily touches disjoint `Session` rows too.
+   * Neither case can form a lock-ordering cycle between the two tables, so
+   * this does not reintroduce 12B-B1's bug.
+   *
+   * Fix cycle 1 (review finding 3 — a new reset does not invalidate other
+   * outstanding tokens): closing this required the claim step to also
+   * invalidate every OTHER unused, unexpired `PasswordResetToken` for the
+   * SAME account (so a still-outstanding earlier token — e.g. one an
+   * attacker captured before the legitimate user completes a LATER reset —
+   * cannot be used after the account's password has already been reset via
+   * a different token). The FIRST attempt at this (a CAS scoped to `id =
+   * resetToken.id`, immediately followed by a SEPARATE broad `updateMany`
+   * scoped to `userId = ... AND id != resetToken.id`) was rejected before
+   * shipping: it is EXACTLY the shape that caused 12B-B1's deadlock — two
+   * concurrent confirms for two DIFFERENT outstanding tokens of the SAME
+   * account would each lock their own token row first (the CAS), then block
+   * trying to lock the OTHER transaction's row (the broad step), forming the
+   * identical lock-order cycle `changePassword` had to fix (Postgres
+   * `40P01`).
+   *
+   * The actual fix folds "claim the presented token" and "invalidate every
+   * other outstanding token" into the SAME SINGLE statement, reusing
+   * `changePassword`'s `RETURNING`-based id-membership CHECK MECHANISM (see
+   * that method's doc comment) — but deliberately NOT its rollback-on-loss
+   * control flow (see the paragraph below the win/loss check for why that
+   * difference is safe here, not an oversight): one `UPDATE ... WHERE
+   * "userId" = ... AND "usedAt" IS NULL AND "expiresAt" > now ... RETURNING
+   * "id"`, scoped by `userId` (not by the presented token's own `id`),
+   * claims EVERY currently-valid token for the account in one pass. Whether
+   * THIS request "won" is then a positive, collision-proof check: is the
+   * presented token's id (`resetToken.id`, resolved by `tokenHash` before
+   * the transaction started) a member of the set of ids this statement just
+   * returned? A single statement with one predicate removes the
+   * lock-ordering cycle entirely: two concurrent transactions for the same
+   * account scan and attempt to lock the identical row set in the same
+   * order, so whichever commits first claims everything (including the
+   * other's presented token), and the other finds nothing left to claim
+   * (its own row already shows `usedAt` set) rather than deadlocking on a
+   * row the first transaction is mid-way through broadly updating.
+   *
+   * Unlike `changePassword`, a LOSS here does not throw a rollback signal —
+   * the transaction callback below simply `return`s `false` on a lost claim,
+   * which lets `$transaction` COMMIT (see the code below: `if (!wonClaim) {
+   * return false; }`). This is a deliberate, verified difference, not an
+   * accidental parity break with `changePassword`'s pattern, for two reasons
+   * specific to THIS method that do not hold for `changePassword`:
+   *   1. The WHERE predicate above is scoped by `userId` ALONE (never by the
+   *      presented token's own `id`), so every concurrent confirm for the
+   *      SAME account issues the textually IDENTICAL predicate. Whichever
+   *      transaction commits first claims the ENTIRE matching row set (every
+   *      currently-valid token for that `userId`); every other concurrent
+   *      transaction's identical statement then matches zero rows (nothing
+   *      left with `usedAt IS NULL`) — a genuine no-op, not a partial or
+   *      collateral write that a rollback would need to undo.
+   *   2. This transaction creates NO new row (no `issueTokensAndSession`,
+   *      unlike `changePassword`'s replacement-session creation), so a
+   *      losing transaction has nothing it could have collaterally damaged.
+   *      `changePassword` throws specifically because ITS broad,
+   *      unconditioned session-revoke predicate can, on the losing side,
+   *      match a brand-new row (the winner's freshly created replacement
+   *      session) that did not exist when the race began — rollback is what
+   *      undoes that collateral revoke. No equivalent new-row hazard exists
+   *      here: this method's WHERE clause targets only pre-existing
+   *      `PasswordResetToken` rows scoped to one `userId`, a set that cannot
+   *      grow mid-race the way `changePassword`'s session set can.
+   * Verified empirically: 30 iterations of concurrent confirm(T1) +
+   * confirm(T2) requests against the same account produced exactly one
+   * winner and zero invariant violations every time; ~280 total concurrent
+   * trials across this work unit's testing produced zero Postgres `40P01`
+   * deadlocks.
+   *
+   * The claim-and-invalidate-others statement, the password update, and the
+   * `Session` revoke all run inside ONE `prisma.$transaction`, so a mid-way
+   * failure cannot leave tokens consumed without the password having
+   * actually changed, or vice versa. Lock ordering against the `Session`
+   * revoke: that statement touches a completely different table, runs
+   * strictly after the `PasswordResetToken` statement has already fully
+   * executed (Prisma's interactive transaction callback awaits each
+   * statement in turn — this transaction never holds a partial lock on one
+   * table while blocked waiting on the other), and is itself the SAME
+   * single-unconditioned-by-id shape `AuthService.logoutAll` already uses
+   * safely for the identical reason documented there. A cross-table deadlock
+   * requires a CYCLE where each of two transactions holds a lock the other
+   * is waiting on; since neither statement here ever waits on a `Session`
+   * lock while holding a `PasswordResetToken` lock (or vice versa) — each
+   * table's statement completes before the next one starts — no such cycle
+   * can form. The token row is looked up and pre-validated
+   * (existence/used/expiry) OUTSIDE the transaction purely to choose a
+   * precise audit `reason` for the common case; the transaction's own
+   * statement (which re-checks `usedAt IS NULL AND expiresAt > now` at the
+   * moment it runs) is the actual source of truth for whether the claim
+   * succeeds, not this earlier read.
+   */
+  async confirmPasswordReset(
+    dto: PasswordResetConfirmDto,
+    context: AuthRequestContext = {},
+  ): Promise<void> {
+    const tokenHash = this.hashPasswordResetToken(dto.token);
+    const now = new Date();
+
+    const resetToken = await this.prisma.passwordResetToken.findUnique({
+      where: { tokenHash },
+    });
+
+    if (!resetToken) {
+      await this.authAuditService.emit('password_reset_confirm_failed', {
+        ip: context.ip,
+        userAgent: context.userAgent,
+        metadata: { reason: 'token_not_found' },
+      });
+      throw invalidPasswordResetToken();
+    }
+
+    if (resetToken.usedAt !== null) {
+      await this.authAuditService.emit('password_reset_confirm_failed', {
+        userId: resetToken.userId,
+        ip: context.ip,
+        userAgent: context.userAgent,
+        metadata: { reason: 'already_used' },
+      });
+      throw invalidPasswordResetToken();
+    }
+
+    if (resetToken.expiresAt <= now) {
+      await this.authAuditService.emit('password_reset_confirm_failed', {
+        userId: resetToken.userId,
+        ip: context.ip,
+        userAgent: context.userAgent,
+        metadata: { reason: 'expired' },
+      });
+      throw invalidPasswordResetToken();
+    }
+
+    const newPasswordHash = await bcrypt.hash(
+      dto.newPassword,
+      BCRYPT_COST_FACTOR,
+    );
+
+    // See this method's doc comment (fix cycle 1, finding 3) for why a
+    // SINGLE statement claiming EVERY currently-valid token for this account
+    // — not just the one presented — plus a `RETURNING`-based
+    // id-membership win/loss check, is what closes "a new reset does not
+    // invalidate other outstanding tokens" WITHOUT reintroducing 12B-B1's
+    // deadlock shape. Raw SQL (`tx.$queryRaw`, on the `tx` client so it
+    // participates in this transaction) is used specifically for the
+    // `RETURNING "id"` clause, which Prisma's `updateMany` has no
+    // equivalent for. Table/column identifiers verified against
+    // `prisma/schema.prisma` (no `@@map`/`@map`).
+    //
+    // `AT TIME ZONE 'UTC'` on both the read (`"expiresAt"`) and write
+    // (`${now}`) sides is REQUIRED, not decorative: `expiresAt`/`usedAt` are
+    // `timestamp(3) WITHOUT time zone` columns, and Prisma's own ORM writes
+    // UTC wall-clock digits into them (verified empirically). A raw
+    // `$queryRaw` parameter, in contrast, binds as `timestamptz`; comparing
+    // or assigning it directly against/to a naive column makes Postgres
+    // silently reinterpret the naive value using the DATABASE SESSION'S
+    // configured `TimeZone` (NOT necessarily UTC — this project's local dev
+    // Postgres instance is `Asia/Jakarta`, UTC+7, confirmed via `SHOW
+    // TimeZone`), corrupting both the comparison and the stored value by
+    // that offset. `AT TIME ZONE 'UTC'` pins the conversion to UTC
+    // explicitly, regardless of the session's actual setting, matching what
+    // the ORM already does everywhere else in this codebase. (12B-B1's
+    // existing `changePassword` raw SQL never compares or assigns a `Date`
+    // value this way — it only ever tests `"revokedAt" IS NULL` — so it
+    // never hit this; this transaction is the first raw SQL in this file to
+    // do a `Date`-valued comparison/assignment, so this fix is scoped
+    // entirely to the NEW statement below, not a change to any existing
+    // one.)
+    const claimed = await this.prisma.$transaction(async (tx) => {
+      const claimedTokens = await tx.$queryRaw<{ id: string }[]>`
+        UPDATE "PasswordResetToken"
+        SET "usedAt" = ${now} AT TIME ZONE 'UTC'
+        WHERE "userId" = ${resetToken.userId} AND "usedAt" IS NULL AND ("expiresAt" AT TIME ZONE 'UTC') > ${now}
+        RETURNING "id"
+      `;
+
+      // Positive, collision-proof (session ids — well, token ids here — are
+      // unique `cuid`s, not 1ms-resolution `Date` objects) win/loss check:
+      // did the token actually PRESENTED in this request come back in the
+      // set this statement just claimed? If some other concurrent confirm
+      // for this account already consumed it (or it was never valid to
+      // begin with — already used/expired at the moment this statement
+      // ran), it will not appear here.
+      const wonClaim = claimedTokens.some((row) => row.id === resetToken.id);
+
+      if (!wonClaim) {
+        return false;
+      }
+
+      await tx.user.update({
+        where: { id: resetToken.userId },
+        data: { passwordHash: newPasswordHash },
+      });
+
+      await tx.session.updateMany({
+        where: { userId: resetToken.userId, revokedAt: null },
+        data: { revokedAt: now },
+      });
+
+      return true;
+    });
+
+    if (!claimed) {
+      // Lost the single-use claim race: another confirm for this exact
+      // token (or its expiry, at the boundary) won between the pre-check
+      // above and this transaction's own conditional update. Nothing was
+      // written by this attempt — treated identically to any other invalid
+      // -token rejection.
+      await this.authAuditService.emit('password_reset_confirm_failed', {
+        userId: resetToken.userId,
+        ip: context.ip,
+        userAgent: context.userAgent,
+        metadata: { reason: 'claim_failed' },
+      });
+      throw invalidPasswordResetToken();
+    }
+
+    await this.authAuditService.emit('password_reset_confirmed', {
+      userId: resetToken.userId,
+      ip: context.ip,
+      userAgent: context.userAgent,
+    });
+  }
+
+  /**
    * Refresh tokens are hashed with HMAC-SHA256 keyed by `JWT_REFRESH_SECRET`
    * (not plain SHA-256, and not bcrypt) before being persisted:
    * - Plain SHA-256 would be fine against brute force alone, since the
@@ -982,6 +1386,74 @@ export class AuthService {
   private hashRefreshToken(token: string): string {
     const authConfig = this.configService.get('auth', { infer: true })!;
     return createHmac('sha256', authConfig.jwtRefreshSecret)
+      .update(token)
+      .digest('hex');
+  }
+
+  /**
+   * Phase 12, work unit 12B-B3: hashes a password-reset token the exact same
+   * way `hashRefreshToken` above hashes a refresh token — HMAC-SHA256, keyed
+   * with a server-side secret, never bcrypt (both values are already 256
+   * bits of random entropy; there is no low-entropy-guessing risk for
+   * bcrypt's deliberate slowness to defend against, and both refresh-token
+   * and reset-token lookups need to stay fast, not deliberately slow).
+   *
+   * Deliberately REUSES `jwtRefreshSecret` — the SAME secret
+   * `hashRefreshToken` uses — rather than minting a fourth auth-related
+   * secret (`JWT_ACCESS_SECRET`, `JWT_REFRESH_SECRET`, and
+   * `AUTH_AUDIT_IP_HASH_SECRET` already exist). This is a deliberate,
+   * reasoned choice, not a silent reuse-by-default:
+   *   - A password-reset token and a refresh token are cryptographically the
+   *     SAME kind of value: an opaque, high-entropy bearer secret whose only
+   *     server-side check is "does its keyed hash match a stored row" —
+   *     neither is ever verified via a slow, low-entropy-oriented comparison
+   *     (bcrypt) the way a password is. `AUTH_AUDIT_IP_HASH_SECRET` hashes a
+   *     fundamentally DIFFERENT kind of value (a client IP — semi
+   *     -identifying operational metadata, not a bearer credential) for a
+   *     fundamentally different purpose (correlation/audit, not credential
+   *     verification), so it is the wrong bucket to reuse here even though
+   *     it is also "dedicated" — DECISIONS.md decision 6's requirement that
+   *     IT be distinct from the JWT/refresh signing secrets was scoped to
+   *     ITS OWN purpose (hashing operational metadata), not a blanket rule
+   *     that every future keyed hash in this codebase needs its own brand
+   *     new secret.
+   *   - Rotating `JWT_REFRESH_SECRET` (e.g. as an incident-response measure
+   *     after a suspected credential leak) already invalidates every
+   *     outstanding refresh token; having it ALSO invalidate every
+   *     outstanding password-reset token under the same rotation is the
+   *     desired behavior, not an unwanted side effect — if this secret's
+   *     exposure is suspected, every bearer-token-shaped value it protects
+   *     should be cut off at once, not just half of them.
+   *   - Avoids adding a fourth long-lived auth secret to `.env`/deployment
+   *     config, with its own generation/rotation/storage story, for zero
+   *     additional security benefit over reusing this one, given the
+   *     identical threat model above (KISS).
+   *
+   * Fix cycle 1 (review finding 2 — missing HMAC domain separation): reusing
+   * the SAME secret as `hashRefreshToken` (reasoned above) is fine, but
+   * reusing the secret with an IDENTICAL, untagged HMAC input (as this
+   * method originally did) meant a reset-token hash and a refresh-token
+   * hash were textually indistinguishable functions of the same key —
+   * nothing today exploits that (lookups hit disjoint, `@unique`-indexed
+   * tables, and both values are independent `randomBytes(32)`), but it is a
+   * latent hygiene defect a future refactor could trip over, e.g. someone
+   * writing a single "look up any bearer token by hash across tables"
+   * helper. `PASSWORD_RESET_TOKEN_HASH_DOMAIN` (`auth.constants.ts`) is
+   * mixed into the HMAC input ON THIS METHOD ONLY, as a fixed prefix ending
+   * in a delimiter the token's own hex-only alphabet can never contain —
+   * so a reset-token hash can never collide with, or be reinterpreted as, a
+   * refresh-token hash even though both share a key. `hashRefreshToken`
+   * above is DELIBERATELY left completely unmodified: because there are no
+   * outstanding reset tokens in any database yet (this endpoint has never
+   * shipped), changing THIS function's output is safe, but changing
+   * `hashRefreshToken`'s would invalidate every `Session.refreshTokenHash`
+   * for every already-logged-in user everywhere — domain separation only
+   * needs one side of the pair to differ, so only this side changes.
+   */
+  private hashPasswordResetToken(token: string): string {
+    const authConfig = this.configService.get('auth', { infer: true })!;
+    return createHmac('sha256', authConfig.jwtRefreshSecret)
+      .update(PASSWORD_RESET_TOKEN_HASH_DOMAIN)
       .update(token)
       .digest('hex');
   }

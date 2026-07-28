@@ -54,6 +54,15 @@ describe('AuthService', () => {
   // does several real cost-factor-12 bcrypt calls (~300-600ms apiece).
   const RACE_TEST_ITERATIONS = 10;
 
+  // Fix cycle 1 (Phase 12, 12B-B3), finding 3 re-verification: the review
+  // explicitly asked for >= 25 warm concurrent iterations for THIS specific
+  // lock-ordering shape (single claim-and-invalidate-others statement),
+  // stronger than `RACE_TEST_ITERATIONS` above (used for 12B-B1's
+  // change-password races). Kept as its own constant rather than raising
+  // `RACE_TEST_ITERATIONS` itself, since that would also slow down the
+  // unrelated change-password race tests above for no reason.
+  const PASSWORD_RESET_RACE_TEST_ITERATIONS = 25;
+
   beforeEach(async () => {
     const module: TestingModule = await Test.createTestingModule({
       imports: [JwtModule.register({})],
@@ -1748,5 +1757,663 @@ describe('AuthService', () => {
       });
       expect(auditRows).toHaveLength(1);
     });
+  });
+
+  /**
+   * Phase 12, work unit 12B-B3: `POST /auth/password-reset/request`
+   * (DECISIONS.md "Phase 12 ... approved..." entry, decision 3). See
+   * `AuthService.requestPasswordReset`'s doc comment for the full
+   * anti-enumeration/dev-token design. The default `service`/`prisma`
+   * fixture (`TEST_AUTH_CONFIG`, no `app` config override) exercises the
+   * production-representative "DEV_TOOLS_ENABLED off" posture, matching
+   * this file's existing convention (e.g. `AccountLockoutService`'s tests
+   * above never toggle any dev flag either).
+   */
+  describe('requestPasswordReset', () => {
+    it('returns an identical { success: true } shape (no devToken) for BOTH an existing and a nonexistent email', async () => {
+      const email = uniqueEmail('reset-request-identical');
+      await service.register({ email, password: 'correct-horse-battery' });
+
+      const existingResult = await service.requestPasswordReset({ email });
+      const nonexistentResult = await service.requestPasswordReset({
+        email: uniqueEmail('reset-request-identical-nonexistent'),
+      });
+
+      expect(existingResult).toEqual({ success: true });
+      expect(nonexistentResult).toEqual({ success: true });
+      expect(existingResult).toEqual(nonexistentResult);
+    });
+
+    it('creates a hashed (never raw) PasswordResetToken row for an existing account', async () => {
+      const email = uniqueEmail('reset-request-creates-row');
+      const registered = await service.register({
+        email,
+        password: 'correct-horse-battery',
+      });
+
+      await service.requestPasswordReset({ email });
+
+      const tokens = await prisma.passwordResetToken.findMany({
+        where: { userId: registered.user.id },
+      });
+      expect(tokens).toHaveLength(1);
+      expect(tokens[0].usedAt).toBeNull();
+      expect(tokens[0].expiresAt.getTime()).toBeGreaterThan(Date.now());
+      // A real HMAC-SHA256 hex digest is 64 characters — proves this is a
+      // keyed hash, not the raw token or some other encoding.
+      expect(tokens[0].tokenHash).toMatch(/^[0-9a-f]{64}$/);
+    });
+
+    it('creates NO PasswordResetToken row for a nonexistent email (no enumeration surface, even with raw DB access)', async () => {
+      const email = uniqueEmail('reset-request-nonexistent-no-row');
+
+      await service.requestPasswordReset({ email });
+
+      const tokens = await prisma.passwordResetToken.findMany({
+        where: { user: { email } },
+      });
+      expect(tokens).toHaveLength(0);
+    });
+
+    it('emits password_reset_requested WITH a userId for a resolved account, and WITHOUT one (reason: user_not_found) for an unresolved email', async () => {
+      const email = uniqueEmail('reset-request-audit');
+      const registered = await service.register({
+        email,
+        password: 'correct-horse-battery',
+      });
+      const nonexistentEmail = uniqueEmail('reset-request-audit-nonexistent');
+      // Phase 12, work unit 12A-B3's existing marker-based cleanup
+      // precedent (see the "nonexistent email" login test above): a
+      // `userId: null` audit row cannot be found via the usual
+      // `user: { email: { contains: emailPrefix } }` relation filter, so a
+      // distinctive `userAgent` marker (itself containing `emailPrefix`,
+      // matching `afterEach`'s existing orphan-cleanup query) is used
+      // instead.
+      const marker = `${emailPrefix}-reset-request-audit-marker`;
+
+      await service.requestPasswordReset({ email }, { userAgent: marker });
+      await service.requestPasswordReset(
+        { email: nonexistentEmail },
+        { userAgent: marker },
+      );
+
+      const foundRow = await prisma.authAuditEvent.findFirst({
+        where: {
+          userId: registered.user.id,
+          event: 'password_reset_requested',
+        },
+      });
+      expect(foundRow).not.toBeNull();
+      expect(foundRow?.metadata).toBeNull();
+
+      const notFoundRow = await prisma.authAuditEvent.findFirst({
+        where: {
+          userId: null,
+          event: 'password_reset_requested',
+          userAgent: marker,
+        },
+      });
+      expect(notFoundRow).not.toBeNull();
+      expect(notFoundRow?.metadata).toEqual({ reason: 'user_not_found' });
+    });
+
+    it('never includes the raw email/password anywhere in the response for an existing account', async () => {
+      const email = uniqueEmail('reset-request-no-leak');
+      await service.register({ email, password: 'correct-horse-battery' });
+
+      const result = await service.requestPasswordReset({ email });
+
+      expect(result).toEqual({ success: true });
+      expect(JSON.stringify(result)).not.toContain(email);
+    });
+
+    /**
+     * DECISIONS.md decision 3: the raw token is returned ONLY when
+     * `DEV_TOOLS_ENABLED=true && NODE_ENV != production`. `env.validation.ts`
+     * already refuses to boot the app at all if that flag is combined with
+     * `NODE_ENV=production` (Phase 10, work unit 10-B5's existing fail-loud
+     * check), so a SEPARATE module instance with `app.devToolsEnabled: true`
+     * (this test process's own `NODE_ENV` is never `production`) is the
+     * correct way to exercise this branch — mirrors this file's existing
+     * "otherModule"/"otherPrisma" pattern used above for a different
+     * config override.
+     */
+    describe('with DEV_TOOLS_ENABLED=true', () => {
+      let devToolsService: AuthService;
+      let devToolsPrisma: PrismaService;
+
+      beforeEach(async () => {
+        const module: TestingModule = await Test.createTestingModule({
+          imports: [JwtModule.register({})],
+          providers: [
+            AuthService,
+            PrismaService,
+            AccountLockoutService,
+            AuthAuditService,
+            {
+              provide: ConfigService,
+              useValue: {
+                get: jest.fn((key: string) =>
+                  key === 'app' ? { devToolsEnabled: true } : TEST_AUTH_CONFIG,
+                ),
+              },
+            },
+          ],
+        }).compile();
+
+        devToolsService = module.get<AuthService>(AuthService);
+        devToolsPrisma = module.get<PrismaService>(PrismaService);
+        await devToolsPrisma.onModuleInit();
+      });
+
+      afterEach(async () => {
+        await devToolsPrisma.onModuleDestroy();
+      });
+
+      it('returns the raw token for an existing account, distinct from the stored (hashed) row', async () => {
+        const email = uniqueEmail('reset-request-dev-token');
+        const registered = await devToolsService.register({
+          email,
+          password: 'correct-horse-battery',
+        });
+
+        const result = await devToolsService.requestPasswordReset({ email });
+
+        expect(result.success).toBe(true);
+        expect(result.devToken).toEqual(expect.any(String));
+
+        const tokenRow = await devToolsPrisma.passwordResetToken.findFirst({
+          where: { userId: registered.user.id },
+        });
+        expect(tokenRow).not.toBeNull();
+        expect(result.devToken).not.toBe(tokenRow!.tokenHash);
+      });
+
+      it('returns no devToken for a nonexistent email even with DEV_TOOLS_ENABLED=true (nothing was ever created to return)', async () => {
+        const result = await devToolsService.requestPasswordReset({
+          email: uniqueEmail('reset-request-dev-token-nonexistent'),
+        });
+
+        expect(result).toEqual({ success: true });
+      });
+    });
+  });
+
+  /**
+   * Phase 12, work unit 12B-B3: `POST /auth/password-reset/confirm`. See
+   * `AuthService.confirmPasswordReset`'s doc comment for the full
+   * single-use/expiry/revoke-all-sessions design — deliberately MORE
+   * aggressive than `changePassword` (every session is revoked, including
+   * "the current one" — there is no such concept here — and no replacement
+   * session is ever issued).
+   *
+   * Every test below needs the RAW token to call `confirmPasswordReset`
+   * with, which the default (`DEV_TOOLS_ENABLED` off) `service` fixture
+   * never returns — so this whole describe block uses its own
+   * `DEV_TOOLS_ENABLED=true` module (mirroring `requestPasswordReset`'s
+   * identical nested block above) purely to OBTAIN a real raw token for
+   * setup; the actual `confirmPasswordReset` behavior under test is
+   * identical regardless of that flag (the flag only affects
+   * `requestPasswordReset`'s response shape).
+   */
+  describe('confirmPasswordReset', () => {
+    let devToolsService: AuthService;
+    let devToolsPrisma: PrismaService;
+
+    // Fix cycle 2 (Phase 12, 12B-B3): the "unknown/garbage token" test below
+    // passes no `context.userAgent`, so `confirmPasswordReset`'s
+    // `!resetToken` branch (see its doc comment) emits a
+    // `password_reset_confirm_failed` row with `userId: null` and no marker —
+    // unreachable by the top-level `afterEach`'s existing
+    // `userId: null, userAgent: { contains: emailPrefix }` orphan-cleanup
+    // query (nothing to `contains`-match against a `null` `userAgent`).
+    // Mirrors this file's existing `requestPasswordReset` marker precedent
+    // (and `test/password-reset.e2e-spec.ts`'s identical pattern): a
+    // distinctive `userAgent` marker lets this describe block's own
+    // `afterEach` below find and remove it, scoped to the FULL marker string
+    // (not just `emailPrefix`) so it cannot remove any other describe
+    // block's or spec file's `userId: null` rows.
+    const unknownTokenAuditMarker = `${emailPrefix}-reset-confirm-unknown-token-audit-marker`;
+
+    beforeEach(async () => {
+      const module: TestingModule = await Test.createTestingModule({
+        imports: [JwtModule.register({})],
+        providers: [
+          AuthService,
+          PrismaService,
+          AccountLockoutService,
+          AuthAuditService,
+          {
+            provide: ConfigService,
+            useValue: {
+              get: jest.fn((key: string) =>
+                key === 'app' ? { devToolsEnabled: true } : TEST_AUTH_CONFIG,
+              ),
+            },
+          },
+        ],
+      }).compile();
+
+      devToolsService = module.get<AuthService>(AuthService);
+      devToolsPrisma = module.get<PrismaService>(PrismaService);
+      await devToolsPrisma.onModuleInit();
+    });
+
+    afterEach(async () => {
+      // Fix cycle 2 (Phase 12, 12B-B3): removes the orphaned `userId: null`
+      // row the "unknown/garbage token" test below creates — see the marker
+      // comment above for why the top-level `afterEach` cannot reach it.
+      await devToolsPrisma.authAuditEvent.deleteMany({
+        where: {
+          userId: null,
+          userAgent: { contains: unknownTokenAuditMarker },
+        },
+      });
+      await devToolsPrisma.onModuleDestroy();
+    });
+
+    async function requestRawToken(email: string): Promise<string> {
+      const result = await devToolsService.requestPasswordReset({ email });
+      return result.devToken!;
+    }
+
+    it('sets the new password, revokes EVERY session (including a different device), and the new password works for login', async () => {
+      const email = uniqueEmail('reset-confirm-success');
+      const oldPassword = 'correct-horse-battery';
+      const newPassword = 'brand-new-password-1';
+      const registered = await devToolsService.register({
+        email,
+        password: oldPassword,
+      });
+      // A "second device" — must ALSO be revoked (frozen contract: EVERY
+      // session, a strictly more aggressive scope than changePassword's
+      // "every OTHER session").
+      await devToolsService.login({ email, password: oldPassword });
+
+      const rawToken = await requestRawToken(email);
+
+      await devToolsService.confirmPasswordReset({
+        token: rawToken,
+        newPassword,
+      });
+
+      const allSessions = await devToolsPrisma.session.findMany({
+        where: { userId: registered.user.id },
+      });
+      expect(allSessions.length).toBeGreaterThanOrEqual(2);
+      expect(allSessions.every((s) => s.revokedAt !== null)).toBe(true);
+
+      const storedUser = await devToolsPrisma.user.findUnique({
+        where: { email },
+      });
+      expect(await bcrypt.compare(newPassword, storedUser!.passwordHash)).toBe(
+        true,
+      );
+      expect(await bcrypt.compare(oldPassword, storedUser!.passwordHash)).toBe(
+        false,
+      );
+
+      await expect(
+        devToolsService.login({ email, password: oldPassword }),
+      ).rejects.toMatchObject({
+        code: AppErrorCode.INVALID_CREDENTIALS,
+      });
+      const loggedIn = await devToolsService.login({
+        email,
+        password: newPassword,
+      });
+      expect(loggedIn.user.email).toBe(email);
+
+      const auditRows = await devToolsPrisma.authAuditEvent.findMany({
+        where: {
+          userId: registered.user.id,
+          event: 'password_reset_confirmed',
+        },
+      });
+      expect(auditRows).toHaveLength(1);
+    });
+
+    it('is single-use: a second confirm with the SAME (already-consumed) token fails with INVALID_PASSWORD_RESET_TOKEN and changes nothing further', async () => {
+      const email = uniqueEmail('reset-confirm-single-use');
+      await devToolsService.register({
+        email,
+        password: 'correct-horse-battery',
+      });
+      const rawToken = await requestRawToken(email);
+
+      await devToolsService.confirmPasswordReset({
+        token: rawToken,
+        newPassword: 'brand-new-password-1',
+      });
+
+      await expect(
+        devToolsService.confirmPasswordReset({
+          token: rawToken,
+          newPassword: 'another-new-password-2',
+        }),
+      ).rejects.toMatchObject({
+        code: AppErrorCode.INVALID_PASSWORD_RESET_TOKEN,
+        status: HttpStatus.UNAUTHORIZED,
+      } as Partial<AppException>);
+
+      // The rejected SECOND attempt's password must not have taken effect.
+      const storedUser = await devToolsPrisma.user.findUnique({
+        where: { email },
+      });
+      expect(
+        await bcrypt.compare('brand-new-password-1', storedUser!.passwordHash),
+      ).toBe(true);
+    });
+
+    it('rejects an expired token with INVALID_PASSWORD_RESET_TOKEN and makes no changes', async () => {
+      const email = uniqueEmail('reset-confirm-expired');
+      const oldPassword = 'correct-horse-battery';
+      await devToolsService.register({ email, password: oldPassword });
+      const rawToken = await requestRawToken(email);
+
+      await devToolsPrisma.passwordResetToken.updateMany({
+        where: { user: { email } },
+        data: { expiresAt: new Date(Date.now() - 1000) },
+      });
+
+      await expect(
+        devToolsService.confirmPasswordReset({
+          token: rawToken,
+          newPassword: 'brand-new-password-1',
+        }),
+      ).rejects.toMatchObject({
+        code: AppErrorCode.INVALID_PASSWORD_RESET_TOKEN,
+        status: HttpStatus.UNAUTHORIZED,
+      } as Partial<AppException>);
+
+      const storedUser = await devToolsPrisma.user.findUnique({
+        where: { email },
+      });
+      expect(await bcrypt.compare(oldPassword, storedUser!.passwordHash)).toBe(
+        true,
+      );
+    });
+
+    it('rejects an unknown/garbage token with the same generic INVALID_PASSWORD_RESET_TOKEN error', async () => {
+      await expect(
+        devToolsService.confirmPasswordReset(
+          {
+            token: 'this-token-was-never-issued',
+            newPassword: 'brand-new-password-1',
+          },
+          { userAgent: unknownTokenAuditMarker },
+        ),
+      ).rejects.toMatchObject({
+        code: AppErrorCode.INVALID_PASSWORD_RESET_TOKEN,
+        status: HttpStatus.UNAUTHORIZED,
+      } as Partial<AppException>);
+    });
+
+    /**
+     * IDOR-safety-equivalent: this endpoint takes no target-account
+     * identifier at all — only the token — so a token issued for account A
+     * can structurally never reset account B's password. Proven explicitly
+     * rather than merely assumed.
+     */
+    it("a token issued for account A only ever resets account A's password, never account B's", async () => {
+      const emailA = uniqueEmail('reset-confirm-cross-a');
+      const emailB = uniqueEmail('reset-confirm-cross-b');
+      const password = 'correct-horse-battery';
+      await devToolsService.register({ email: emailA, password });
+      await devToolsService.register({ email: emailB, password });
+
+      const rawTokenA = await requestRawToken(emailA);
+
+      await devToolsService.confirmPasswordReset({
+        token: rawTokenA,
+        newPassword: 'brand-new-password-1',
+      });
+
+      const storedB = await devToolsPrisma.user.findUnique({
+        where: { email: emailB },
+      });
+      expect(await bcrypt.compare(password, storedB!.passwordHash)).toBe(true);
+      await expect(
+        devToolsService.login({ email: emailB, password }),
+      ).resolves.toBeDefined();
+    });
+
+    it('never includes the raw token or either password in a thrown error', async () => {
+      const email = uniqueEmail('reset-confirm-no-leak');
+      await devToolsService.register({
+        email,
+        password: 'correct-horse-battery',
+      });
+      const rawToken = await requestRawToken(email);
+      await devToolsService.confirmPasswordReset({
+        token: rawToken,
+        newPassword: 'brand-new-password-1',
+      });
+
+      let caughtError: unknown;
+      try {
+        await devToolsService.confirmPasswordReset({
+          token: rawToken,
+          newPassword: 'another-new-password-2',
+        });
+      } catch (error) {
+        caughtError = error;
+      }
+
+      expect(caughtError).toBeInstanceOf(AppException);
+      const serializedError = JSON.stringify({
+        message: (caughtError as AppException).message,
+        code: (caughtError as AppException).code,
+      });
+      expect(serializedError).not.toContain(rawToken);
+      expect(serializedError).not.toContain('brand-new-password-1');
+      expect(serializedError).not.toContain('another-new-password-2');
+    });
+
+    it('emits password_reset_confirm_failed with reason "already_used" for a reused token', async () => {
+      const email = uniqueEmail('reset-confirm-audit-already-used');
+      const registered = await devToolsService.register({
+        email,
+        password: 'correct-horse-battery',
+      });
+      const rawToken = await requestRawToken(email);
+
+      await devToolsService.confirmPasswordReset({
+        token: rawToken,
+        newPassword: 'brand-new-password-1',
+      });
+
+      await expect(
+        devToolsService.confirmPasswordReset({
+          token: rawToken,
+          newPassword: 'another-new-password-2',
+        }),
+      ).rejects.toBeInstanceOf(AppException);
+
+      const auditRows = await devToolsPrisma.authAuditEvent.findMany({
+        where: {
+          event: 'password_reset_confirm_failed',
+          userId: registered.user.id,
+        },
+      });
+      expect(
+        auditRows.some(
+          (row) =>
+            (row.metadata as { reason?: string } | null)?.reason ===
+            'already_used',
+        ),
+      ).toBe(true);
+    });
+
+    /**
+     * Two concurrent confirms racing the SAME still-valid token: exactly
+     * one must win (password changed) and the other must fail cleanly
+     * through the same generic `INVALID_PASSWORD_RESET_TOKEN` — never both
+     * succeeding (a double-spend of a single-use token) and never both
+     * failing (a legitimate reset request stuck unusable).
+     */
+    it('two concurrent confirms of the SAME token: exactly one succeeds, the other fails cleanly (no double-spend)', async () => {
+      const email = uniqueEmail('reset-confirm-race');
+      const oldPassword = 'correct-horse-battery';
+      await devToolsService.register({ email, password: oldPassword });
+      const rawToken = await requestRawToken(email);
+
+      const settled = await Promise.allSettled([
+        devToolsService.confirmPasswordReset({
+          token: rawToken,
+          newPassword: 'password-from-attempt-a',
+        }),
+        devToolsService.confirmPasswordReset({
+          token: rawToken,
+          newPassword: 'password-from-attempt-b',
+        }),
+      ]);
+
+      for (const result of settled) {
+        if (result.status === 'rejected') {
+          expect(result.reason).toBeInstanceOf(AppException);
+          expect((result.reason as AppException).code).toBe(
+            AppErrorCode.INVALID_PASSWORD_RESET_TOKEN,
+          );
+        }
+      }
+
+      const fulfilled = settled.filter((r) => r.status === 'fulfilled');
+      const rejected = settled.filter((r) => r.status === 'rejected');
+      expect(fulfilled).toHaveLength(1);
+      expect(rejected).toHaveLength(1);
+    });
+
+    /**
+     * Fix cycle 1 (Phase 12, 12B-B3), finding 3: a completed reset must
+     * invalidate every OTHER outstanding token for the same account, not
+     * just the one that was actually presented — concretely, an attacker who
+     * captured an EARLIER reset link/token keeps a live account-takeover
+     * credential today even after the legitimate user completes their OWN,
+     * LATER reset with a different token, until that earlier token's own
+     * 1-hour TTL expires. See `AuthService.confirmPasswordReset`'s doc
+     * comment for the full claim-and-invalidate-others design.
+     */
+    it('confirming one outstanding token invalidates every OTHER outstanding token for the same account', async () => {
+      const email = uniqueEmail('reset-confirm-invalidates-others');
+      const oldPassword = 'correct-horse-battery';
+      const registered = await devToolsService.register({
+        email,
+        password: oldPassword,
+      });
+
+      // Two independently-issued tokens for the SAME account — e.g. an
+      // earlier request an attacker captured, plus a later one the
+      // legitimate account owner actually uses.
+      const olderToken = await requestRawToken(email);
+      const newerToken = await requestRawToken(email);
+
+      await devToolsService.confirmPasswordReset({
+        token: newerToken,
+        newPassword: 'brand-new-password-1',
+      });
+
+      // The older token was NEVER itself presented to `confirm` before this
+      // point, yet it must no longer work — this is finding 3's entire
+      // point: a completed reset invalidates every OTHER outstanding token,
+      // not just the one that was used.
+      await expect(
+        devToolsService.confirmPasswordReset({
+          token: olderToken,
+          newPassword: 'attacker-supplied-password',
+        }),
+      ).rejects.toMatchObject({
+        code: AppErrorCode.INVALID_PASSWORD_RESET_TOKEN,
+        status: HttpStatus.UNAUTHORIZED,
+      } as Partial<AppException>);
+
+      // The account's password is the legitimate (newer-token) confirm's,
+      // never the rejected older-token attempt's.
+      const storedUser = await devToolsPrisma.user.findUnique({
+        where: { email },
+      });
+      expect(
+        await bcrypt.compare('brand-new-password-1', storedUser!.passwordHash),
+      ).toBe(true);
+      expect(
+        await bcrypt.compare(
+          'attacker-supplied-password',
+          storedUser!.passwordHash,
+        ),
+      ).toBe(false);
+
+      // Both tokens are marked used/invalid AT REST, not merely rejected at
+      // the API boundary.
+      const tokens = await devToolsPrisma.passwordResetToken.findMany({
+        where: { userId: registered.user.id },
+      });
+      expect(tokens).toHaveLength(2);
+      expect(tokens.every((token) => token.usedAt !== null)).toBe(true);
+    });
+
+    /**
+     * Race-safety re-verification for finding 3 (fix cycle 1): the FIRST
+     * attempt at "invalidate the other outstanding tokens" (a CAS scoped to
+     * the presented token's own `id`, followed by a SEPARATE broad
+     * `updateMany` scoped to `userId != that id`) was rejected before
+     * shipping — it is exactly the shape that deadlocked 12B-B1
+     * (`changePassword`): two concurrent confirms for two DIFFERENT
+     * outstanding tokens of the SAME account would each lock their own token
+     * row first, then block trying to lock the OTHER transaction's row,
+     * forming a lock-order cycle (Postgres `40P01`). This test reproduces
+     * exactly that scenario — real concurrency, real tokens, no mocks — and
+     * is looped `PASSWORD_RESET_RACE_TEST_ITERATIONS` (>= 25, per the
+     * review's own requirement) times to raise the catch rate for a
+     * reintroduced regression, mirroring `RACE_TEST_ITERATIONS`'s existing
+     * precedent above for the equivalent `changePassword` races.
+     */
+    it('N concurrent confirms of TWO DIFFERENT outstanding tokens for the same account never deadlock: exactly one wins, the other fails cleanly', async () => {
+      for (
+        let iteration = 0;
+        iteration < PASSWORD_RESET_RACE_TEST_ITERATIONS;
+        iteration++
+      ) {
+        const email = uniqueEmail(`reset-confirm-two-token-race-${iteration}`);
+        await devToolsService.register({
+          email,
+          password: 'correct-horse-battery',
+        });
+
+        const tokenA = await requestRawToken(email);
+        const tokenB = await requestRawToken(email);
+
+        const settled = await Promise.allSettled([
+          devToolsService.confirmPasswordReset({
+            token: tokenA,
+            newPassword: 'password-from-attempt-a',
+          }),
+          devToolsService.confirmPasswordReset({
+            token: tokenB,
+            newPassword: 'password-from-attempt-b',
+          }),
+        ]);
+
+        // Neither settlement may be an unhandled/opaque failure — the
+        // deadlock shape this guards against (Postgres `40P01`) would
+        // surface as a raw `PrismaClientUnknownRequestError`, never a clean
+        // `AppException`.
+        for (const result of settled) {
+          if (result.status === 'rejected') {
+            expect(result.reason).toBeInstanceOf(AppException);
+            expect((result.reason as AppException).code).toBe(
+              AppErrorCode.INVALID_PASSWORD_RESET_TOKEN,
+            );
+          }
+        }
+
+        // Exactly one call wins (password changed) and exactly one loses —
+        // never both succeeding (a double-invalidate bypass) and never both
+        // failing (a legitimate reset request stuck unusable).
+        const fulfilled = settled.filter((r) => r.status === 'fulfilled');
+        const rejected = settled.filter((r) => r.status === 'rejected');
+        expect(fulfilled).toHaveLength(1);
+        expect(rejected).toHaveLength(1);
+      }
+    }, 60000);
   });
 });

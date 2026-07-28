@@ -75,6 +75,37 @@ export const AUTH_AUDIT_METADATA_ALLOWLIST = {
    * `Session` row, so it is simply omitted rather than kept "just in case").
    */
   session_revoked: [],
+  /**
+   * Phase 12, work unit 12B-B3: `POST /auth/password-reset/request` was
+   * called. Fires for BOTH outcomes — the email resolved to a real account
+   * (a `PasswordResetToken` row was created; no metadata needed, mirroring
+   * `login_success`'s no-metadata convention for the "normal" path) and the
+   * email did not resolve to any account (`reason: 'user_not_found'`, no
+   * `userId` — mirrors `login_failed`'s identical "unresolved email" case
+   * exactly). This distinction is internal/operational only: the HTTP
+   * response itself is byte-identical either way (this endpoint's frozen
+   * anti-enumeration contract), so recording it here does not create a
+   * client-visible enumeration surface — it only gives an operator
+   * reviewing this log the same "wrong password vs. no such account"
+   * visibility `login_failed` already provides.
+   */
+  password_reset_requested: ['reason'],
+  /**
+   * `POST /auth/password-reset/confirm` succeeded — the password hash was
+   * updated, the token was consumed (single-use), and every session for the
+   * account was revoked. No metadata needed.
+   */
+  password_reset_confirmed: [],
+  /**
+   * `POST /auth/password-reset/confirm` was refused. `reason` distinguishes
+   * the internal cause (`token_not_found` | `already_used` | `expired` |
+   * `claim_failed`) for operator visibility — mirroring
+   * `change_password_failed`'s/`login_failed`'s existing "generic client
+   * response, disambiguated audit reason" precedent. The client-facing
+   * error is always the same generic `INVALID_PASSWORD_RESET_TOKEN`
+   * regardless of which reason fired.
+   */
+  password_reset_confirm_failed: ['reason'],
 } as const satisfies Record<string, readonly string[]>;
 
 export type AuthAuditEventName = keyof typeof AUTH_AUDIT_METADATA_ALLOWLIST;

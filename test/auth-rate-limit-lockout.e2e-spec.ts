@@ -150,6 +150,65 @@ describe('Auth rate limiting + account lockout (e2e)', () => {
         HttpStatus.TOO_MANY_REQUESTS,
       );
     }, 20000);
+
+    /**
+     * Phase 12, work unit 12B-B3: `POST /auth/password-reset/request` is
+     * unauthenticated, exactly like register/login/refresh above, so it
+     * gets the same style of tight per-route override (see
+     * `PASSWORD_RESET_REQUEST_RATE_LIMIT`'s doc comment for the
+     * 3/10min threshold/rationale — deliberately the SAME limit as
+     * `/auth/register`).
+     */
+    it('returns a generic 429 on the 4th /auth/password-reset/request call within the window (limit 3/10min)', async () => {
+      const email = uniqueEmail('reset-req-rl');
+      await request(app.getHttpServer())
+        .post('/auth/register')
+        .send({ email, password: 'correct-horse-battery' })
+        .expect(HttpStatus.CREATED);
+
+      const requestReset = () =>
+        request(app.getHttpServer())
+          .post('/auth/password-reset/request')
+          .send({ email });
+
+      await requestReset().expect(HttpStatus.ACCEPTED);
+      await requestReset().expect(HttpStatus.ACCEPTED);
+      await requestReset().expect(HttpStatus.ACCEPTED);
+
+      const blocked = await requestReset().expect(HttpStatus.TOO_MANY_REQUESTS);
+      const body = blocked.body as ErrorResponseBody;
+      expect(body.statusCode).toBe(HttpStatus.TOO_MANY_REQUESTS);
+      // Generic: no hint about which email/account triggered it.
+      expect(JSON.stringify(body)).not.toMatch(/@example\.test/);
+    });
+
+    /**
+     * `POST /auth/password-reset/confirm` is also unauthenticated (no
+     * access token — the presented token itself is the only credential),
+     * so it gets its own tight override too (see
+     * `PASSWORD_RESET_CONFIRM_RATE_LIMIT`'s doc comment — the SAME
+     * threshold as `/auth/login`). A garbage token is used throughout so
+     * this test never depends on `requestPasswordReset`'s dev-only raw
+     * -token exposure.
+     */
+    it('returns a generic 429 on the 6th /auth/password-reset/confirm call within the window (limit 5/min)', async () => {
+      const attemptConfirm = () =>
+        request(app.getHttpServer()).post('/auth/password-reset/confirm').send({
+          token: 'never-issued-reset-token',
+          newPassword: 'brand-new-password-1',
+        });
+
+      for (let i = 0; i < 5; i += 1) {
+        await attemptConfirm().expect(HttpStatus.UNAUTHORIZED);
+      }
+
+      const blocked = await attemptConfirm().expect(
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+      expect((blocked.body as ErrorResponseBody).statusCode).toBe(
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+    });
   });
 
   describe('Persistent account lockout', () => {

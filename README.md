@@ -450,6 +450,99 @@ The IP-hashing and user-agent-sanitization logic lives in one shared place
 `AuthAuditEvent`) and `AuthService` (for `Session`) — never two divergent
 implementations of the same hash/sanitize step.
 
+### `POST /auth/password-reset/request` (Phase 12, work unit 12B-B3)
+
+Unauthenticated. Body:
+
+```json
+{ "email": "someone@example.test" }
+```
+
+**Frozen contract: always returns `202`, with the identical body shape,
+regardless of whether `email` resolves to a real account** (DECISIONS.md
+"Phase 12 ... approved..." entry, decision 3) — this is an anti-enumeration
+guarantee, mirroring `POST /auth/login`'s existing "same generic error either
+way" precedent, applied here at the "does this email exist" layer:
+
+```json
+{ "success": true }
+```
+
+- If the email resolves to a real account, a single-use, expiring
+  (`PasswordResetToken`) row is created for it. **No row is ever created for
+  a nonexistent email** — mirroring `AccountLockout`'s existing "a
+  nonexistent email never causes a row to be created" precedent — so this
+  table cannot be used to enumerate which emails are registered, even with
+  raw database access.
+- **The raw reset token is returned in the response body (as `devToken`)
+  ONLY when `DEV_TOOLS_ENABLED=true` AND `NODE_ENV` is not `production`.**
+  `env.validation.ts` already refuses to boot the app at all if that
+  combination is misconfigured (the existing Phase 10, work unit 10-B5
+  fail-loud check — see that file), so this can only ever be observed on a
+  developer's own machine, never in production. This conditional
+  deliberately lives in the RESPONSE SHAPING, not a `DevToolsGuard` route
+  guard: a guard would reject the ENTIRE route (404) whenever the flag is
+  off, which would break this endpoint's own "always returns 202" contract
+  for every environment except a developer's own machine with the flag on.
+  The route always executes normally; only the `devToken` field is
+  conditionally attached.
+- **No real email or SMS is ever sent this phase** — that is an explicit,
+  hard-scoped-out integration for a future phase. In production (or any
+  environment with `DEV_TOOLS_ENABLED` off), the caller has no way to
+  retrieve the raw token through this API at all.
+- Rate-limited to **3 requests per 10 minutes per IP** (the SAME threshold as
+  `POST /auth/register` — both are unauthenticated, low-frequency-legitimate
+  -use, state-changing routes).
+
+### `POST /auth/password-reset/confirm` (Phase 12, work unit 12B-B3)
+
+Unauthenticated (no `Authorization` header — the presented token itself is
+the only credential in play). Body:
+
+```json
+{
+  "token": "the raw reset token (from the dev-only devToken field, in dev)",
+  "newPassword": "at-least-8-chars"
+}
+```
+
+- `newPassword`: the SAME 8–128 character policy as `POST /auth/register` /
+  `POST /auth/change-password` — the single source of truth.
+
+On success, returns `200 { "success": true }` and:
+
+- Sets the new password.
+- Marks the token **single-use** — a second confirm with the same token
+  fails.
+- **Revokes EVERY session for the account** — deliberately MORE aggressive
+  than `POST /auth/change-password` (which keeps the calling device's own
+  session alive with a rotated token pair): a password reset exists
+  specifically for the scenario where the account may already be
+  compromised, so there is no session worth sparing, and **no replacement
+  session is issued either** — the caller must log in again afterward with
+  the new password, the same end state `POST /auth/logout-all` leaves the
+  account in.
+
+Errors: `401 INVALID_PASSWORD_RESET_TOKEN` — used identically whether the
+token does not exist, was already used, or has expired (never distinguished,
+mirroring the `INVALID_CREDENTIALS`/`INVALID_REFRESH_TOKEN` anti-enumeration
+precedent); `400` for a `newPassword` that fails the length policy.
+Rate-limited to **5 requests per minute per IP** (the SAME threshold as
+`POST /auth/login`).
+
+### `PasswordResetToken` (Phase 12, work unit 12B-B3)
+
+Additive table. `tokenHash` (never the raw token) is an HMAC-SHA256 digest of
+the raw token, keyed with `JWT_REFRESH_SECRET` — the SAME secret
+`Session.refreshTokenHash` already uses, reused deliberately (not a silent
+default): a reset token and a refresh token are cryptographically the same
+kind of value (an opaque, high-entropy bearer secret checked only via a
+keyed-hash match, never bcrypt), so they share the same hashing key rather
+than this phase minting a fourth long-lived auth secret. `usedAt` (nullable,
+set exactly once) enforces single-use; `expiresAt` bounds the token to a
+1-hour window independently of use. `onDelete: Cascade` — an outstanding
+reset token for a deleted account is discarded along with it.
+
 ### Known gaps in the Auth API
 
 - **No rate limiting yet** on `/auth/login` or `/auth/register`. This was

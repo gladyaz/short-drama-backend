@@ -11,17 +11,17 @@ datasource db {
 }
 
 model User {
-  id                String                 @id @default(cuid())
-  email             String                 @unique
-  passwordHash      String
-  displayName       String?
-  createdAt         DateTime               @default(now())
-  updatedAt         DateTime               @updatedAt
-  sessions          Session[]
-  videoInteractions UserVideoInteraction[]
-  watchProgress     WatchProgress[]
-  entitlements      Entitlement[]
-  analyticsEvents   AnalyticsEvent[]
+  id                  String                 @id @default(cuid())
+  email               String                 @unique
+  passwordHash        String
+  displayName         String?
+  createdAt           DateTime               @default(now())
+  updatedAt           DateTime               @updatedAt
+  sessions            Session[]
+  videoInteractions   UserVideoInteraction[]
+  watchProgress       WatchProgress[]
+  entitlements        Entitlement[]
+  analyticsEvents     AnalyticsEvent[]
   /// Phase 11, work unit 11B-2: authorizes the admin-guarded `/admin/media`
   /// API (11B-3). Plain `String` (not a Postgres enum), matching the
   /// existing `Video.category`/`Entitlement.tier` precedent — no second
@@ -32,13 +32,13 @@ model User {
   /// an explicit, separate action (`AdminGuard`'s DEV-ONLY grant route,
   /// gated by the existing `DEV_TOOLS_ENABLED`/`DevToolsGuard` precedent —
   /// there is no real admin-provisioning flow yet).
-  role              String                 @default("user")
+  role                String                 @default("user")
   /// Phase 12, work unit 12A-B1: persistent per-account failed-login/lockout
   /// state. Optional 1:1 — most users never have a row here (one is only
   /// created lazily on that account's first failed login attempt via
   /// `AccountLockoutService`). See `AccountLockout` below for the full
   /// design rationale.
-  accountLockout    AccountLockout?
+  accountLockout      AccountLockout?
   /// Phase 12, work unit 12A-B3: operational security audit trail. Nullable
   /// FK with `onDelete: SetNull` (NOT `Cascade`), mirroring the existing
   /// `AnalyticsEvent.userId` precedent — deleting a `User` anonymizes their
@@ -46,7 +46,15 @@ model User {
   /// operational-security log (e.g. investigating account-takeover activity
   /// must survive the attacker later deleting the compromised account). See
   /// `AuthAuditEvent` below for the full design rationale.
-  authAuditEvents   AuthAuditEvent[]
+  authAuditEvents     AuthAuditEvent[]
+  /// Phase 12, work unit 12B-B3: `POST /auth/password-reset/*`. Cascades
+  /// with the `User` (`onDelete: Cascade`, NOT `SetNull`) — unlike
+  /// `AuthAuditEvent` above, an outstanding reset-token row has no
+  /// standalone value once its account no longer exists; there is nothing
+  /// to investigate or anonymize, matching the `Session`/`AccountLockout`
+  /// precedent instead. See `PasswordResetToken` below for the full design
+  /// rationale.
+  passwordResetTokens PasswordResetToken[]
 }
 
 // Phase 12, work unit 12A-B1: persistent (PostgreSQL, survives restart)
@@ -223,12 +231,12 @@ model Video {
 // this work unit). `sortOrder` defaults to 0, independent of and unrelated
 // to `Video.sortOrder` (a different table, a different ordering concern).
 model Series {
-  id            String   @id
+  id            String    @id
   title         String
   coverImageKey String?
-  sortOrder     Int      @default(0)
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
+  sortOrder     Int       @default(0)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
   /// Phase 11, work unit 11F-1: safe (soft) archive — the PRIMARY "delete"
   /// action for a `Series` row. Nullable with NO default, so every
   /// pre-existing row (and every caller that creates/updates a `Series`
@@ -393,4 +401,54 @@ model AuthAuditEvent {
   @@index([userId])
   @@index([event])
   @@index([createdAt])
+}
+
+// Phase 12, work unit 12B-B3: `POST /auth/password-reset/request` /
+// `POST /auth/password-reset/confirm` (DECISIONS.md "Phase 12 ...
+// approved..." entry, decision 3). A row is created only once a
+// `password-reset/request` call resolves to a REAL existing `User` — a
+// nonexistent email never creates a row here, matching the exact same
+// no-enumeration-surface precedent `AccountLockout`'s schema doc comment
+// above already establishes for this codebase.
+//
+// `tokenHash` (NOT the raw token) is the only thing ever persisted — the
+// raw, high-entropy opaque token is returned to the caller (API response,
+// gated by `DEV_TOOLS_ENABLED`/`NODE_ENV`; see `AuthService
+// .requestPasswordReset`) and otherwise never stored, matching
+// `Session.refreshTokenHash`'s existing "hash of a bearer secret, `@unique`,
+// never the plaintext" precedent exactly. It is HMAC-SHA256 keyed with
+// `jwtRefreshSecret` (see `AuthService.hashPasswordResetToken`'s doc comment
+// for why this reuses that secret rather than minting a fourth one) — this
+// is deliberately NOT the same value as `Session.refreshTokenHash` for the
+// same raw bytes would be (different tokens, different purposes), it is the
+// same HASHING KEY.
+//
+// `usedAt` (nullable, set exactly once) enforces single-use: a token that
+// has already been consumed by a successful confirm can never be reused,
+// even if the raw value leaks afterward (e.g. via a browser history/email
+// client). `expiresAt` bounds the exposure window independently of use.
+// Both `usedAt IS NULL` and `expiresAt > now()` must hold for a presented
+// token to be accepted by `AuthService.confirmPasswordReset` — see that
+// method's doc comment for the single-statement, race-safe claim mechanism
+// (a conditional `updateMany` keyed on `usedAt: null`, mirroring
+// `AuthService.revokeSession`'s existing CAS-on-one-row pattern) that
+// prevents two concurrent confirms of the same still-valid token from both
+// succeeding.
+//
+// `onDelete: Cascade` (not `SetNull`, unlike `AuthAuditEvent` above): an
+// outstanding reset token for an account that no longer exists is useless
+// dead weight, not an audit trail worth preserving — this mirrors
+// `Session`/`AccountLockout`'s existing cascade precedent, not
+// `AuthAuditEvent`'s anonymize-on-delete precedent.
+model PasswordResetToken {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
 }

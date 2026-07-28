@@ -15,6 +15,10 @@ import type { Request } from 'express';
 import {
   LOGIN_RATE_LIMIT,
   LOGIN_RATE_TTL_MS,
+  PASSWORD_RESET_CONFIRM_RATE_LIMIT,
+  PASSWORD_RESET_CONFIRM_RATE_TTL_MS,
+  PASSWORD_RESET_REQUEST_RATE_LIMIT,
+  PASSWORD_RESET_REQUEST_RATE_TTL_MS,
   REFRESH_RATE_LIMIT,
   REFRESH_RATE_TTL_MS,
   REGISTER_RATE_LIMIT,
@@ -25,11 +29,14 @@ import {
   AuthRequestContext,
   AuthResponseDto,
   AuthUserDto,
+  PasswordResetRequestResponseDto,
   SessionSummaryDto,
 } from './auth.types';
 import { CurrentUser } from './decorators/current-user.decorator';
 import { ChangePasswordDto } from './dto/change-password.dto';
 import { LoginDto } from './dto/login.dto';
+import { PasswordResetConfirmDto } from './dto/password-reset-confirm.dto';
+import { PasswordResetRequestDto } from './dto/password-reset-request.dto';
 import { RefreshTokenDto } from './dto/refresh-token.dto';
 import { RegisterDto } from './dto/register.dto';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
@@ -220,5 +227,56 @@ export class AuthController {
     @Req() request: Request,
   ): Promise<void> {
     await this.authService.revokeSession(user.id, id, requestContext(request));
+  }
+
+  /**
+   * Phase 12, work unit 12B-B3 (DECISIONS.md "Phase 12 ... approved..."
+   * entry, decision 3). Unauthenticated, like `login`/`register`/`refresh`
+   * above — gets its own tight `@Throttle()` override for the same reason
+   * (see `PASSWORD_RESET_REQUEST_RATE_LIMIT`'s doc comment for the exact
+   * threshold/rationale). Deliberately NO `DevToolsGuard` here — see
+   * `AuthService.requestPasswordReset`'s doc comment for why the dev-only
+   * raw-token conditional lives in that method's response-shaping instead
+   * of a route guard: this route must always return `202`, in every
+   * environment, which a guard rejecting the whole route when
+   * `DEV_TOOLS_ENABLED` is off would break.
+   */
+  @Post('password-reset/request')
+  @HttpCode(HttpStatus.ACCEPTED)
+  @Throttle({
+    default: {
+      limit: PASSWORD_RESET_REQUEST_RATE_LIMIT,
+      ttl: PASSWORD_RESET_REQUEST_RATE_TTL_MS,
+    },
+  })
+  requestPasswordReset(
+    @Body() dto: PasswordResetRequestDto,
+    @Req() request: Request,
+  ): Promise<PasswordResetRequestResponseDto> {
+    return this.authService.requestPasswordReset(dto, requestContext(request));
+  }
+
+  /**
+   * Phase 12, work unit 12B-B3. Also unauthenticated (no `Authorization`
+   * header — the single-use reset token itself is the only credential in
+   * play), so it also gets its own tight `@Throttle()` override (see
+   * `PASSWORD_RESET_CONFIRM_RATE_LIMIT`'s doc comment). See
+   * `AuthService.confirmPasswordReset`'s doc comment for the full
+   * single-use/expiry/revoke-all-sessions design.
+   */
+  @Post('password-reset/confirm')
+  @HttpCode(HttpStatus.OK)
+  @Throttle({
+    default: {
+      limit: PASSWORD_RESET_CONFIRM_RATE_LIMIT,
+      ttl: PASSWORD_RESET_CONFIRM_RATE_TTL_MS,
+    },
+  })
+  async confirmPasswordReset(
+    @Body() dto: PasswordResetConfirmDto,
+    @Req() request: Request,
+  ): Promise<{ success: true }> {
+    await this.authService.confirmPasswordReset(dto, requestContext(request));
+    return { success: true };
   }
 }

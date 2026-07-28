@@ -50,3 +50,21 @@ export interface SessionSummaryDto {
   createdAt: string;
   expiresAt: string;
 }
+
+/**
+ * Phase 12, work unit 12B-B3: `POST /auth/password-reset/request`'s
+ * response shape (DECISIONS.md "Phase 12 ... approved..." entry, decision
+ * 3). `success` is always `true` — this route always responds `202`
+ * regardless of whether the email resolved to a real account (the frozen
+ * anti-enumeration contract). `devToken` is the ONLY field that can differ
+ * between callers, and only when `DEV_TOOLS_ENABLED=true && NODE_ENV !=
+ * production` (`AuthService.requestPasswordReset` decides this — never a
+ * route guard; see that method's doc comment for why): present (the raw,
+ * one-time reset token) when a token was actually created for a resolved
+ * account, `undefined`/omitted otherwise (no account resolved, OR dev-token
+ * exposure is off). Never a hash, never a password, never any other secret.
+ */
+export interface PasswordResetRequestResponseDto {
+  success: true;
+  devToken?: string;
+}

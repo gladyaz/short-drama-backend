@@ -161,4 +161,16 @@ export enum AppErrorCode {
    * `INVALID_REFRESH_TOKEN` already establish elsewhere in this file.
    */
   SESSION_NOT_FOUND = 'SESSION_NOT_FOUND',
+  // Phase 12, work unit 12B-B3 (password reset)
+  /**
+   * Returned by `POST /auth/password-reset/confirm` for ANY invalid-token
+   * condition — the token does not exist, was already used, or has expired
+   * — collapsing all three into the exact same generic code/status,
+   * mirroring the `INVALID_REFRESH_TOKEN`/`INVALID_CREDENTIALS`
+   * anti-enumeration precedent: never let a caller distinguish "this token
+   * never existed" from "someone already used it" from "you waited too
+   * long", which would otherwise leak information about account/reset-flow
+   * state.
+   */
+  INVALID_PASSWORD_RESET_TOKEN = 'INVALID_PASSWORD_RESET_TOKEN',
 }

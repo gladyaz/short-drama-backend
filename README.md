@@ -357,6 +357,99 @@ or account-lockout coupling for this route (unlike `login`) — it is
 authenticated already and falls under the app-wide default throttler like
 every other authenticated route.
 
+### `POST /auth/logout-all` (Phase 12, work unit 12B-B2)
+
+Requires `Authorization: Bearer <accessToken>`. No request body.
+
+**Frozen contract: this logs the caller out EVERYWHERE, including the
+device/session that made this very call.** There is no "current session"
+carve-out here — every `Session` row for the account is revoked
+unconditionally. This is a deliberate, explicit design decision (recorded in
+DECISIONS.md's Phase 12 approval): the "revoke every OTHER session but keep
+me signed in" need is already served by `POST /auth/change-password`
+(work unit 12B-B1); this endpoint is the separate, more aggressive "log out
+everywhere" option, not a duplicate of it.
+
+Returns `200 { "success": true }`. Every outstanding refresh token for the
+account stops working immediately afterward (any subsequent
+`POST /auth/refresh` gets `401 INVALID_REFRESH_TOKEN`). The access token
+this call itself was authenticated with remains cryptographically valid
+until it naturally expires (~15 min) — this app's access tokens are
+stateless JWTs (see `JwtAuthGuard`'s existing "does not re-check user
+existence per request" gap below); this is the same pre-existing property
+`POST /auth/logout` already has for the one session it revokes, not a new
+gap introduced by this endpoint.
+
+Errors: `401 INVALID_ACCESS_TOKEN` for a missing/malformed/expired/invalid
+access token (same as every other guarded route).
+
+### `GET /auth/sessions` (Phase 12, work unit 12B-B2)
+
+Requires `Authorization: Bearer <accessToken>`. Returns `200` with an array
+of the caller's **own** currently-active sessions only — never another
+account's, and never a `refreshTokenHash`/`ipHash`/any other hash or secret:
+
+```json
+[
+  {
+    "id": "...",
+    "userAgent": "Mozilla/5.0 ... or null",
+    "lastUsedAt": "2026-07-28T00:00:00.000Z or null",
+    "createdAt": "2026-07-28T00:00:00.000Z",
+    "expiresAt": "2026-08-27T00:00:00.000Z"
+  }
+]
+```
+
+Revoked sessions are excluded (this is a "manage your logged-in devices"
+view, not a history log — see `AuthAuditEvent`/the audit trail for that).
+`userAgent`/`lastUsedAt` are `null` for a session created without request
+context (e.g. directly through `AuthService` in a test) or predating this
+work unit. Errors: `401 INVALID_ACCESS_TOKEN`.
+
+### `DELETE /auth/sessions/:id` (Phase 12, work unit 12B-B2)
+
+Requires `Authorization: Bearer <accessToken>`. Ownership-scoped revoke (not
+a row delete — the underlying `Session.revokedAt` is set, matching every
+other session-lifecycle action in this codebase). Returns `204 No Content`
+on success.
+
+A session id that does not exist at all, and a session id that exists but
+belongs to a **different** account, are both refused with the exact same
+`404 SESSION_NOT_FOUND` — a cross-account revoke is impossible, not merely
+unlikely, and this endpoint cannot be used to probe which session ids exist
+for other accounts. Revoking an already-revoked session of your own is a
+safe, idempotent no-op (also `204`), mirroring `POST /auth/logout`'s
+existing idempotent-on-already-revoked precedent.
+
+Errors: `401 INVALID_ACCESS_TOKEN`; `404 SESSION_NOT_FOUND`.
+
+### Session metadata: `userAgent` / `ipHash` / `lastUsedAt` (Phase 12, work unit 12B-B2)
+
+`Session` gained three additive, nullable columns (DECISIONS.md "Phase 12
+... approved..." entry, decision 6), populated everywhere a session is
+created or refreshed (`register`, `login`, `refresh`'s replacement session,
+`change-password`'s replacement session):
+
+- `userAgent`: the raw `User-Agent` request header, truncated to 255
+  characters and stripped of control characters before storage — never
+  persisted verbatim/unbounded.
+- `ipHash`: an HMAC-SHA256 digest of the client IP, keyed with
+  `AUTH_AUDIT_IP_HASH_SECRET` (the same dedicated secret `AuthAuditEvent`
+  already uses — see that env var's `.env.example` comment). **The raw IP
+  address is never stored anywhere on the `Session` row, or in any
+  session-listing response.**
+- `lastUsedAt`: set when a session is created, and updated on the old
+  session row at the exact moment `POST /auth/refresh` rotates it out. This
+  app's access tokens are stateless JWTs and refresh tokens rotate (rather
+  than being mutated in place) on every use, so "created" and "rotated out
+  by a refresh" are the only two events that ever touch this column today.
+
+The IP-hashing and user-agent-sanitization logic lives in one shared place
+(`src/auth/auth-crypto.ts`), used by both `AuthAuditService` (for
+`AuthAuditEvent`) and `AuthService` (for `Session`) — never two divergent
+implementations of the same hash/sanitize step.
+
 ### Known gaps in the Auth API
 
 - **No rate limiting yet** on `/auth/login` or `/auth/register`. This was
@@ -954,6 +1047,10 @@ anywhere in this project. Five models:
   `displayName`).
 - `Session` — refresh-token state (`refreshTokenHash`, `expiresAt`,
   `revokedAt`) backing `/auth/refresh` and `/auth/logout` rotation/revocation.
+  Phase 12, work unit 12B-B2 added three additive, nullable columns —
+  `userAgent`, `ipHash` (HMAC, never the raw IP), `lastUsedAt` — surfaced
+  (never a hash) by `GET /auth/sessions`; see the "Session metadata" section
+  above.
 - `Video` — the video catalog previously hardcoded in `videos.data.ts`, now
   seeded into this table (`prisma/seed.ts`) and read by `VideosService` at
   request time. `sortOrder` is derived from each record's array position in

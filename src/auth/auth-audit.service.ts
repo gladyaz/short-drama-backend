@@ -1,17 +1,16 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Prisma } from '@prisma/client';
-import { createHmac } from 'crypto';
 import { RootConfig } from '../config/configuration';
 import { redactSensitiveText } from '../common/logging/redact';
 import { PrismaService } from '../prisma/prisma.service';
+import { hashIp, sanitizeUserAgent } from './auth-crypto';
 import {
   AUTH_AUDIT_METADATA_ALLOWLIST,
   AuthAuditEventName,
   AuthAuditMetadataValue,
   EmitAuthAuditEventParams,
   MAX_METADATA_STRING_LENGTH,
-  MAX_USER_AGENT_LENGTH,
 } from './auth-audit.types';
 
 /**
@@ -37,6 +36,13 @@ import {
  *     no token, password, secret, raw email, or raw IP can reach this table
  *     regardless of what a caller passes in.
  *
+ * The IP-hashing and user-agent-sanitization primitives themselves live in
+ * `./auth-crypto.ts` (Phase 12, work unit 12B-B2), not here — `AuthService`'s
+ * session-writing path (`Session.ipHash`/`Session.userAgent`) needs the
+ * EXACT same two primitives, and duplicating either would risk the audit
+ * log and the session table silently disagreeing on how the same raw IP/
+ * user-agent value gets hashed or sanitized.
+ *
  * Emission is deliberately BEST-EFFORT: a failure to write the audit row
  * (e.g. a transient DB error) is caught and logged through the existing
  * redaction-safe logger, never rethrown — an audit-logging outage must never
@@ -58,8 +64,11 @@ export class AuthAuditService {
     params: EmitAuthAuditEventParams = {},
   ): Promise<void> {
     try {
+      const authConfig = this.configService.get('auth', { infer: true })!;
       const ipHash =
-        params.ip !== undefined ? this.hashIp(params.ip) : undefined;
+        params.ip !== undefined
+          ? hashIp(params.ip, authConfig.authAuditIpHashSecret)
+          : undefined;
       const userAgent =
         params.userAgent !== undefined
           ? sanitizeUserAgent(params.userAgent)
@@ -97,42 +106,6 @@ export class AuthAuditService {
       );
     }
   }
-
-  /**
-   * HMAC-SHA256 of the raw IP, keyed with the dedicated
-   * `AUTH_AUDIT_IP_HASH_SECRET` — never plain/unkeyed SHA-256, so a leak of
-   * the `AuthAuditEvent` table alone cannot be used to test candidate IPs
-   * against stored hashes without also knowing the secret, and rotating the
-   * secret invalidates the ability to correlate old hashes with new ones if
-   * ever needed as an incident-response measure (mirrors
-   * `AuthService.hashRefreshToken`'s existing rationale for the same
-   * HMAC-vs-plain-hash choice).
-   */
-  private hashIp(ip: string): string {
-    const authConfig = this.configService.get('auth', { infer: true })!;
-    return createHmac('sha256', authConfig.authAuditIpHashSecret)
-      .update(ip)
-      .digest('hex');
-  }
-}
-
-/**
- * Strips ASCII control characters (code points 0x00-0x1F and 0x7F) and
- * truncates to `MAX_USER_AGENT_LENGTH`. Filters by character code rather
- * than a `/[\x00-\x1F\x7F]/` regex literal (the more common approach) to
- * avoid the ESLint `no-control-regex` rule this project runs clean under —
- * behaviorally identical, just expressed without a raw control-character
- * regex.
- */
-function sanitizeUserAgent(userAgent: string): string {
-  const withoutControlCharacters = Array.from(userAgent)
-    .filter((character) => {
-      const codePoint = character.codePointAt(0) ?? 0;
-      return codePoint > 0x1f && codePoint !== 0x7f;
-    })
-    .join('');
-
-  return withoutControlCharacters.slice(0, MAX_USER_AGENT_LENGTH);
 }
 
 /**

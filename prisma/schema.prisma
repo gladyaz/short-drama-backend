@@ -97,6 +97,29 @@ model Session {
   expiresAt        DateTime
   revokedAt        DateTime?
   createdAt        DateTime  @default(now())
+  /// Phase 12, work unit 12B-B2 (DECISIONS.md "Phase 12 ... approved..."
+  /// entry, decision 6): additive, nullable session metadata surfaced by
+  /// `GET /auth/sessions` (never a hash/secret — see `SessionSummaryDto` in
+  /// `auth.types.ts`). All three are nullable with NO default so every
+  /// pre-existing row (and any caller creating a `Session` without them)
+  /// backfills to `null` — this migration changes no existing row's value.
+  /// `userAgent`: the RAW `User-Agent` header value, truncated/sanitized by
+  /// `sanitizeUserAgent` (`auth-crypto.ts`) before it ever reaches this
+  /// column — never persisted verbatim/unbounded. `ipHash`: an HMAC-SHA256
+  /// digest of the client IP (`hashIp`, `auth-crypto.ts`), keyed with the
+  /// SAME dedicated `AUTH_AUDIT_IP_HASH_SECRET` `AuthAuditService` already
+  /// uses for `AuthAuditEvent.ipHash` — the raw IP is never computed into
+  /// this column or persisted anywhere else on this row. `lastUsedAt`: set
+  /// whenever this row is created (`AuthService.issueTokensAndSession`) and
+  /// again on the OLD row at the moment it is rotated out by a refresh (see
+  /// `AuthService.refresh`) — this app's access tokens are stateless JWTs
+  /// verified without a DB hit (`JwtAuthGuard`), and refresh tokens rotate
+  /// on every use rather than being mutated in place, so there is no
+  /// separate "heartbeat"/"touch" event distinct from create-or-rotate to
+  /// wire this into.
+  userAgent        String?
+  ipHash           String?
+  lastUsedAt       DateTime?
 
   @@index([userId])
 }

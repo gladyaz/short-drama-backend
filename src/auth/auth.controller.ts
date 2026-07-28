@@ -1,9 +1,11 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   HttpCode,
   HttpStatus,
+  Param,
   Post,
   Req,
   UseGuards,
@@ -19,7 +21,12 @@ import {
   REGISTER_RATE_TTL_MS,
 } from '../common/rate-limit.constants';
 import { AuthService } from './auth.service';
-import { AuthRequestContext, AuthResponseDto, AuthUserDto } from './auth.types';
+import {
+  AuthRequestContext,
+  AuthResponseDto,
+  AuthUserDto,
+  SessionSummaryDto,
+} from './auth.types';
 import { CurrentUser } from './decorators/current-user.decorator';
 import { ChangePasswordDto } from './dto/change-password.dto';
 import { LoginDto } from './dto/login.dto';
@@ -135,5 +142,83 @@ export class AuthController {
       dto,
       requestContext(request),
     );
+  }
+
+  /**
+   * Phase 12, work unit 12B-B2 (DECISIONS.md "Phase 12 ... approved..."
+   * entry, decision 6; runbook `.claude/plans/rfc-dag-safe-phase12.md`
+   * flagged this endpoint's exact scope as an open ambiguity — "including
+   * or excluding the current one ... decide and document explicitly, do
+   * not leave it ambiguous" — this doc comment IS that resolution).
+   *
+   * FROZEN CONTRACT: "log out everywhere" — revokes EVERY session for the
+   * authenticated caller's account, INCLUDING the session/device that made
+   * THIS very request. There is deliberately no `refreshToken` in the
+   * request body (unlike `change-password`/`refresh`/`logout`) to identify
+   * "the current session" for exclusion, because this endpoint's whole
+   * point is that no session is excluded. The "revoke every OTHER session
+   * but keep me signed in" need this might otherwise seem to serve is
+   * already met by `POST /auth/change-password` (work unit 12B-B1), which
+   * exists specifically for that case — this endpoint is the OTHER, more
+   * aggressive option, not a duplicate of it.
+   *
+   * Practical effect: every outstanding REFRESH token for the account stops
+   * working immediately (any subsequent `POST /auth/refresh` gets `401
+   * INVALID_REFRESH_TOKEN`, exactly like any other revoked session). The
+   * ACCESS token this very request was authenticated with remains
+   * cryptographically valid until it naturally expires (~15 min) — this
+   * app's access tokens are stateless JWTs (`JwtAuthGuard` verifies them
+   * without a database lookup) and that is a pre-existing property of the
+   * whole auth system, not something unique to (or a gap introduced by)
+   * this endpoint; `POST /auth/logout` has always had the exact same
+   * property for the one session it revokes.
+   */
+  @Post('logout-all')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(JwtAuthGuard)
+  async logoutAll(
+    @CurrentUser() user: AuthenticatedUser,
+    @Req() request: Request,
+  ): Promise<{ success: true }> {
+    await this.authService.logoutAll(user.id, requestContext(request));
+    return { success: true };
+  }
+
+  /**
+   * Phase 12, work unit 12B-B2: lists ONLY the authenticated caller's OWN
+   * currently-active sessions — never another account's, never a
+   * `refreshTokenHash`/`ipHash`/any other hash or secret. See
+   * `AuthService.listSessions`'s doc comment for the exact shape/filtering.
+   */
+  @Get('sessions')
+  @UseGuards(JwtAuthGuard)
+  async listSessions(
+    @CurrentUser() user: AuthenticatedUser,
+  ): Promise<SessionSummaryDto[]> {
+    return this.authService.listSessions(user.id);
+  }
+
+  /**
+   * Phase 12, work unit 12B-B2: ownership-scoped session revoke. Returns
+   * `404 SESSION_NOT_FOUND` for a session id that does not exist AND for one
+   * that exists but belongs to a DIFFERENT account — the exact same
+   * response either way, so a cross-account revoke is impossible and this
+   * endpoint cannot be used to probe which session ids exist for other
+   * accounts (see `AuthService.revokeSession`'s doc comment). `204 No
+   * Content` on success (revoke, not delete — the underlying row's
+   * `revokedAt` is set, matching every other session-lifecycle action in
+   * this codebase), mirroring `SeriesController.remove`'s existing
+   * "nothing left to usefully return" precedent for a guarded destructive
+   * action.
+   */
+  @Delete('sessions/:id')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @UseGuards(JwtAuthGuard)
+  async revokeSession(
+    @CurrentUser() user: AuthenticatedUser,
+    @Param('id') id: string,
+    @Req() request: Request,
+  ): Promise<void> {
+    await this.authService.revokeSession(user.id, id, requestContext(request));
   }
 }

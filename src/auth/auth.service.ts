@@ -10,6 +10,7 @@ import { AppException } from '../common/errors/app.exception';
 import { PrismaService } from '../prisma/prisma.service';
 import { AccountLockoutService } from './account-lockout.service';
 import { AuthAuditService } from './auth-audit.service';
+import { hashIp, sanitizeUserAgent } from './auth-crypto';
 import {
   ACCESS_TOKEN_TTL,
   BCRYPT_COST_FACTOR,
@@ -17,7 +18,12 @@ import {
   REFRESH_TOKEN_BYTES,
   REFRESH_TOKEN_TTL_MS,
 } from './auth.constants';
-import { AuthRequestContext, AuthResponseDto, AuthUserDto } from './auth.types';
+import {
+  AuthRequestContext,
+  AuthResponseDto,
+  AuthUserDto,
+  SessionSummaryDto,
+} from './auth.types';
 import { ChangePasswordDto } from './dto/change-password.dto';
 import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
@@ -120,7 +126,7 @@ export class AuthService {
       userAgent: context.userAgent,
     });
 
-    return this.issueTokensAndSession(user);
+    return this.issueTokensAndSession(user, context);
   }
 
   async login(
@@ -194,7 +200,7 @@ export class AuthService {
       ip: context.ip,
       userAgent: context.userAgent,
     });
-    return this.issueTokensAndSession(user);
+    return this.issueTokensAndSession(user, context);
   }
 
   async refresh(
@@ -265,9 +271,21 @@ export class AuthService {
     // revoke atomic and conditioned on the row still being unrevoked at the
     // database level, so only one concurrent request can ever flip it. The
     // returned `count` tells us whether this request won that race.
+    //
+    // Phase 12, work unit 12B-B2: this same statement also stamps
+    // `lastUsedAt` on the OLD (about-to-be-revoked) row — this IS the "a
+    // session was refreshed" moment decision 6's `Session.lastUsedAt`
+    // column exists to capture, distinct from `issueTokensAndSession`
+    // stamping it on the brand-new replacement row below. Added to the
+    // EXISTING `data` object of the EXISTING conditional `updateMany` (same
+    // `where` predicate, same atomicity) rather than a second statement, so
+    // this cannot introduce a new race window of its own. Deliberately NOT
+    // added to the defensive revoke-all-OTHER-sessions statement a few
+    // lines below (`count === 0` branch) or the reuse-detected branch
+    // above: those sessions are being defensively cut off, not "used".
     const { count } = await this.prisma.session.updateMany({
       where: { id: session.id, revokedAt: null },
-      data: { revokedAt: now },
+      data: { revokedAt: now, lastUsedAt: now },
     });
 
     if (count === 0) {
@@ -293,7 +311,7 @@ export class AuthService {
       throw invalidRefreshToken();
     }
 
-    return this.issueTokensAndSession(user);
+    return this.issueTokensAndSession(user, context);
   }
 
   async logout(refreshToken: string): Promise<void> {
@@ -341,8 +359,25 @@ export class AuthService {
     };
   }
 
+  /**
+   * Phase 12, work unit 12B-B2: `context` (the same `AuthRequestContext`
+   * every public method here already threads through to
+   * `AuthAuditService.emit`) is now ALSO used to populate the new additive
+   * `Session.userAgent`/`Session.ipHash`/`Session.lastUsedAt` columns
+   * (DECISIONS.md "Phase 12 ... approved..." entry, decision 6) on the row
+   * this method creates — every call site below (`register`, `login`,
+   * `refresh`'s replacement session, `changePassword`'s replacement
+   * session) already has a `context` in scope, so this is a pure additive
+   * parameter, not a new code path. Reuses the EXACT SAME `hashIp`/
+   * `sanitizeUserAgent` primitives `AuthAuditService` uses for
+   * `AuthAuditEvent.ipHash`/`userAgent` (`./auth-crypto.ts`) — including the
+   * SAME `authAuditIpHashSecret` — so a given raw IP/user-agent value is
+   * guaranteed to hash/sanitize identically whether it ends up on an audit
+   * row or a session row.
+   */
   private async issueTokensAndSession(
     user: Pick<User, 'id' | 'email' | 'displayName'>,
+    context: AuthRequestContext = {},
     client: PrismaClientLike = this.prisma,
   ): Promise<AuthResponseDto> {
     const authConfig = this.configService.get('auth', { infer: true })!;
@@ -357,11 +392,33 @@ export class AuthService {
     const refreshToken = randomBytes(REFRESH_TOKEN_BYTES).toString('hex');
     const refreshTokenHash = this.hashRefreshToken(refreshToken);
 
+    // Same "omit entirely (never `undefined`/raw) unless actually supplied"
+    // pattern `AuthAuditService.emit` already uses for these same two
+    // fields — a unit test calling `AuthService` methods directly (no HTTP
+    // request, no `context`) simply gets `null` in both columns, exactly
+    // like today.
+    const ipHash =
+      context.ip !== undefined
+        ? hashIp(context.ip, authConfig.authAuditIpHashSecret)
+        : undefined;
+    const userAgent =
+      context.userAgent !== undefined
+        ? sanitizeUserAgent(context.userAgent)
+        : undefined;
+    const now = new Date();
+
     await client.session.create({
       data: {
         userId: user.id,
         refreshTokenHash,
         expiresAt: new Date(Date.now() + REFRESH_TOKEN_TTL_MS),
+        userAgent: userAgent ?? null,
+        ipHash: ipHash ?? null,
+        // The moment this session slot was (re)issued — see this class's
+        // `Session.lastUsedAt` schema doc comment for why "created" and
+        // "refreshed" are the only two events that ever touch this column
+        // in this codebase's current design.
+        lastUsedAt: now,
       },
       select: { id: true },
     });
@@ -675,8 +732,10 @@ export class AuthService {
         // Issues the replacement token pair for the SAME session slot,
         // inside this same transaction — the account is never observably
         // left with zero valid sessions between the revoke above and this
-        // create.
-        const response = await this.issueTokensAndSession(user, tx);
+        // create. Passes `context` through (Phase 12, work unit 12B-B2) so
+        // the replacement session's `userAgent`/`ipHash`/`lastUsedAt` are
+        // populated exactly like any other freshly issued session.
+        const response = await this.issueTokensAndSession(user, context, tx);
 
         // Final defensive sweep, still inside the SAME (winning) transaction,
         // immediately before it commits: catches the narrow remaining window
@@ -756,6 +815,150 @@ export class AuthService {
     });
 
     return rotation.response;
+  }
+
+  /**
+   * Phase 12, work unit 12B-B2: `POST /auth/logout-all` (DECISIONS.md
+   * "Phase 12 ... approved..." entry, decision 6; the exact "which
+   * sessions" semantic is this work unit's own explicit, binding
+   * resolution of the runbook's flagged ambiguity — see
+   * `AuthController.logoutAll`'s doc comment, which is the canonical
+   * statement of the contract, and the README).
+   *
+   * FROZEN CONTRACT: revokes EVERY session for the account, INCLUDING the
+   * one the caller used to make this very request — there is no
+   * "current session" carve-out here (unlike `changePassword`, which
+   * deliberately keeps the calling device logged in with rotated
+   * credentials). "Log out everywhere" logging out the calling device too
+   * is the whole point of a SEPARATE endpoint from `changePassword`: the
+   * "revoke others but keep me signed in" need is already served by
+   * `changePassword`'s existing behavior, so this endpoint does not need to
+   * (and must not) replicate it.
+   *
+   * A single unconditioned `updateMany` (no per-row CAS/id-membership dance
+   * like `changePassword`'s transaction) is sufficient here: unlike
+   * `changePassword`, this method never creates a replacement session in
+   * the same operation, so there is no "did MY OWN write win a race against
+   * itself" question to answer — every concurrent caller's `updateMany`
+   * converges on the same end state (every session revoked), and Postgres
+   * needs no special lock-ordering care for that outcome.
+   *
+   * Note on the access token: this app's access tokens are stateless JWTs,
+   * verified by `JwtAuthGuard` without any database lookup (see that
+   * guard's doc comment). Revoking every `Session` row here immediately
+   * invalidates every REFRESH token for the account (any subsequent
+   * `POST /auth/refresh` attempt fails, exactly like a normal revoke), but
+   * an access token issued before this call remains verifiable until it
+   * naturally expires (~15 min) — this is the SAME pre-existing limitation
+   * `POST /auth/logout` already has today, not a new gap introduced here,
+   * and out of scope for this endpoint's frozen contract to fix.
+   */
+  async logoutAll(
+    userId: string,
+    context: AuthRequestContext = {},
+  ): Promise<void> {
+    await this.prisma.session.updateMany({
+      where: { userId, revokedAt: null },
+      data: { revokedAt: new Date() },
+    });
+
+    await this.authAuditService.emit('logout_all_success', {
+      userId,
+      ip: context.ip,
+      userAgent: context.userAgent,
+    });
+  }
+
+  /**
+   * Phase 12, work unit 12B-B2: `GET /auth/sessions`. Lists only the
+   * CALLER'S OWN currently-active (`revokedAt: null`) sessions — an explicit
+   * Prisma `select` is used (not a blanket `findMany` + manual field
+   * stripping) specifically so `refreshTokenHash`/`ipHash` are never even
+   * fetched from the database in the first place, not merely omitted when
+   * building the response — defense in depth against a future accidental
+   * `JSON.stringify(session)`-style leak. Revoked sessions are deliberately
+   * excluded: this is a "manage your logged-in devices" surface, and a
+   * revoked/rotated-out session is no longer a device the caller can act on
+   * (there is nothing a `DELETE /auth/sessions/:id` on it could usefully do
+   * that hasn't already happened). `expiresAt` is included (per this work
+   * unit's frozen response shape) so a client can itself judge staleness
+   * for a session that is technically still `revokedAt: null` but already
+   * past its TTL, without this endpoint needing its own opinion on that.
+   */
+  async listSessions(userId: string): Promise<SessionSummaryDto[]> {
+    const sessions = await this.prisma.session.findMany({
+      where: { userId, revokedAt: null },
+      orderBy: { createdAt: 'desc' },
+      select: {
+        id: true,
+        userAgent: true,
+        lastUsedAt: true,
+        createdAt: true,
+        expiresAt: true,
+      },
+    });
+
+    return sessions.map((session) => ({
+      id: session.id,
+      userAgent: session.userAgent,
+      lastUsedAt: session.lastUsedAt?.toISOString() ?? null,
+      createdAt: session.createdAt.toISOString(),
+      expiresAt: session.expiresAt.toISOString(),
+    }));
+  }
+
+  /**
+   * Phase 12, work unit 12B-B2: `DELETE /auth/sessions/:id`. Ownership-scoped
+   * revoke — a session id that does not exist at all, and a session id that
+   * exists but belongs to a DIFFERENT account, are refused with the EXACT
+   * SAME `SESSION_NOT_FOUND`/404 (see that error code's doc comment) so a
+   * cross-account revoke is impossible, not merely unlikely, and so a
+   * caller cannot use this endpoint to probe which session ids exist for
+   * other accounts. The initial ownership lookup only ever selects `id`/
+   * `userId` — `refreshTokenHash`/`ipHash` are never fetched here either.
+   *
+   * The actual revoke is a conditional `updateMany` (`id` + `userId` +
+   * `revokedAt: null` all in the `WHERE` clause, mirroring `refresh()`'s
+   * existing CAS pattern) rather than a plain `update` on the row read
+   * above, so a session already revoked by something else between the
+   * lookup and this write (another concurrent `DELETE` for the same id,
+   * `logout()`, `refresh()`'s rotation, `logoutAll`, ...) is a safe,
+   * idempotent no-op — mirroring `AuthService.logout`'s existing
+   * idempotent-on-already-revoked precedent — rather than a spurious
+   * "not found" or an unnecessary second write. The audit event only fires
+   * when this call actually performed the revoke (`count > 0`), not on the
+   * idempotent no-op path, to avoid double-logging one real revoke.
+   */
+  async revokeSession(
+    userId: string,
+    sessionId: string,
+    context: AuthRequestContext = {},
+  ): Promise<void> {
+    const session = await this.prisma.session.findUnique({
+      where: { id: sessionId },
+      select: { id: true, userId: true },
+    });
+
+    if (!session || session.userId !== userId) {
+      throw new AppException(
+        AppErrorCode.SESSION_NOT_FOUND,
+        'Session not found',
+        HttpStatus.NOT_FOUND,
+      );
+    }
+
+    const { count } = await this.prisma.session.updateMany({
+      where: { id: sessionId, userId, revokedAt: null },
+      data: { revokedAt: new Date() },
+    });
+
+    if (count > 0) {
+      await this.authAuditService.emit('session_revoked', {
+        userId,
+        ip: context.ip,
+        userAgent: context.userAgent,
+      });
+    }
   }
 
   /**

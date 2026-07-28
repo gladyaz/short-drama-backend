@@ -59,6 +59,22 @@ export const AUTH_AUDIT_METADATA_ALLOWLIST = {
    * the attempted password.
    */
   change_password_failed: ['reason'],
+  /**
+   * Phase 12, work unit 12B-B2: `POST /auth/logout-all` succeeded — EVERY
+   * session for the account was revoked, INCLUDING the one that made this
+   * call (see `AuthController.logoutAll`'s doc comment for the frozen
+   * "logs out everywhere, including the calling device" contract). No
+   * metadata needed.
+   */
+  logout_all_success: [],
+  /**
+   * Phase 12, work unit 12B-B2: `DELETE /auth/sessions/:id` revoked a single
+   * session the caller owns. No metadata needed — the session id itself is
+   * not persisted here (it is not sensitive, but it is also not useful for
+   * an operator reviewing this log without cross-referencing the now-gone
+   * `Session` row, so it is simply omitted rather than kept "just in case").
+   */
+  session_revoked: [],
 } as const satisfies Record<string, readonly string[]>;
 
 export type AuthAuditEventName = keyof typeof AUTH_AUDIT_METADATA_ALLOWLIST;
@@ -71,11 +87,13 @@ export const AUTH_AUDIT_EVENT_NAMES = Object.keys(
 export const MAX_METADATA_STRING_LENGTH = 200;
 
 /**
- * Hard cap applied to `userAgent` before persistence (DECISIONS.md decision
- * 6: "truncated and sanitized"). 255 comfortably fits every real browser/
- * app user-agent string while bounding an attacker-controlled header.
+ * Phase 12, work unit 12B-B2: re-exported from `./auth-crypto.ts` (the
+ * single source of truth shared with `Session.userAgent`'s sanitization),
+ * not redeclared here — kept as a named export from this file too so
+ * existing imports (e.g. `auth-audit.service.spec.ts`) keep working
+ * unchanged. See `auth-crypto.ts` for the full rationale.
  */
-export const MAX_USER_AGENT_LENGTH = 255;
+export { MAX_USER_AGENT_LENGTH } from './auth-crypto';
 
 export type AuthAuditMetadataValue = string | number | boolean;
 

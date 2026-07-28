@@ -32,3 +32,21 @@ export interface AuthRequestContext {
   ip?: string;
   userAgent?: string;
 }
+
+/**
+ * Phase 12, work unit 12B-B2: `GET /auth/sessions`'s per-session response
+ * shape (DECISIONS.md "Phase 12 ... approved..." entry, decision 6).
+ * Deliberately just the fields a "manage your logged-in devices" UI needs —
+ * NEVER `refreshTokenHash`, NEVER `ipHash`, NEVER `userId`, and never any
+ * other hash/secret. `userAgent`/`lastUsedAt` are nullable because the
+ * underlying `Session` columns are additive/nullable (a session created
+ * before this work unit, or one created without request-context info, has
+ * neither).
+ */
+export interface SessionSummaryDto {
+  id: string;
+  userAgent: string | null;
+  lastUsedAt: string | null;
+  createdAt: string;
+  expiresAt: string;
+}

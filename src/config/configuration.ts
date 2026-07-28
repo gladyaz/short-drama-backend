@@ -13,13 +13,19 @@ export interface AuthConfig {
   /** Signing secret for the (separately, DB-hashed) refresh token. Never logged. */
   jwtRefreshSecret: string;
   /**
-   * Phase 12, work unit 12A-B3: DEDICATED HMAC key used ONLY to hash client
-   * IP addresses before they are persisted to `AuthAuditEvent.ipHash` (see
+   * Phase 12, work unit 12A-B3: DEDICATED HMAC key used to hash client IP
+   * addresses before they are persisted to `AuthAuditEvent.ipHash` (see
    * `AuthAuditService`). Deliberately a separate secret from
    * `jwtAccessSecret`/`jwtRefreshSecret` (DECISIONS.md "Phase 12 ...
    * approved..." entry, decision 6: "a dedicated secret, distinct from the
    * JWT/refresh-token signing secrets") so that rotating one never silently
    * changes the other's blast radius. Never logged.
+   *
+   * Phase 12, work unit 12B-B2 update: this SAME field is now ALSO used
+   * (via the shared `hashIp` helper in `src/auth/auth-crypto.ts`) to hash
+   * client IPs for `Session.ipHash` — it already satisfies decision 6's
+   * "dedicated secret" requirement for that column too, so no second env
+   * var was introduced for it (see `.env.example`).
    */
   authAuditIpHashSecret: string;
 }

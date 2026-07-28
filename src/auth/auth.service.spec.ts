@@ -9,6 +9,7 @@ import { AppException } from '../common/errors/app.exception';
 import { PrismaService } from '../prisma/prisma.service';
 import { AccountLockoutService } from './account-lockout.service';
 import { AuthAuditService } from './auth-audit.service';
+import { MAX_USER_AGENT_LENGTH } from './auth-crypto';
 import { AuthService } from './auth.service';
 import type { AuthResponseDto } from './auth.types';
 
@@ -20,6 +21,12 @@ const TEST_AUTH_CONFIG = {
   // (DECISIONS.md "Phase 12 ... approved..." entry, decision 6).
   authAuditIpHashSecret: 'test-auth-audit-ip-hash-secret-not-a-real-secret',
 };
+
+// Phase 12, work unit 12B-B2 (fix cycle 1): mirrors
+// `auth-audit.service.spec.ts`'s own `OTHER_SECRET` constant, used below to
+// prove `Session.ipHash` is a keyed HMAC (not a plain/unkeyed hash) — the
+// same IP must hash differently under a different secret.
+const OTHER_SECRET = 'a-completely-different-test-secret-not-a-real-secret';
 
 /**
  * Integration-style spec (Phase 8, work unit 8-B5), following the same
@@ -1243,6 +1250,52 @@ describe('AuthService', () => {
       });
       expect(sessionAfter?.revokedAt).toBeNull();
     });
+
+    /**
+     * Fix cycle 1 (Phase 12, 12B-B2): `changePassword`'s replacement session
+     * is created via the SAME `issueTokensAndSession(user, context, tx)`
+     * call site `register`/`login`/`refresh` already use (see this file's
+     * "session metadata" describe block above), and passes the caller's
+     * `context` through unchanged — but until now no shipped test exercised
+     * THIS call site specifically. Decision 6 (DECISIONS.md "Phase 12 ...
+     * approved..." entry) requires HMAC IP hashing wired everywhere a
+     * `Session` is created or refreshed, which includes this one.
+     */
+    it("propagates the caller's context (sanitized userAgent, HMAC ipHash) onto the replacement session it creates", async () => {
+      const email = uniqueEmail('change-password-context-propagation');
+      const oldPassword = 'correct-horse-battery';
+      const registered = await service.register({
+        email,
+        password: oldPassword,
+      });
+
+      const rawIp = '198.51.100.42';
+      const userAgent = 'change-password-agent/1.0';
+
+      await service.changePassword(
+        registered.user.id,
+        {
+          currentPassword: oldPassword,
+          newPassword: 'brand-new-password-1',
+          refreshToken: registered.refreshToken,
+        },
+        { ip: rawIp, userAgent },
+      );
+
+      const replacementSession = await prisma.session.findFirst({
+        where: { userId: registered.user.id, revokedAt: null },
+      });
+
+      expect(replacementSession).not.toBeNull();
+      expect(replacementSession!.userAgent).toBe(userAgent);
+      expect(replacementSession!.ipHash).not.toBeNull();
+      expect(replacementSession!.ipHash).not.toBe(rawIp);
+      // A real HMAC-SHA256 hex digest is 64 characters — proves this is
+      // actually the same `hashIp` primitive, not merely "some non-null
+      // value".
+      expect(replacementSession!.ipHash).toMatch(/^[0-9a-f]{64}$/);
+      expect(JSON.stringify(replacementSession)).not.toContain(rawIp);
+    });
   });
 
   /**
@@ -1289,6 +1342,411 @@ describe('AuthService', () => {
         code: AppErrorCode.INVALID_ACCESS_TOKEN,
         status: HttpStatus.UNAUTHORIZED,
       } as Partial<AppException>);
+    });
+  });
+
+  /**
+   * Phase 12, work unit 12B-B2: proves the new additive `Session.userAgent`/
+   * `Session.ipHash`/`Session.lastUsedAt` columns are actually populated by
+   * `issueTokensAndSession` (the shared session-creation path behind
+   * `register`/`login`/`refresh`/`changePassword`), using the SAME
+   * `hashIp`/`sanitizeUserAgent` primitives `AuthAuditService` already uses
+   * for `AuthAuditEvent` (`./auth-crypto.ts`) — never a second, divergent
+   * implementation.
+   */
+  describe('session metadata (userAgent/ipHash/lastUsedAt)', () => {
+    it('stores a hashed (never raw) IP and a sanitized user agent on the session created by register', async () => {
+      const email = uniqueEmail('session-metadata-register');
+      const rawIp = '198.51.100.7';
+      // Contains ASCII control characters (BEL 0x07, DEL 0x7F) that
+      // `sanitizeUserAgent` must strip.
+      const controlCharacterLadenUserAgent = 'Mozilla/5.0(evil)';
+
+      const result = await service.register(
+        { email, password: 'correct-horse-battery' },
+        { ip: rawIp, userAgent: controlCharacterLadenUserAgent },
+      );
+
+      const session = await prisma.session.findFirst({
+        where: { userId: result.user.id },
+      });
+
+      expect(session).not.toBeNull();
+      expect(session!.ipHash).not.toBeNull();
+      expect(session!.ipHash).not.toBe(rawIp);
+      // A real HMAC-SHA256 hex digest is 64 characters — mirrors
+      // `auth-audit.service.spec.ts`'s identical assertion for
+      // `AuthAuditEvent.ipHash` (fix cycle 1, Phase 12, 12B-B2: this was
+      // previously only checked indirectly via "not the raw IP", which
+      // would not catch a future accidental fork of the session-writing
+      // path onto some other, non-HMAC hash).
+      expect(session!.ipHash).toMatch(/^[0-9a-f]{64}$/);
+      expect(session!.userAgent).toBe('Mozilla/5.0(evil)');
+      expect(session!.lastUsedAt).not.toBeNull();
+      expect(JSON.stringify(session)).not.toContain(rawIp);
+    });
+
+    /**
+     * Fix cycle 1 (Phase 12, 12B-B2): `hashIp` is the SAME imported function
+     * on both the `AuthAuditEvent` and `Session` paths, so this is not a
+     * functional risk today — but nothing previously asserted
+     * secret-sensitivity directly against `Session.ipHash` itself, so a
+     * future accidental fork of the session-writing path onto a
+     * non-keyed hash would not be caught here. Mirrors
+     * `auth-audit.service.spec.ts`'s "hashes the SAME IP to a DIFFERENT
+     * value under a different secret" test, adapted to a real second
+     * `AuthService` module instance (rather than a second
+     * `AuthAuditService` instance) so it exercises the session-creation
+     * path specifically.
+     */
+    it('hashes the SAME IP to a DIFFERENT value on Session.ipHash under a different secret (keyed HMAC, not plain hash)', async () => {
+      const rawIp = '203.0.113.201';
+      const emailDefaultSecret = uniqueEmail('session-ip-hash-secret-default');
+      const emailOtherSecret = uniqueEmail('session-ip-hash-secret-other');
+
+      const otherModule: TestingModule = await Test.createTestingModule({
+        imports: [JwtModule.register({})],
+        providers: [
+          AuthService,
+          PrismaService,
+          AccountLockoutService,
+          AuthAuditService,
+          {
+            provide: ConfigService,
+            useValue: {
+              get: jest.fn().mockReturnValue({
+                ...TEST_AUTH_CONFIG,
+                authAuditIpHashSecret: OTHER_SECRET,
+              }),
+            },
+          },
+        ],
+      }).compile();
+      const otherService = otherModule.get<AuthService>(AuthService);
+      const otherPrisma = otherModule.get<PrismaService>(PrismaService);
+      await otherPrisma.onModuleInit();
+
+      try {
+        const resultDefaultSecret = await service.register(
+          { email: emailDefaultSecret, password: 'correct-horse-battery' },
+          { ip: rawIp },
+        );
+        const resultOtherSecret = await otherService.register(
+          { email: emailOtherSecret, password: 'correct-horse-battery' },
+          { ip: rawIp },
+        );
+
+        const sessionDefaultSecret = await prisma.session.findFirst({
+          where: { userId: resultDefaultSecret.user.id },
+        });
+        const sessionOtherSecret = await otherPrisma.session.findFirst({
+          where: { userId: resultOtherSecret.user.id },
+        });
+
+        expect(sessionDefaultSecret!.ipHash).not.toBe(
+          sessionOtherSecret!.ipHash,
+        );
+      } finally {
+        // The two accounts' rows are cleaned up by this describe block's
+        // shared top-level `afterEach` (both emails contain `emailPrefix`,
+        // and every `PrismaService` instance — including `otherPrisma` —
+        // reads the same `DATABASE_URL`, so `prisma.user.deleteMany` there
+        // reaches both). Only this test's OWN extra module/connection
+        // needs its own explicit teardown here.
+        await otherPrisma.onModuleDestroy();
+      }
+    });
+
+    it('truncates an overlong user agent to MAX_USER_AGENT_LENGTH on the session row', async () => {
+      const email = uniqueEmail('session-metadata-truncate');
+      const password = 'correct-horse-battery';
+      const overlongUserAgent = `prefix-${'x'.repeat(MAX_USER_AGENT_LENGTH + 50)}`;
+
+      // Registers first (creates the account), then logs in with the
+      // overlong user agent — exercises `login`'s call into
+      // `issueTokensAndSession`, not just `register`'s.
+      await service.register({ email, password });
+      const result = await service.login(
+        { email, password },
+        { userAgent: overlongUserAgent },
+      );
+
+      const session = await prisma.session.findFirst({
+        where: { userId: result.user.id, revokedAt: null },
+        orderBy: { createdAt: 'desc' },
+      });
+
+      expect(session!.userAgent).toHaveLength(MAX_USER_AGENT_LENGTH);
+      expect(session!.userAgent).toBe(
+        overlongUserAgent.slice(0, MAX_USER_AGENT_LENGTH),
+      );
+    });
+
+    it('omits userAgent/ipHash (stores null) when no request context is supplied', async () => {
+      const email = uniqueEmail('session-metadata-no-context');
+
+      const result = await service.register({
+        email,
+        password: 'correct-horse-battery',
+      });
+
+      const session = await prisma.session.findFirst({
+        where: { userId: result.user.id },
+      });
+
+      expect(session!.userAgent).toBeNull();
+      expect(session!.ipHash).toBeNull();
+      // `lastUsedAt` is set unconditionally at creation regardless of
+      // whether a request context was supplied at all.
+      expect(session!.lastUsedAt).not.toBeNull();
+    });
+
+    it('sets lastUsedAt on the OLD session at the moment refresh() rotates it out, and on the NEW replacement session', async () => {
+      const email = uniqueEmail('session-metadata-refresh');
+      const registered = await service.register({
+        email,
+        password: 'correct-horse-battery',
+      });
+
+      const oldSessionBefore = await prisma.session.findFirst({
+        where: { userId: registered.user.id },
+      });
+      expect(oldSessionBefore!.lastUsedAt).not.toBeNull();
+
+      await service.refresh(registered.refreshToken, {
+        ip: '203.0.113.9',
+        userAgent: 'refresh-agent/2.0',
+      });
+
+      const oldSessionAfter = await prisma.session.findUnique({
+        where: { id: oldSessionBefore!.id },
+      });
+      expect(oldSessionAfter!.revokedAt).not.toBeNull();
+      expect(oldSessionAfter!.lastUsedAt).not.toBeNull();
+      expect(oldSessionAfter!.lastUsedAt!.getTime()).toBeGreaterThanOrEqual(
+        oldSessionBefore!.lastUsedAt!.getTime(),
+      );
+
+      const newSession = await prisma.session.findFirst({
+        where: { userId: registered.user.id, revokedAt: null },
+      });
+      expect(newSession!.userAgent).toBe('refresh-agent/2.0');
+      expect(newSession!.ipHash).not.toBeNull();
+      expect(newSession!.lastUsedAt).not.toBeNull();
+    });
+  });
+
+  /**
+   * Phase 12, work unit 12B-B2: `POST /auth/logout-all`'s FROZEN contract —
+   * revokes EVERY session for the account, INCLUDING the one used to call
+   * it (see `AuthService.logoutAll`'s doc comment for the full rationale).
+   */
+  describe('logoutAll', () => {
+    it('revokes every session for the account, including the current one, and every refresh token stops working', async () => {
+      const email = uniqueEmail('logout-all-success');
+      const password = 'correct-horse-battery';
+      const registered = await service.register({ email, password });
+      const secondDevice = await service.login({ email, password });
+
+      await service.logoutAll(registered.user.id);
+
+      const sessions = await prisma.session.findMany({
+        where: { userId: registered.user.id },
+      });
+      expect(sessions.length).toBeGreaterThanOrEqual(2);
+      expect(sessions.every((s) => s.revokedAt !== null)).toBe(true);
+
+      // Both the "current" (calling) session's refresh token AND the other
+      // device's are now unusable — the frozen contract's whole point.
+      await expect(
+        service.refresh(registered.refreshToken),
+      ).rejects.toMatchObject({
+        code: AppErrorCode.INVALID_REFRESH_TOKEN,
+      });
+      await expect(
+        service.refresh(secondDevice.refreshToken),
+      ).rejects.toMatchObject({
+        code: AppErrorCode.INVALID_REFRESH_TOKEN,
+      });
+
+      const auditRows = await prisma.authAuditEvent.findMany({
+        where: { userId: registered.user.id, event: 'logout_all_success' },
+      });
+      expect(auditRows).toHaveLength(1);
+    });
+
+    it('does not throw for an account with no active sessions (already logged out everywhere)', async () => {
+      const email = uniqueEmail('logout-all-noop');
+      const registered = await service.register({
+        email,
+        password: 'correct-horse-battery',
+      });
+      await service.logoutAll(registered.user.id);
+
+      await expect(
+        service.logoutAll(registered.user.id),
+      ).resolves.toBeUndefined();
+    });
+  });
+
+  /**
+   * Phase 12, work unit 12B-B2: `GET /auth/sessions`. Never a hash/secret,
+   * never another account's rows.
+   */
+  describe('listSessions', () => {
+    it("lists only the caller's own active sessions, correctly shaped, with no hash anywhere", async () => {
+      const email = uniqueEmail('list-sessions-own');
+      const password = 'correct-horse-battery';
+      const registered = await service.register(
+        { email, password },
+        { userAgent: 'device-a/1.0' },
+      );
+      await service.login({ email, password }, { userAgent: 'device-b/1.0' });
+
+      const sessions = await service.listSessions(registered.user.id);
+
+      expect(sessions).toHaveLength(2);
+      expect(sessions.map((s) => s.userAgent).sort()).toEqual([
+        'device-a/1.0',
+        'device-b/1.0',
+      ]);
+      for (const session of sessions) {
+        expect(session.id).toEqual(expect.any(String));
+        expect(session.createdAt).toEqual(expect.any(String));
+        expect(session.expiresAt).toEqual(expect.any(String));
+      }
+      expect(JSON.stringify(sessions)).not.toMatch(
+        /refreshTokenHash|ipHash|\$2[aby]\$/,
+      );
+    });
+
+    it("never includes a DIFFERENT account's sessions", async () => {
+      const emailA = uniqueEmail('list-sessions-cross-a');
+      const emailB = uniqueEmail('list-sessions-cross-b');
+      const password = 'correct-horse-battery';
+      const registeredA = await service.register({ email: emailA, password });
+      await service.register({ email: emailB, password });
+
+      const sessions = await service.listSessions(registeredA.user.id);
+
+      expect(sessions).toHaveLength(1);
+    });
+
+    it('excludes revoked sessions', async () => {
+      const email = uniqueEmail('list-sessions-excludes-revoked');
+      const registered = await service.register({
+        email,
+        password: 'correct-horse-battery',
+      });
+
+      await service.logoutAll(registered.user.id);
+
+      const sessions = await service.listSessions(registered.user.id);
+      expect(sessions).toHaveLength(0);
+    });
+  });
+
+  /**
+   * Phase 12, work unit 12B-B2: `DELETE /auth/sessions/:id`. Ownership-scoped
+   * revoke — see `AuthService.revokeSession`'s doc comment for the exact
+   * IDOR-safety rationale.
+   */
+  describe('revokeSession', () => {
+    it("revokes the caller's own session by id, and that session's refresh token stops working", async () => {
+      const email = uniqueEmail('revoke-session-own');
+      const registered = await service.register({
+        email,
+        password: 'correct-horse-battery',
+      });
+      const session = await prisma.session.findFirst({
+        where: { userId: registered.user.id },
+      });
+
+      await service.revokeSession(registered.user.id, session!.id);
+
+      const after = await prisma.session.findUnique({
+        where: { id: session!.id },
+      });
+      expect(after!.revokedAt).not.toBeNull();
+
+      await expect(
+        service.refresh(registered.refreshToken),
+      ).rejects.toMatchObject({
+        code: AppErrorCode.INVALID_REFRESH_TOKEN,
+      });
+
+      const auditRows = await prisma.authAuditEvent.findMany({
+        where: { userId: registered.user.id, event: 'session_revoked' },
+      });
+      expect(auditRows).toHaveLength(1);
+    });
+
+    it("rejects revoking a DIFFERENT account's session with SESSION_NOT_FOUND, and does not revoke it", async () => {
+      const emailA = uniqueEmail('revoke-session-cross-a');
+      const emailB = uniqueEmail('revoke-session-cross-b');
+      const password = 'correct-horse-battery';
+      const registeredA = await service.register({ email: emailA, password });
+      const registeredB = await service.register({ email: emailB, password });
+
+      const sessionB = await prisma.session.findFirst({
+        where: { userId: registeredB.user.id },
+      });
+
+      await expect(
+        service.revokeSession(registeredA.user.id, sessionB!.id),
+      ).rejects.toMatchObject({
+        code: AppErrorCode.SESSION_NOT_FOUND,
+        status: HttpStatus.NOT_FOUND,
+      } as Partial<AppException>);
+
+      const sessionBAfter = await prisma.session.findUnique({
+        where: { id: sessionB!.id },
+      });
+      expect(sessionBAfter!.revokedAt).toBeNull();
+
+      await expect(
+        service.refresh(registeredB.refreshToken),
+      ).resolves.toBeDefined();
+    });
+
+    it('rejects a nonexistent session id with the same SESSION_NOT_FOUND', async () => {
+      const email = uniqueEmail('revoke-session-nonexistent');
+      const registered = await service.register({
+        email,
+        password: 'correct-horse-battery',
+      });
+
+      await expect(
+        service.revokeSession(
+          registered.user.id,
+          'nonexistent-session-id-cuid',
+        ),
+      ).rejects.toMatchObject({
+        code: AppErrorCode.SESSION_NOT_FOUND,
+        status: HttpStatus.NOT_FOUND,
+      } as Partial<AppException>);
+    });
+
+    it('is idempotent for an already-revoked session (no error, no duplicate audit event)', async () => {
+      const email = uniqueEmail('revoke-session-idempotent');
+      const registered = await service.register({
+        email,
+        password: 'correct-horse-battery',
+      });
+      const session = await prisma.session.findFirst({
+        where: { userId: registered.user.id },
+      });
+
+      await service.revokeSession(registered.user.id, session!.id);
+
+      await expect(
+        service.revokeSession(registered.user.id, session!.id),
+      ).resolves.toBeUndefined();
+
+      const auditRows = await prisma.authAuditEvent.findMany({
+        where: { userId: registered.user.id, event: 'session_revoked' },
+      });
+      expect(auditRows).toHaveLength(1);
     });
   });
 });

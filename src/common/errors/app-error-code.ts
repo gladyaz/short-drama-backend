@@ -149,4 +149,16 @@ export enum AppErrorCode {
    * is explicitly NOT treated as a collision.
    */
   DUPLICATE_EPISODE_NUMBER = 'DUPLICATE_EPISODE_NUMBER',
+  // Phase 12, work unit 12B-B2 (session management)
+  /**
+   * Returned by `DELETE /auth/sessions/:id` when no `Session` row with the
+   * given id belongs to the authenticated caller — deliberately used for
+   * BOTH "no such session id at all" and "that session id exists but
+   * belongs to a different account" (the exact same code/404 either way).
+   * Never split into a distinct "not yours" code/403: doing so would let a
+   * caller enumerate which session ids exist for other accounts, which is
+   * the same anti-enumeration rationale `INVALID_CREDENTIALS`/
+   * `INVALID_REFRESH_TOKEN` already establish elsewhere in this file.
+   */
+  SESSION_NOT_FOUND = 'SESSION_NOT_FOUND',
 }

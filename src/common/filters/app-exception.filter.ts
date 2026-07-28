@@ -15,6 +15,45 @@ interface HttpExceptionBody {
   message?: string | string[];
 }
 
+/**
+ * The `http-errors` package's error shape (used internally by Express's own
+ * middleware — e.g. `body-parser`/`raw-body` throw a `PayloadTooLargeError`
+ * this way for an oversized request body, see the 256kb JSON body limit
+ * added in Phase 12, work unit 12A-B2). These errors are thrown by
+ * middleware that runs *before* Nest's own routing/exception pipeline, so
+ * they are never a Nest `HttpException` — without this check they would
+ * fall through to the generic 500 branch below and misreport a genuine
+ * client error (e.g. 413) as a server failure.
+ */
+interface StatusCarryingError extends Error {
+  status?: number;
+  statusCode?: number;
+  /**
+   * `http-errors` convention: `true` only for 4xx errors whose `message` is
+   * safe to expose to the client (e.g. "request entity too large"); `false`
+   * for its own internal 5xx errors, whose message must NOT be exposed —
+   * checking this flag keeps this branch from ever leaking an unexpected
+   * third-party 5xx error's raw message the way the generic AppException/
+   * HttpException branches above already avoid doing for their own cases.
+   */
+  expose?: boolean;
+}
+
+function getExposedClientErrorStatus(exception: unknown): number | null {
+  if (!(exception instanceof Error)) {
+    return null;
+  }
+  const err = exception as StatusCarryingError;
+  const status = err.status ?? err.statusCode;
+  const isExposedClientError =
+    err.expose === true &&
+    typeof status === 'number' &&
+    status >= 400 &&
+    status < 500;
+
+  return isExposedClientError ? status : null;
+}
+
 @Catch()
 export class AppExceptionFilter implements ExceptionFilter {
   private readonly logger = new Logger(AppExceptionFilter.name);
@@ -45,6 +84,16 @@ export class AppExceptionFilter implements ExceptionFilter {
         statusCode: status,
         code: 'HTTP_ERROR',
         message: Array.isArray(rawMessage) ? rawMessage.join(', ') : rawMessage,
+      });
+      return;
+    }
+
+    const exposedClientErrorStatus = getExposedClientErrorStatus(exception);
+    if (exposedClientErrorStatus !== null) {
+      response.status(exposedClientErrorStatus).json({
+        statusCode: exposedClientErrorStatus,
+        code: 'HTTP_ERROR',
+        message: (exception as Error).message,
       });
       return;
     }

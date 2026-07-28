@@ -18,7 +18,30 @@ const VALID_CONFIG: Record<string, unknown> = {
   DATABASE_URL: 'postgresql://user:pass@localhost:5432/db',
   JWT_ACCESS_SECRET: 'test-access-secret',
   JWT_REFRESH_SECRET: 'test-refresh-secret',
+  AUTH_AUDIT_IP_HASH_SECRET: 'test-auth-audit-ip-hash-secret',
 };
+
+/**
+ * Phase 12, work unit 12A-B3: `AUTH_AUDIT_IP_HASH_SECRET` (DECISIONS.md
+ * "Phase 12 ... approved..." entry, decision 6) is required unconditionally,
+ * matching the existing JWT-secret required-key precedent above.
+ */
+describe('validateEnv — AUTH_AUDIT_IP_HASH_SECRET (Phase 12, 12A-B3)', () => {
+  it('passes when AUTH_AUDIT_IP_HASH_SECRET is present', () => {
+    expect(() => validateEnv({ ...VALID_CONFIG })).not.toThrow();
+  });
+
+  it('throws naming the missing variable when AUTH_AUDIT_IP_HASH_SECRET is absent', () => {
+    const configMissingSecret = omitKey(
+      VALID_CONFIG,
+      'AUTH_AUDIT_IP_HASH_SECRET',
+    );
+
+    expect(() => validateEnv(configMissingSecret)).toThrow(
+      /Missing required environment variable: AUTH_AUDIT_IP_HASH_SECRET/,
+    );
+  });
+});
 
 /**
  * Phase 10, work unit 10-B6: covers the new production fail-loud check

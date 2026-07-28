@@ -12,6 +12,16 @@ export interface AuthConfig {
   jwtAccessSecret: string;
   /** Signing secret for the (separately, DB-hashed) refresh token. Never logged. */
   jwtRefreshSecret: string;
+  /**
+   * Phase 12, work unit 12A-B3: DEDICATED HMAC key used ONLY to hash client
+   * IP addresses before they are persisted to `AuthAuditEvent.ipHash` (see
+   * `AuthAuditService`). Deliberately a separate secret from
+   * `jwtAccessSecret`/`jwtRefreshSecret` (DECISIONS.md "Phase 12 ...
+   * approved..." entry, decision 6: "a dedicated secret, distinct from the
+   * JWT/refresh-token signing secrets") so that rotating one never silently
+   * changes the other's blast radius. Never logged.
+   */
+  authAuditIpHashSecret: string;
 }
 
 /**
@@ -74,6 +84,7 @@ export default (): RootConfig => ({
   auth: {
     jwtAccessSecret: process.env.JWT_ACCESS_SECRET ?? '',
     jwtRefreshSecret: process.env.JWT_REFRESH_SECRET ?? '',
+    authAuditIpHashSecret: process.env.AUTH_AUDIT_IP_HASH_SECRET ?? '',
   },
   storage: {
     driver: resolveStorageDriver(),

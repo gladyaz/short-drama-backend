@@ -71,6 +71,10 @@ jobs:
       # secrets. Clearly labeled so they are never mistaken for one.
       JWT_ACCESS_SECRET: ci-test-only-access-secret-not-a-real-credential
       JWT_REFRESH_SECRET: ci-test-only-refresh-secret-not-a-real-credential
+      # Phase 12, work unit 12A-B3: dedicated (deliberately different from
+      # the two JWT secrets above) test-only HMAC key for
+      # AuthAuditEvent.ipHash. Never a real credential.
+      AUTH_AUDIT_IP_HASH_SECRET: ci-test-only-auth-audit-ip-hash-secret-not-a-real-credential
       DEV_TOOLS_ENABLED: 'false'
 
     steps:

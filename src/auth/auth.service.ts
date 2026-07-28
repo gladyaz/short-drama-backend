@@ -9,6 +9,7 @@ import { AppErrorCode } from '../common/errors/app-error-code';
 import { AppException } from '../common/errors/app.exception';
 import { PrismaService } from '../prisma/prisma.service';
 import { AccountLockoutService } from './account-lockout.service';
+import { AuthAuditService } from './auth-audit.service';
 import {
   ACCESS_TOKEN_TTL,
   BCRYPT_COST_FACTOR,
@@ -16,7 +17,7 @@ import {
   REFRESH_TOKEN_BYTES,
   REFRESH_TOKEN_TTL_MS,
 } from './auth.constants';
-import { AuthResponseDto, AuthUserDto } from './auth.types';
+import { AuthRequestContext, AuthResponseDto, AuthUserDto } from './auth.types';
 import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
 
@@ -47,9 +48,13 @@ export class AuthService {
     private readonly jwtService: JwtService,
     private readonly configService: ConfigService<RootConfig>,
     private readonly accountLockoutService: AccountLockoutService,
+    private readonly authAuditService: AuthAuditService,
   ) {}
 
-  async register(dto: RegisterDto): Promise<AuthResponseDto> {
+  async register(
+    dto: RegisterDto,
+    context: AuthRequestContext = {},
+  ): Promise<AuthResponseDto> {
     // Emails are stored and looked up case-insensitively (normalized to
     // lowercase) even though the `User.email` column itself is a
     // case-sensitive unique constraint: normalizing here ensures
@@ -77,10 +82,24 @@ export class AuthService {
       },
     });
 
+    // Phase 12, work unit 12A-B3: operational security audit trail
+    // (DECISIONS.md "Phase 12 ... approved..." entry, decision 6). Awaited
+    // (not fire-and-forget) so the happy path reliably records — but
+    // `AuthAuditService.emit` internally catches every failure, so this can
+    // never turn a successful registration into a failed HTTP response.
+    await this.authAuditService.emit('register_success', {
+      userId: user.id,
+      ip: context.ip,
+      userAgent: context.userAgent,
+    });
+
     return this.issueTokensAndSession(user);
   }
 
-  async login(dto: LoginDto): Promise<AuthResponseDto> {
+  async login(
+    dto: LoginDto,
+    context: AuthRequestContext = {},
+  ): Promise<AuthResponseDto> {
     const email = dto.email.toLowerCase();
     const user = await this.prisma.user.findUnique({
       where: { email },
@@ -98,6 +117,14 @@ export class AuthService {
     );
 
     if (!user) {
+      // No `userId` — this attempt never resolved to a real account, so
+      // there is nothing to link the row to. `reason` is a fixed enum
+      // value, never the attempted email (see `AUTH_AUDIT_METADATA_ALLOWLIST`).
+      await this.authAuditService.emit('login_failed', {
+        ip: context.ip,
+        userAgent: context.userAgent,
+        metadata: { reason: 'user_not_found' },
+      });
       throw invalidCredentials();
     }
 
@@ -115,19 +142,38 @@ export class AuthService {
     // the same "statistically indistinguishable, not perfectly
     // constant-time" tradeoff already made by this code.
     if (await this.accountLockoutService.isLocked(user.id)) {
+      await this.authAuditService.emit('account_locked', {
+        userId: user.id,
+        ip: context.ip,
+        userAgent: context.userAgent,
+      });
       throw invalidCredentials();
     }
 
     if (!passwordMatches) {
       await this.accountLockoutService.recordFailure(user.id);
+      await this.authAuditService.emit('login_failed', {
+        userId: user.id,
+        ip: context.ip,
+        userAgent: context.userAgent,
+        metadata: { reason: 'invalid_password' },
+      });
       throw invalidCredentials();
     }
 
     await this.accountLockoutService.recordSuccess(user.id);
+    await this.authAuditService.emit('login_success', {
+      userId: user.id,
+      ip: context.ip,
+      userAgent: context.userAgent,
+    });
     return this.issueTokensAndSession(user);
   }
 
-  async refresh(refreshToken: string): Promise<AuthResponseDto> {
+  async refresh(
+    refreshToken: string,
+    context: AuthRequestContext = {},
+  ): Promise<AuthResponseDto> {
     const refreshTokenHash = this.hashRefreshToken(refreshToken);
     const session = await this.prisma.session.findUnique({
       where: { refreshTokenHash },
@@ -151,6 +197,17 @@ export class AuthService {
       await this.prisma.session.updateMany({
         where: { userId: session.userId, revokedAt: null },
         data: { revokedAt: now },
+      });
+      // Phase 12, work unit 12A-B3: `refresh_reuse_detected` (DECISIONS.md
+      // "Phase 12 ... approved..." entry, decision 6). Fires from the
+      // EXISTING replay-detection logic above — this unit only adds the
+      // audit emission, the detection/defensive-revoke behavior itself is
+      // unchanged and must stay that way.
+      await this.authAuditService.emit('refresh_reuse_detected', {
+        userId: session.userId,
+        ip: context.ip,
+        userAgent: context.userAgent,
+        metadata: { reason: 'already_rotated' },
       });
       throw invalidRefreshToken();
     }
@@ -194,6 +251,17 @@ export class AuthService {
       await this.prisma.session.updateMany({
         where: { userId: session.userId, revokedAt: null },
         data: { revokedAt: now },
+      });
+      // Same event as the reuse-of-revoked-token branch above: from the
+      // audit log's perspective, "another request already revoked this
+      // session before we could" is the same defensive-revoke-all outcome
+      // as a genuinely reused token, just reached via the race window
+      // instead of a literal resubmission.
+      await this.authAuditService.emit('refresh_reuse_detected', {
+        userId: session.userId,
+        ip: context.ip,
+        userAgent: context.userAgent,
+        metadata: { reason: 'concurrent_rotation_race' },
       });
       throw invalidRefreshToken();
     }

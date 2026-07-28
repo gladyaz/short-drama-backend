@@ -13,6 +13,12 @@ const REQUIRED_KEYS = [
   'DATABASE_URL',
   'JWT_ACCESS_SECRET',
   'JWT_REFRESH_SECRET',
+  // Phase 12, work unit 12A-B3: dedicated HMAC key for `AuthAuditEvent.ipHash`
+  // (DECISIONS.md "Phase 12 ... approved..." entry, decision 6) — required
+  // unconditionally (not gated behind a feature flag) since `AuthAuditService`
+  // is wired into the core login/register/refresh paths, not an optional
+  // add-on.
+  'AUTH_AUDIT_IP_HASH_SECRET',
 ] as const;
 
 /**

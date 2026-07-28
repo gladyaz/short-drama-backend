@@ -7,11 +7,16 @@ import { AppErrorCode } from '../common/errors/app-error-code';
 import { AppException } from '../common/errors/app.exception';
 import { PrismaService } from '../prisma/prisma.service';
 import { AccountLockoutService } from './account-lockout.service';
+import { AuthAuditService } from './auth-audit.service';
 import { AuthService } from './auth.service';
 
 const TEST_AUTH_CONFIG = {
   jwtAccessSecret: 'test-access-secret-not-a-real-secret',
   jwtRefreshSecret: 'test-refresh-secret-not-a-real-secret',
+  // Phase 12, work unit 12A-B3: deliberately a DIFFERENT dummy value from
+  // the two secrets above, matching the real dedicated-secret requirement
+  // (DECISIONS.md "Phase 12 ... approved..." entry, decision 6).
+  authAuditIpHashSecret: 'test-auth-audit-ip-hash-secret-not-a-real-secret',
 };
 
 /**
@@ -38,6 +43,7 @@ describe('AuthService', () => {
         AuthService,
         PrismaService,
         AccountLockoutService,
+        AuthAuditService,
         {
           provide: ConfigService,
           useValue: { get: jest.fn().mockReturnValue(TEST_AUTH_CONFIG) },
@@ -55,7 +61,20 @@ describe('AuthService', () => {
     // `AccountLockout`/`Session` both cascade-delete with their `User`
     // (Phase 12 additive migration, `onDelete: Cascade`), but this is
     // explicit rather than relying on that alone, matching the existing
-    // `session.deleteMany` line's own precedent below.
+    // `session.deleteMany` line's own precedent below. `AuthAuditEvent`
+    // instead `SetNull`s on user deletion (Phase 12, work unit 12A-B3 — see
+    // its schema doc comment), so it is cleaned up explicitly here too,
+    // BEFORE the user row is deleted, while `userId` still links each row
+    // back to this test's own prefixed accounts.
+    await prisma.authAuditEvent.deleteMany({
+      where: { user: { email: { contains: emailPrefix } } },
+    });
+    // Orphaned rows with no linked user (e.g. a login attempt for an email
+    // that never resolved to any account) — see the "nonexistent email"
+    // login test above for the one call site that creates one.
+    await prisma.authAuditEvent.deleteMany({
+      where: { userId: null, userAgent: { contains: emailPrefix } },
+    });
     await prisma.accountLockout.deleteMany({
       where: { user: { email: { contains: emailPrefix } } },
     });
@@ -96,6 +115,35 @@ describe('AuthService', () => {
 
       const decoded = jwtService.decode<{ sub: string }>(result.accessToken);
       expect(decoded.sub).toBe(storedUser!.id);
+    });
+
+    /**
+     * Phase 12, work unit 12A-B3: proves `AuthService.register` is actually
+     * wired to `AuthAuditService.emit`, not just unit-tested in isolation
+     * (see `auth-audit.service.spec.ts` for `emit`'s own hashing/
+     * sanitization coverage). Also proves the raw IP passed in never reaches
+     * the stored row as-is — only its HMAC hash does.
+     */
+    it('writes a register_success AuthAuditEvent row with a hashed (never raw) IP and no raw email in metadata', async () => {
+      const email = uniqueEmail('register-audit');
+      const rawIp = '203.0.113.42';
+
+      const result = await service.register(
+        { email, password: 'correct-horse-battery' },
+        { ip: rawIp, userAgent: 'audit-spec-test-agent/1.0' },
+      );
+
+      const auditRows = await prisma.authAuditEvent.findMany({
+        where: { userId: result.user.id },
+      });
+
+      expect(auditRows).toHaveLength(1);
+      expect(auditRows[0].event).toBe('register_success');
+      expect(auditRows[0].ipHash).not.toBeNull();
+      expect(auditRows[0].ipHash).not.toBe(rawIp);
+      expect(auditRows[0].userAgent).toBe('audit-spec-test-agent/1.0');
+      expect(JSON.stringify(auditRows[0])).not.toContain(email);
+      expect(JSON.stringify(auditRows[0])).not.toContain(rawIp);
     });
 
     it('rejects registration with a duplicate email using a structured conflict error', async () => {
@@ -173,6 +221,63 @@ describe('AuthService', () => {
       } as Partial<AppException>);
     });
 
+    /**
+     * Phase 12, work unit 12A-B3: `login_success`/`login_failed`
+     * AuthAuditEvent rows are actually written from the real
+     * `AuthService.login` call sites (not merely unit-tested on
+     * `AuthAuditService` in isolation) and carry none of the sensitive
+     * values DECISIONS.md decision 6 / the "Additional binding
+     * requirements" section forbid (raw email, raw password, raw IP,
+     * token).
+     */
+    it('writes login_success / login_failed AuthAuditEvent rows containing no email/password/token/raw-IP', async () => {
+      const email = uniqueEmail('login-audit');
+      const registered = await service.register({
+        email,
+        password: 'correct-horse-battery',
+      });
+
+      await expect(
+        service.login(
+          { email, password: 'totally-wrong-password' },
+          { ip: '198.51.100.7', userAgent: 'audit-spec-login-agent' },
+        ),
+      ).rejects.toBeInstanceOf(AppException);
+
+      await service.login(
+        { email, password: 'correct-horse-battery' },
+        { ip: '198.51.100.7', userAgent: 'audit-spec-login-agent' },
+      );
+
+      const auditRows = await prisma.authAuditEvent.findMany({
+        where: { userId: registered.user.id },
+        orderBy: { createdAt: 'asc' },
+      });
+
+      // register_success (from the earlier `service.register` call above,
+      // with no `ip`/`userAgent` supplied) + login_failed + login_success.
+      expect(auditRows.map((row) => row.event)).toEqual([
+        'register_success',
+        'login_failed',
+        'login_success',
+      ]);
+
+      const loginFailedRow = auditRows[1];
+      expect(loginFailedRow.metadata).toEqual({ reason: 'invalid_password' });
+      expect(loginFailedRow.ipHash).not.toBeNull();
+      expect(loginFailedRow.ipHash).not.toBe('198.51.100.7');
+
+      const loginSuccessRow = auditRows[2];
+      expect(loginSuccessRow.userAgent).toBe('audit-spec-login-agent');
+
+      const serialized = JSON.stringify(auditRows);
+      expect(serialized).not.toContain(email);
+      expect(serialized).not.toContain('correct-horse-battery');
+      expect(serialized).not.toContain('totally-wrong-password');
+      expect(serialized).not.toContain('198.51.100.7');
+      expect(serialized).not.toContain(registered.refreshToken);
+    });
+
     it('logs in successfully when the casing of the email differs from registration', async () => {
       const email = uniqueEmail('login-case-insensitive');
       await service.register({ email, password: 'correct-horse-battery' });
@@ -206,10 +311,19 @@ describe('AuthService', () => {
 
       let nonexistentEmailError: unknown;
       try {
-        await service.login({
-          email: uniqueEmail('login-shape-nonexistent'),
-          password: 'totally-wrong-password',
-        });
+        await service.login(
+          {
+            email: uniqueEmail('login-shape-nonexistent'),
+            password: 'totally-wrong-password',
+          },
+          // Phase 12, work unit 12A-B3: this is the one call site in this
+          // spec file that emits a `userId: null` AuthAuditEvent row (no
+          // user ever resolved) — a distinctive `userAgent` marker lets
+          // `afterEach` clean it up below, since it cannot be found via the
+          // usual `user: { email: { contains: emailPrefix } }` relation
+          // filter (there is no related user to filter through).
+          { userAgent: `${emailPrefix}-nonexistent-email-audit-marker` },
+        );
       } catch (error) {
         nonexistentEmailError = error;
       }
@@ -273,6 +387,20 @@ describe('AuthService', () => {
         where: { user: { email } },
       });
       expect(lockout?.lockedUntil).not.toBeNull();
+
+      // Phase 12, work unit 12A-B3: the locked-account attempt above must
+      // have written its own `account_locked` row, distinct from the 10
+      // preceding `login_failed` rows.
+      const auditEvents = await prisma.authAuditEvent.findMany({
+        where: { user: { email } },
+        orderBy: { createdAt: 'asc' },
+      });
+      expect(auditEvents).toHaveLength(12); // register_success + 10 login_failed + 1 account_locked
+      expect(auditEvents[0].event).toBe('register_success');
+      expect(
+        auditEvents.slice(1, 11).every((row) => row.event === 'login_failed'),
+      ).toBe(true);
+      expect(auditEvents[11].event).toBe('account_locked');
     });
 
     it('allows login again once the lock window has elapsed (simulated via the stored timestamp)', async () => {
@@ -420,6 +548,22 @@ describe('AuthService', () => {
         code: AppErrorCode.INVALID_REFRESH_TOKEN,
         status: HttpStatus.UNAUTHORIZED,
       } as Partial<AppException>);
+
+      // Phase 12, work unit 12A-B3: both reuse attempts above must have
+      // written a `refresh_reuse_detected` AuthAuditEvent row (the existing
+      // replay-detection/revoke-all behavior itself is unchanged — this
+      // only asserts the audit emission actually fires from that path).
+      const auditEvents = await prisma.authAuditEvent.findMany({
+        where: { user: { email }, event: 'refresh_reuse_detected' },
+      });
+      expect(auditEvents).toHaveLength(2);
+      expect(
+        auditEvents.every(
+          (row) =>
+            (row.metadata as { reason?: string } | null)?.reason ===
+            'already_rotated',
+        ),
+      ).toBe(true);
     });
 
     it('treats a concurrent rotation of the same session as reuse/theft instead of issuing two valid token pairs', async () => {
@@ -474,6 +618,18 @@ describe('AuthService', () => {
       });
       expect(sessions).toHaveLength(1);
       expect(sessions[0].revokedAt).not.toBeNull();
+
+      // Phase 12, work unit 12A-B3: this is the OTHER branch that emits
+      // `refresh_reuse_detected` (the `count === 0` concurrent-race branch,
+      // distinct from the `isReuseOfRevokedToken` branch covered above) —
+      // `reason` distinguishes the two in the audit log.
+      const auditEvents = await prisma.authAuditEvent.findMany({
+        where: { user: { email }, event: 'refresh_reuse_detected' },
+      });
+      expect(auditEvents).toHaveLength(1);
+      expect(
+        (auditEvents[0].metadata as { reason?: string } | null)?.reason,
+      ).toBe('concurrent_rotation_race');
     });
   });
 

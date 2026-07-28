@@ -39,6 +39,14 @@ model User {
   /// `AccountLockoutService`). See `AccountLockout` below for the full
   /// design rationale.
   accountLockout    AccountLockout?
+  /// Phase 12, work unit 12A-B3: operational security audit trail. Nullable
+  /// FK with `onDelete: SetNull` (NOT `Cascade`), mirroring the existing
+  /// `AnalyticsEvent.userId` precedent — deleting a `User` anonymizes their
+  /// audit history instead of destroying it, which matters for an
+  /// operational-security log (e.g. investigating account-takeover activity
+  /// must survive the attacker later deleting the compromised account). See
+  /// `AuthAuditEvent` below for the full design rationale.
+  authAuditEvents   AuthAuditEvent[]
 }
 
 // Phase 12, work unit 12A-B1: persistent (PostgreSQL, survives restart)
@@ -318,4 +326,48 @@ model AnalyticsEvent {
   @@index([eventName])
   @@index([userId])
   @@index([receivedAt])
+}
+
+// Phase 12, work unit 12A-B3: operational SECURITY audit log (DECISIONS.md
+// "Phase 12 ... approved..." entry, decision 6, plus the "Additional binding
+// requirements" section). Deliberately a SEPARATE model from `AnalyticsEvent`
+// above — different purpose (operational security investigation, e.g. "was
+// this account brute-forced / did a stolen refresh token get replayed"),
+// different retention/access story, never merged into the product-analytics
+// pipeline. Written exclusively by `AuthAuditService.emit` (see that file's
+// doc comment), which enforces every one of the constraints this schema
+// relies on before a row is ever created:
+//   - `event` is restricted server-side to an allowlisted
+//     `AuthAuditEventName` union (login_success, login_failed,
+//     account_locked, register_success, refresh_reuse_detected, ...) — never
+//     an arbitrary caller-supplied string.
+//   - `ipHash` is an HMAC-SHA256 digest of the client IP, keyed with a
+//     DEDICATED secret (`AUTH_AUDIT_IP_HASH_SECRET`, distinct from the JWT
+//     access/refresh signing secrets) — the raw IP address is never computed
+//     into this column or persisted anywhere else on this row.
+//   - `userAgent` is truncated and control-character-sanitized before
+//     storage, never persisted verbatim/unbounded.
+//   - `metadata` is validated against a per-event allowlist (mirroring the
+//     existing `AnalyticsEvent.properties` allowlist precedent) — no
+//     password, token, secret, raw email, or raw IP value can ever reach
+//     this column, regardless of what a caller passes to `emit`.
+// `userId` is nullable with `onDelete: SetNull` (see `User.authAuditEvents`
+// above) rather than `Cascade`, so a deleted account's security history
+// survives (anonymized) instead of disappearing — the opposite tradeoff from
+// `Session`/`AccountLockout`, which intentionally DO cascade-delete, because
+// this table exists specifically to be read AFTER something has already gone
+// wrong with an account, which can include its own deletion.
+model AuthAuditEvent {
+  id        String   @id @default(cuid())
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  event     String
+  ipHash    String?
+  userAgent String?
+  metadata  Json?
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([event])
+  @@index([createdAt])
 }

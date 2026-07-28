@@ -21,6 +21,7 @@ import {
 import { AuthService } from './auth.service';
 import { AuthRequestContext, AuthResponseDto, AuthUserDto } from './auth.types';
 import { CurrentUser } from './decorators/current-user.decorator';
+import { ChangePasswordDto } from './dto/change-password.dto';
 import { LoginDto } from './dto/login.dto';
 import { RefreshTokenDto } from './dto/refresh-token.dto';
 import { RegisterDto } from './dto/register.dto';
@@ -109,5 +110,30 @@ export class AuthController {
   @UseGuards(JwtAuthGuard)
   async me(@CurrentUser() user: AuthenticatedUser): Promise<AuthUserDto> {
     return this.authService.getUserById(user.id);
+  }
+
+  /**
+   * Phase 12, work unit 12B-B1 (DECISIONS.md "Phase 12 ... approved..."
+   * entry, decision 7). See `AuthService.changePassword`'s doc comment for
+   * the full design (why `refreshToken` is required in the body to identify
+   * "the current session", the race-safe rotation, and the audit events).
+   * No dedicated `@Throttle()` override here — this route is authenticated
+   * (unlike `login`/`register`/`refresh`, which are reachable by anyone),
+   * so it already falls under the app-wide default throttler like every
+   * other authenticated route.
+   */
+  @Post('change-password')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(JwtAuthGuard)
+  async changePassword(
+    @CurrentUser() user: AuthenticatedUser,
+    @Body() dto: ChangePasswordDto,
+    @Req() request: Request,
+  ): Promise<AuthResponseDto> {
+    return this.authService.changePassword(
+      user.id,
+      dto,
+      requestContext(request),
+    );
   }
 }

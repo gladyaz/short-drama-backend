@@ -44,6 +44,21 @@ export const AUTH_AUDIT_METADATA_ALLOWLIST = {
    * code paths that both trigger this event.
    */
   refresh_reuse_detected: ['reason'],
+  /**
+   * Phase 12, work unit 12B-B1: `POST /auth/change-password` succeeded — the
+   * password hash was updated, every OTHER session for the account was
+   * revoked, and the current session's own token pair was rotated (see
+   * DECISIONS.md "Phase 12 ... approved..." entry, decision 7). No metadata
+   * needed.
+   */
+  change_password_success: [],
+  /**
+   * `POST /auth/change-password` was refused because the supplied
+   * `currentPassword` did not match the account's stored hash. `reason` is a
+   * fixed, non-sensitive enum (mirroring `login_failed`'s `reason`) — never
+   * the attempted password.
+   */
+  change_password_failed: ['reason'],
 } as const satisfies Record<string, readonly string[]>;
 
 export type AuthAuditEventName = keyof typeof AUTH_AUDIT_METADATA_ALLOWLIST;

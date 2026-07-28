@@ -2,6 +2,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
 import { JwtModule, JwtService } from '@nestjs/jwt';
 import { HttpStatus } from '@nestjs/common';
+import * as bcrypt from 'bcryptjs';
 import type { Session } from '@prisma/client';
 import { AppErrorCode } from '../common/errors/app-error-code';
 import { AppException } from '../common/errors/app.exception';
@@ -9,6 +10,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { AccountLockoutService } from './account-lockout.service';
 import { AuthAuditService } from './auth-audit.service';
 import { AuthService } from './auth.service';
+import type { AuthResponseDto } from './auth.types';
 
 const TEST_AUTH_CONFIG = {
   jwtAccessSecret: 'test-access-secret-not-a-real-secret',
@@ -35,6 +37,15 @@ describe('AuthService', () => {
 
   const uniqueEmail = (label: string): string =>
     `${emailPrefix}-${label}-${Date.now()}-${Math.random().toString(36).slice(2)}@example.test`;
+
+  // Fix cycle 3 (Phase 12, 12B-B1), advisory-polish item 2: the two
+  // probabilistic race tests below (real bcrypt, real concurrent Promise
+  // races, no mocked timing) each ran a single iteration, so a reintroduced
+  // regression had only a partial chance of being caught by any one run.
+  // Looping a bounded number of times raises that catch rate without
+  // changing what either test asserts. Kept small because each iteration
+  // does several real cost-factor-12 bcrypt calls (~300-600ms apiece).
+  const RACE_TEST_ITERATIONS = 10;
 
   beforeEach(async () => {
     const module: TestingModule = await Test.createTestingModule({
@@ -655,6 +666,582 @@ describe('AuthService', () => {
       await expect(
         service.logout('some-token-that-does-not-exist'),
       ).resolves.toBeUndefined();
+    });
+  });
+
+  /**
+   * Phase 12, work unit 12B-B1: `POST /auth/change-password` (DECISIONS.md
+   * "Phase 12 ... approved..." entry, decision 7). See
+   * `AuthService.changePassword`'s doc comment for the full design.
+   */
+  describe('changePassword', () => {
+    it('changes the password, revokes every OTHER session, rotates the current session token pair, and the new tokens work', async () => {
+      const email = uniqueEmail('change-password-success');
+      const oldPassword = 'correct-horse-battery';
+      const newPassword = 'brand-new-password-1';
+
+      const registered = await service.register({
+        email,
+        password: oldPassword,
+      });
+      // A "second device" — logging in again creates an independent session
+      // that must ALSO be revoked (every OTHER session, not just one). Its
+      // token is never read again; only the side effect (a second `Session`
+      // row) matters for this test.
+      await service.login({ email, password: oldPassword });
+
+      const result = await service.changePassword(registered.user.id, {
+        currentPassword: oldPassword,
+        newPassword,
+        refreshToken: registered.refreshToken,
+      });
+
+      expect(result.user.email).toBe(email);
+      expect(result.accessToken).toEqual(expect.any(String));
+      expect(result.refreshToken).toEqual(expect.any(String));
+      expect(result.refreshToken).not.toBe(registered.refreshToken);
+      // No session record, refreshTokenHash, or any hash/secret ever appears
+      // in the response.
+      expect(JSON.stringify(result)).not.toMatch(
+        /passwordHash|refreshTokenHash|revokedAt|\$2[aby]\$/,
+      );
+
+      // Every session for this account except the brand-new one is revoked
+      // — checked directly against the DB, NOT by calling `refresh()` with
+      // an already-revoked token, since doing so has its OWN side effect
+      // (replay-detection's defensive revoke-EVERYTHING, including the
+      // brand-new session) that would contaminate this exact assertion —
+      // see the dedicated "replay" test below for that behavior in
+      // isolation.
+      const allSessions = await prisma.session.findMany({
+        where: { user: { email } },
+      });
+      expect(allSessions.filter((s) => s.revokedAt === null)).toHaveLength(1);
+      expect(
+        allSessions.filter((s) => s.revokedAt !== null).length,
+      ).toBeGreaterThanOrEqual(2); // the pre-change session + the second device's session
+
+      // The NEW token pair issued BY changePassword itself keeps working —
+      // this is the "current session" being rotated, not merely killed.
+      const rotatedAgain = await service.refresh(result.refreshToken);
+      expect(rotatedAgain.accessToken).toEqual(expect.any(String));
+
+      // The stored password hash actually changed.
+      const storedUser = await prisma.user.findUnique({ where: { email } });
+      expect(await bcrypt.compare(newPassword, storedUser!.passwordHash)).toBe(
+        true,
+      );
+      expect(await bcrypt.compare(oldPassword, storedUser!.passwordHash)).toBe(
+        false,
+      );
+
+      // Logging in with the OLD password now fails; the NEW password works.
+      await expect(
+        service.login({ email, password: oldPassword }),
+      ).rejects.toMatchObject({
+        code: AppErrorCode.INVALID_CREDENTIALS,
+      });
+      const loginWithNewPassword = await service.login({
+        email,
+        password: newPassword,
+      });
+      expect(loginWithNewPassword.user.email).toBe(email);
+
+      const auditRows = await prisma.authAuditEvent.findMany({
+        where: { userId: registered.user.id, event: 'change_password_success' },
+      });
+      expect(auditRows).toHaveLength(1);
+    });
+
+    it('rejects a wrong current password with the generic INVALID_CREDENTIALS error, leaves the password/session unchanged, and emits change_password_failed', async () => {
+      const email = uniqueEmail('change-password-wrong-current');
+      const correctPassword = 'correct-horse-battery';
+      const registered = await service.register({
+        email,
+        password: correctPassword,
+      });
+
+      await expect(
+        service.changePassword(registered.user.id, {
+          currentPassword: 'totally-wrong-password',
+          newPassword: 'brand-new-password-1',
+          refreshToken: registered.refreshToken,
+        }),
+      ).rejects.toMatchObject({
+        code: AppErrorCode.INVALID_CREDENTIALS,
+        status: HttpStatus.UNAUTHORIZED,
+      } as Partial<AppException>);
+
+      const storedUser = await prisma.user.findUnique({ where: { email } });
+      expect(
+        await bcrypt.compare(correctPassword, storedUser!.passwordHash),
+      ).toBe(true);
+
+      // The session is untouched — the presented refresh token still works.
+      const stillWorks = await service.refresh(registered.refreshToken);
+      expect(stillWorks.accessToken).toEqual(expect.any(String));
+
+      const auditRows = await prisma.authAuditEvent.findMany({
+        where: { userId: registered.user.id, event: 'change_password_failed' },
+      });
+      expect(auditRows).toHaveLength(1);
+      expect(auditRows[0].metadata).toEqual({
+        reason: 'invalid_current_password',
+      });
+    });
+
+    it('rejects an unknown refresh token with the generic INVALID_REFRESH_TOKEN error and makes no changes', async () => {
+      const email = uniqueEmail('change-password-unknown-token');
+      const correctPassword = 'correct-horse-battery';
+      const registered = await service.register({
+        email,
+        password: correctPassword,
+      });
+
+      await expect(
+        service.changePassword(registered.user.id, {
+          currentPassword: correctPassword,
+          newPassword: 'brand-new-password-1',
+          refreshToken: 'this-token-was-never-issued',
+        }),
+      ).rejects.toMatchObject({
+        code: AppErrorCode.INVALID_REFRESH_TOKEN,
+        status: HttpStatus.UNAUTHORIZED,
+      } as Partial<AppException>);
+
+      const storedUser = await prisma.user.findUnique({ where: { email } });
+      expect(
+        await bcrypt.compare(correctPassword, storedUser!.passwordHash),
+      ).toBe(true);
+    });
+
+    /**
+     * IDOR-safety: a refresh token that hash-resolves to a real `Session`
+     * row belonging to a DIFFERENT account must never be usable as "the
+     * current session" for this caller — this must be impossible, not
+     * merely unlikely.
+     */
+    it('rejects a refresh token belonging to a DIFFERENT account (cross-account attempt) and leaves both accounts unchanged', async () => {
+      const emailA = uniqueEmail('change-password-cross-account-a');
+      const emailB = uniqueEmail('change-password-cross-account-b');
+      const correctPassword = 'correct-horse-battery';
+      const userA = await service.register({
+        email: emailA,
+        password: correctPassword,
+      });
+      const userB = await service.register({
+        email: emailB,
+        password: correctPassword,
+      });
+
+      await expect(
+        service.changePassword(userA.user.id, {
+          currentPassword: correctPassword,
+          newPassword: 'brand-new-password-1',
+          refreshToken: userB.refreshToken,
+        }),
+      ).rejects.toMatchObject({
+        code: AppErrorCode.INVALID_REFRESH_TOKEN,
+        status: HttpStatus.UNAUTHORIZED,
+      } as Partial<AppException>);
+
+      const storedUserA = await prisma.user.findUnique({
+        where: { email: emailA },
+      });
+      expect(
+        await bcrypt.compare(correctPassword, storedUserA!.passwordHash),
+      ).toBe(true);
+
+      const sessionsB = await prisma.session.findMany({
+        where: { user: { email: emailB } },
+      });
+      expect(sessionsB.every((s) => s.revokedAt === null)).toBe(true);
+    });
+
+    /**
+     * Preserves `refresh()`'s existing replay-detection unchanged: since
+     * change-password REVOKES (not deletes) the pre-change session, reusing
+     * its refresh token afterward must be caught by the SAME
+     * `isReuseOfRevokedToken` branch a normal `refresh()` rotation would
+     * trigger.
+     */
+    it('after rotation, reusing the OLD (pre-change-password) refresh token is detected as replay and revokes every session', async () => {
+      const email = uniqueEmail('change-password-replay');
+      const correctPassword = 'correct-horse-battery';
+      const registered = await service.register({
+        email,
+        password: correctPassword,
+      });
+
+      const result = await service.changePassword(registered.user.id, {
+        currentPassword: correctPassword,
+        newPassword: 'brand-new-password-1',
+        refreshToken: registered.refreshToken,
+      });
+
+      await expect(
+        service.refresh(registered.refreshToken),
+      ).rejects.toMatchObject({
+        code: AppErrorCode.INVALID_REFRESH_TOKEN,
+        status: HttpStatus.UNAUTHORIZED,
+      } as Partial<AppException>);
+
+      const sessions = await prisma.session.findMany({
+        where: { user: { email } },
+      });
+      expect(sessions.every((s) => s.revokedAt !== null)).toBe(true);
+
+      const reuseEvents = await prisma.authAuditEvent.findMany({
+        where: { user: { email }, event: 'refresh_reuse_detected' },
+      });
+      expect(
+        reuseEvents.some(
+          (row) =>
+            (row.metadata as { reason?: string } | null)?.reason ===
+            'already_rotated',
+        ),
+      ).toBe(true);
+
+      // The replay's defensive revoke-all also kills the legitimately
+      // rotated NEW session — reusing a stolen old token must cut off the
+      // whole chain, including the one change-password itself just issued.
+      await expect(service.refresh(result.refreshToken)).rejects.toMatchObject({
+        code: AppErrorCode.INVALID_REFRESH_TOKEN,
+        status: HttpStatus.UNAUTHORIZED,
+      } as Partial<AppException>);
+    });
+
+    /**
+     * Simulates the exact interleaving `refresh()`'s own race test does
+     * (see "treats a concurrent rotation of the same session as reuse/theft"
+     * above): the application reads the current session (`revokedAt: null`),
+     * but by the time it performs the conditional revoke, another request
+     * has ALREADY revoked the same row.
+     */
+    it('treats a concurrent rotation of the current session as reuse/theft instead of applying the password change', async () => {
+      const email = uniqueEmail('change-password-race-simulated');
+      const correctPassword = 'correct-horse-battery';
+      const registered = await service.register({
+        email,
+        password: correctPassword,
+      });
+
+      const realSessionBeforeChange = await prisma.session.findFirst({
+        where: { user: { email } },
+      });
+
+      // `mockImplementationOnce`'s parameter type is Prisma's generated
+      // `Prisma__SessionClient` fluent-thenable (it also exposes relation
+      // methods like `.user()`), which a plain `Promise<Session | null>`
+      // does not structurally satisfy. Cast the implementation to the exact
+      // spied method's own type — a plain resolved Promise is a valid
+      // thenable at runtime (all real call sites here just `await` it),
+      // this cast only tells the type checker to trust that.
+      const findUniqueSpy = jest
+        .spyOn(prisma.session, 'findUnique')
+        .mockImplementationOnce((async (): Promise<Session | null> => {
+          if (realSessionBeforeChange) {
+            await prisma.session.updateMany({
+              where: { id: realSessionBeforeChange.id },
+              data: { revokedAt: new Date() },
+            });
+          }
+          return realSessionBeforeChange;
+        }) as unknown as typeof prisma.session.findUnique);
+
+      await expect(
+        service.changePassword(registered.user.id, {
+          currentPassword: correctPassword,
+          newPassword: 'brand-new-password-1',
+          refreshToken: registered.refreshToken,
+        }),
+      ).rejects.toMatchObject({
+        code: AppErrorCode.INVALID_REFRESH_TOKEN,
+        status: HttpStatus.UNAUTHORIZED,
+      } as Partial<AppException>);
+
+      findUniqueSpy.mockRestore();
+
+      // The password change must NOT have been applied.
+      const storedUser = await prisma.user.findUnique({ where: { email } });
+      expect(
+        await bcrypt.compare(correctPassword, storedUser!.passwordHash),
+      ).toBe(true);
+
+      // Every session for the account ends up revoked (the defensive
+      // revoke-all), and no new session was created for the loser of the
+      // race.
+      const sessions = await prisma.session.findMany({
+        where: { user: { email } },
+      });
+      expect(sessions).toHaveLength(1);
+      expect(sessions[0].revokedAt).not.toBeNull();
+
+      const auditEvents = await prisma.authAuditEvent.findMany({
+        where: { user: { email }, event: 'refresh_reuse_detected' },
+      });
+      expect(auditEvents).toHaveLength(1);
+      expect(
+        (auditEvents[0].metadata as { reason?: string } | null)?.reason,
+      ).toBe('concurrent_rotation_race');
+    });
+
+    /**
+     * BLOCKING FINDING 1 (Phase 12, 12B-B1 fix cycle 1): reproduces the
+     * scenario the reviewer found deadlocking against the REAL code (not a
+     * reimplementation) — an account with TWO different, genuinely
+     * concurrent, currently-active sessions (e.g. phone + tablet) both
+     * calling `changePassword` at once via `Promise.allSettled`, with no
+     * artificial delay. Before the fix, the transaction's separate
+     * CAS-on-current-session + broad-revoke-every-OTHER-session statements
+     * let the two transactions lock rows in opposite orders and deadlock
+     * (Postgres `40P01`), which surfaced as an unhandled
+     * `PrismaClientUnknownRequestError` (an opaque 500) instead of the
+     * documented clean race path. This test uses two REAL sessions and REAL
+     * concurrency (not the deterministic single-shared-token mock above),
+     * matching exactly what the reviewer reproduced.
+     */
+    it('two concurrent change-password calls for two DIFFERENT active sessions of the same account do not deadlock — one succeeds, the other fails cleanly through the documented race path', async () => {
+      for (let iteration = 0; iteration < RACE_TEST_ITERATIONS; iteration++) {
+        const email = uniqueEmail(
+          `change-password-two-session-race-${iteration}`,
+        );
+        const correctPassword = 'correct-horse-battery';
+        const registered = await service.register({
+          email,
+          password: correctPassword,
+        });
+        // A genuinely independent SECOND active session for the SAME account
+        // (a real `login`, not a mock) — this is precisely the "phone +
+        // tablet" scenario decision 7's "revoke every OTHER session" exists
+        // to serve.
+        const secondDevice = await service.login({
+          email,
+          password: correctPassword,
+        });
+
+        const [resultA, resultB] = await Promise.allSettled([
+          service.changePassword(registered.user.id, {
+            currentPassword: correctPassword,
+            newPassword: 'brand-new-password-from-device-a',
+            refreshToken: registered.refreshToken,
+          }),
+          service.changePassword(registered.user.id, {
+            currentPassword: correctPassword,
+            newPassword: 'brand-new-password-from-device-b',
+            refreshToken: secondDevice.refreshToken,
+          }),
+        ]);
+        const settled = [resultA, resultB];
+
+        // Neither settlement may be an unhandled/opaque failure. The deadlock
+        // bug this test guards against surfaces as a raw
+        // `PrismaClientUnknownRequestError` (Postgres `40P01`), never a clean
+        // `AppException` — so any rejection here must carry the documented
+        // `INVALID_REFRESH_TOKEN` shape, never anything else.
+        for (const result of settled) {
+          if (result.status === 'rejected') {
+            expect(result.reason).toBeInstanceOf(AppException);
+            expect((result.reason as AppException).code).toBe(
+              AppErrorCode.INVALID_REFRESH_TOKEN,
+            );
+          }
+        }
+
+        // Exactly one call wins (password changed, fresh token pair) and
+        // exactly one loses (rejected via the existing
+        // concurrent-rotation-race path) — never both succeeding (race-safety
+        // bypassed) and never both failing (account stuck, unable to change
+        // its password at all).
+        const fulfilled = settled.filter(
+          (r): r is PromiseFulfilledResult<AuthResponseDto> =>
+            r.status === 'fulfilled',
+        );
+        const rejected = settled.filter((r) => r.status === 'rejected');
+        expect(fulfilled).toHaveLength(1);
+        expect(rejected).toHaveLength(1);
+
+        // The winner's brand-new token pair actually still works afterward —
+        // proof the loser's defensive cleanup revoke never swept up the
+        // winner's freshly created replacement session.
+        const winnerResponse = fulfilled[0].value;
+        const refreshedAgain = await service.refresh(
+          winnerResponse.refreshToken,
+        );
+        expect(refreshedAgain.accessToken).toEqual(expect.any(String));
+
+        // The account is never left with zero active sessions.
+        const activeSessions = await prisma.session.findMany({
+          where: { user: { email }, revokedAt: null },
+        });
+        expect(activeSessions).toHaveLength(1);
+
+        // The loser's rejection used the SAME existing
+        // `refresh_reuse_detected` / `concurrent_rotation_race` audit path —
+        // no new error code or event type was invented for this fix.
+        const auditEvents = await prisma.authAuditEvent.findMany({
+          where: { user: { email }, event: 'refresh_reuse_detected' },
+        });
+        expect(auditEvents).toHaveLength(1);
+        expect(
+          (auditEvents[0].metadata as { reason?: string } | null)?.reason,
+        ).toBe('concurrent_rotation_race');
+      }
+    }, 60000);
+
+    /**
+     * BLOCKING CRITICAL (Phase 12, 12B-B1 fix cycle 2): reproduces, against
+     * the REAL code (not a reimplementation), the exact scenario the
+     * reviewer found reproducible 30/30 (100%) before this fix — ANYONE who
+     * still holds the CURRENT, not-yet-changed password (e.g. an attacker
+     * who obtained it, or simply a second concurrent login by the account
+     * owner) racing a `login()` call at the exact same moment the account
+     * owner calls `changePassword()`. Fix-cycle-1's revoke-all statement was
+     * bounded by `createdAt: { lte: now }`, where `now` was captured BEFORE
+     * either bcrypt call inside `changePassword` (roughly 300–600ms of work
+     * at `BCRYPT_COST_FACTOR = 12`) — so a session created by `login()`
+     * moments later was structurally excluded from every revoke-all
+     * statement and survived the password change permanently, even though
+     * the account owner's whole point in changing the password was "cut off
+     * every other session." This uses a REAL `login()` call racing a REAL
+     * `changePassword()` call via `Promise.allSettled` (no mocks, no
+     * artificial delay), matching exactly what the reviewer reproduced.
+     */
+    it('a login() racing changePassword() with the still-valid CURRENT password never leaves a surviving extra session', async () => {
+      for (let iteration = 0; iteration < RACE_TEST_ITERATIONS; iteration++) {
+        const email = uniqueEmail(`change-password-login-race-${iteration}`);
+        const oldPassword = 'correct-horse-battery';
+        const newPassword = 'brand-new-password-1';
+
+        const registered = await service.register({
+          email,
+          password: oldPassword,
+        });
+
+        const [changePasswordResult, loginResult] = await Promise.allSettled([
+          service.changePassword(registered.user.id, {
+            currentPassword: oldPassword,
+            newPassword,
+            refreshToken: registered.refreshToken,
+          }),
+          service.login({ email, password: oldPassword }),
+        ]);
+
+        // `login()` never contends for the same session row `changePassword`
+        // is rotating (it only ever creates a brand-new row of its own), so
+        // it always succeeds independently of the race outcome — asserting
+        // this keeps the test as "the exact scenario reported" rather than a
+        // degenerate run where one call trivially errors for an unrelated
+        // reason. `changePassword` also always wins here: nothing else in
+        // this test ever touches `registered`'s own session row.
+        expect(loginResult.status).toBe('fulfilled');
+        expect(changePasswordResult.status).toBe('fulfilled');
+
+        // The core of the CRITICAL finding: exactly ONE active session must
+        // survive for the account afterward — the fresh session
+        // `changePassword` itself issued. Before this fix, this was 2 (the
+        // attacker/second-login's session structurally escaped the
+        // `createdAt`-bounded revoke-all and stayed active forever).
+        const activeSessions = await prisma.session.findMany({
+          where: { user: { email }, revokedAt: null },
+        });
+        expect(activeSessions).toHaveLength(1);
+
+        // The winner's brand-new token pair still works afterward — proof
+        // this fix's revoke-all (which now has no `createdAt` bound at all)
+        // did not collaterally revoke `changePassword`'s OWN replacement
+        // session in the process of catching the racing login's session.
+        if (changePasswordResult.status === 'fulfilled') {
+          expect(activeSessions[0].id).toEqual(expect.any(String));
+          const refreshedAgain = await service.refresh(
+            changePasswordResult.value.refreshToken,
+          );
+          expect(refreshedAgain.accessToken).toEqual(expect.any(String));
+        }
+      }
+    }, 60000);
+
+    /**
+     * BLOCKING FINDING 2 (Phase 12, 12B-B1 fix cycle 1): mirrors
+     * `getUserById`'s existing precedent for this exact situation (see
+     * "rejects with INVALID_ACCESS_TOKEN when the user id does not exist"
+     * above) — an access token that verified fine (this method is only ever
+     * reached via `JwtAuthGuard`), but whose `sub` no longer resolves to a
+     * real user because the account was deleted after the token was issued.
+     */
+    it('rejects with INVALID_ACCESS_TOKEN when the caller user id no longer exists (e.g. deleted after token issuance)', async () => {
+      const email = uniqueEmail('change-password-user-deleted');
+      const correctPassword = 'correct-horse-battery';
+      const registered = await service.register({
+        email,
+        password: correctPassword,
+      });
+
+      await prisma.session.deleteMany({
+        where: { userId: registered.user.id },
+      });
+      await prisma.user.delete({ where: { id: registered.user.id } });
+
+      await expect(
+        service.changePassword(registered.user.id, {
+          currentPassword: correctPassword,
+          newPassword: 'brand-new-password-1',
+          refreshToken: registered.refreshToken,
+        }),
+      ).rejects.toMatchObject({
+        code: AppErrorCode.INVALID_ACCESS_TOKEN,
+        status: HttpStatus.UNAUTHORIZED,
+      } as Partial<AppException>);
+    });
+
+    /**
+     * BLOCKING FINDING 3 (Phase 12, 12B-B1 fix cycle 1): adapts `refresh()`'s
+     * existing "rejects an expired refresh token" precedent (see that test
+     * above, which forces `expiresAt` into the past on a NOT-revoked
+     * session) to `changePassword`'s `isCurrentSessionUsable` check —
+     * proves the expiry half of that check (as opposed to the
+     * already-covered revoked/unknown/cross-account halves) is actually
+     * exercised.
+     */
+    it('rejects an expired-but-not-revoked current session with the generic INVALID_REFRESH_TOKEN error and makes no changes', async () => {
+      const email = uniqueEmail('change-password-expired-session');
+      const correctPassword = 'correct-horse-battery';
+      const registered = await service.register({
+        email,
+        password: correctPassword,
+      });
+
+      const realSession = await prisma.session.findFirst({
+        where: { user: { email } },
+      });
+      await prisma.session.update({
+        where: { id: realSession!.id },
+        data: { expiresAt: new Date(Date.now() - 1000) },
+      });
+
+      await expect(
+        service.changePassword(registered.user.id, {
+          currentPassword: correctPassword,
+          newPassword: 'brand-new-password-1',
+          refreshToken: registered.refreshToken,
+        }),
+      ).rejects.toMatchObject({
+        code: AppErrorCode.INVALID_REFRESH_TOKEN,
+        status: HttpStatus.UNAUTHORIZED,
+      } as Partial<AppException>);
+
+      // Neither the password nor the session's revocation state changed —
+      // this must be indistinguishable from any other "current session not
+      // usable" rejection, and must not itself revoke anything.
+      const storedUser = await prisma.user.findUnique({ where: { email } });
+      expect(
+        await bcrypt.compare(correctPassword, storedUser!.passwordHash),
+      ).toBe(true);
+
+      const sessionAfter = await prisma.session.findUnique({
+        where: { id: realSession!.id },
+      });
+      expect(sessionAfter?.revokedAt).toBeNull();
     });
   });
 

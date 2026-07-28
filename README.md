@@ -292,6 +292,71 @@ This is intentionally the smallest possible authenticated route — a working,
 tested example of `JwtAuthGuard` + `@CurrentUser()` for future routes to
 copy, not a general-purpose profile endpoint.
 
+### `POST /auth/change-password` (Phase 12, work unit 12B-B1)
+
+Requires `Authorization: Bearer <accessToken>`. Body:
+
+```json
+{
+  "currentPassword": "the caller's existing password",
+  "newPassword": "at-least-8-chars",
+  "refreshToken": "the CURRENT session's own refresh token"
+}
+```
+
+- `currentPassword`: re-verified server-side against the stored bcrypt hash
+  before anything changes.
+- `newPassword`: same 8–128 character policy as `POST /auth/register` (the
+  single source of truth — no second, divergent policy).
+- `refreshToken`: identifies which of the caller's sessions is "the current
+  one". The access-token payload carries only the user id (`sub`) — no
+  session-id claim — so, exactly like `/auth/refresh` and `/auth/logout`,
+  the current session is identified by the plaintext refresh token supplied
+  in the body.
+
+On success, returns `200` with a new `AuthResponseDto` (a rotated
+access/refresh token pair for the current session, so the calling device
+stays authenticated with fresh credentials) and:
+
+- Revokes **every other session** for the account (all sessions except the
+  one just rotated) — including a session created by a concurrent `login()`
+  call using the still-valid CURRENT password at the exact moment the
+  password change runs. This is enforced by two unconditioned (no time-window
+  bound) revoke sweeps inside the same database transaction as the password
+  update — one before, one immediately after creating the replacement
+  session — rather than a wall-clock cutoff, which cannot reliably
+  distinguish "created moments too late" from "created by an unrelated
+  caller." Verified empirically against real concurrent traffic (repeated,
+  no-artificial-delay races, both `changePassword` vs. `changePassword` and
+  `changePassword` vs. `login`) with zero surviving extra sessions observed.
+  The guarantee is narrowed to the database commit round-trip, though: a
+  `login()` call whose session creation lands inside the window between the
+  final sweep and the `changePassword` transaction's COMMIT can still retain
+  an extra active session. This has not been observed organically across
+  290+ concurrent-race iterations (210 by independent review across 4
+  interleavings, 80 during implementation) — zero survivors — and is only
+  reproducible via direct instrumentation of the commit boundary (20/20 when
+  forced), not via ordinary concurrent HTTP traffic. Fully closing it would
+  require serializing `login()`'s password check against a lock
+  `changePassword()` holds — deliberately not attempted in this work unit,
+  tracked as a follow-up.
+- Never returns a session record, a `refreshTokenHash`, or any other
+  hash/secret in the response body.
+- The old (pre-change) refresh token is now revoked — reusing it via
+  `/auth/refresh` afterward is caught by that route's existing replay/reuse
+  detection (revokes every session for the account defensively), exactly as
+  it would for any other rotated token.
+
+Errors: `401 INVALID_CREDENTIALS` (same generic body login failures use) for
+a wrong `currentPassword`; `401 INVALID_REFRESH_TOKEN` for an unknown,
+expired, already-revoked, or cross-account `refreshToken` (a refresh token
+belonging to a different account is never usable here — this is
+IDOR-safe/ownership-scoped, not merely unlikely to happen); `400` for a
+`newPassword` that fails the length policy. There is no dedicated rate limit
+or account-lockout coupling for this route (unlike `login`) — it is
+authenticated already and falls under the app-wide default throttler like
+every other authenticated route.
+
 ### Known gaps in the Auth API
 
 - **No rate limiting yet** on `/auth/login` or `/auth/register`. This was

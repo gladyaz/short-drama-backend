@@ -44,44 +44,90 @@ describe('validateEnv — AUTH_AUDIT_IP_HASH_SECRET (Phase 12, 12A-B3)', () => {
 });
 
 /**
- * Phase 10, work unit 10-B6: covers the new production fail-loud check
- * added alongside `DEV_TOOLS_ENABLED` (10-B5) — dev-only entitlement
- * grant/revoke routes must never be reachable in production, per the
- * security review requirement in the approved Phase 10 plan.
+ * Phase 10, work unit 10-B6 originally covered the production fail-loud
+ * check added alongside `DEV_TOOLS_ENABLED` (10-B5). Phase 12, work unit
+ * 12D-B2 replaced that check's exact-string denylist
+ * (`NODE_ENV === 'production'`) with a fail-closed ALLOWLIST after an
+ * independent security review found it HIGH: an unset, empty, misspelled, or
+ * differently-cased `NODE_ENV` silently passed the old check, and the same
+ * flag also gates `/dev/admin/*`'s self-service admin-role grant — a
+ * privilege-escalation path, not merely the dev-only entitlement
+ * grant/revoke routes this check was first written for.
+ *
+ * The matrix below exercises every `DEV_TOOLS_ENABLED` (true/false) ×
+ * `NODE_ENV` (unset / empty / development / test / production / Production /
+ * arbitrary junk) combination explicitly, per that review's requirement.
  */
-describe('validateEnv — DEV_TOOLS_ENABLED / NODE_ENV interaction', () => {
-  it('passes when DEV_TOOLS_ENABLED is unset', () => {
-    expect(() => validateEnv({ ...VALID_CONFIG })).not.toThrow();
+describe('validateEnv — DEV_TOOLS_ENABLED / NODE_ENV interaction (Phase 12, 12D-B2)', () => {
+  /** `nodeEnv: undefined` means the key is OMITTED from the config entirely — genuinely unset, not the string `"undefined"`. */
+  const NODE_ENV_CASES: Array<{ label: string; nodeEnv: string | undefined }> =
+    [
+      { label: 'unset', nodeEnv: undefined },
+      { label: 'empty string', nodeEnv: '' },
+      { label: 'development', nodeEnv: 'development' },
+      { label: 'test', nodeEnv: 'test' },
+      { label: 'production', nodeEnv: 'production' },
+      { label: 'Production (wrong case)', nodeEnv: 'Production' },
+      { label: 'arbitrary junk', nodeEnv: 'not-a-real-environment' },
+    ];
+
+  function buildConfig(
+    devToolsEnabled: 'true' | 'false',
+    nodeEnv: string | undefined,
+  ): Record<string, unknown> {
+    const config: Record<string, unknown> = {
+      ...VALID_CONFIG,
+      DEV_TOOLS_ENABLED: devToolsEnabled,
+    };
+    if (nodeEnv !== undefined) {
+      config.NODE_ENV = nodeEnv;
+    }
+    return config;
+  }
+
+  describe('DEV_TOOLS_ENABLED=false — boots under every NODE_ENV, including unset', () => {
+    it.each(NODE_ENV_CASES)('passes when NODE_ENV is $label', ({ nodeEnv }) => {
+      expect(() => validateEnv(buildConfig('false', nodeEnv))).not.toThrow();
+    });
   });
 
-  it('passes when DEV_TOOLS_ENABLED=true and NODE_ENV is not production', () => {
-    expect(() =>
-      validateEnv({
-        ...VALID_CONFIG,
-        DEV_TOOLS_ENABLED: 'true',
-        NODE_ENV: 'development',
-      }),
-    ).not.toThrow();
-  });
+  describe('DEV_TOOLS_ENABLED=true — only an explicit development/test NODE_ENV boots', () => {
+    it.each([
+      { label: 'development', nodeEnv: 'development' },
+      { label: 'test', nodeEnv: 'test' },
+    ])('passes when NODE_ENV is $label', ({ nodeEnv }) => {
+      expect(() => validateEnv(buildConfig('true', nodeEnv))).not.toThrow();
+    });
 
-  it('throws when DEV_TOOLS_ENABLED=true and NODE_ENV=production', () => {
-    expect(() =>
-      validateEnv({
-        ...VALID_CONFIG,
-        DEV_TOOLS_ENABLED: 'true',
-        NODE_ENV: 'production',
-      }),
-    ).toThrow(/DEV_TOOLS_ENABLED=true is not allowed when NODE_ENV=production/);
-  });
+    it.each([
+      { label: 'unset', nodeEnv: undefined },
+      { label: 'empty string', nodeEnv: '' },
+      { label: 'production', nodeEnv: 'production' },
+      { label: 'Production (wrong case)', nodeEnv: 'Production' },
+      { label: 'arbitrary junk', nodeEnv: 'not-a-real-environment' },
+    ])('throws naming the problem when NODE_ENV is $label', ({ nodeEnv }) => {
+      expect(() => validateEnv(buildConfig('true', nodeEnv))).toThrow(
+        /Refusing to boot with DEV_TOOLS_ENABLED=true/,
+      );
+    });
 
-  it('passes when DEV_TOOLS_ENABLED=false and NODE_ENV=production', () => {
-    expect(() =>
-      validateEnv({
-        ...VALID_CONFIG,
-        DEV_TOOLS_ENABLED: 'false',
-        NODE_ENV: 'production',
-      }),
-    ).not.toThrow();
+    it('names the actual (unsafe) NODE_ENV value in the thrown message, never a generic "invalid" message', () => {
+      expect(() =>
+        validateEnv(buildConfig('true', 'not-a-real-environment')),
+      ).toThrow(/NODE_ENV="not-a-real-environment"/);
+    });
+
+    it('reports NODE_ENV=null (not the string "undefined") when the key is genuinely absent', () => {
+      expect(() => validateEnv(buildConfig('true', undefined))).toThrow(
+        /NODE_ENV=null/,
+      );
+    });
+
+    it('still fails loudly for the original 10-B5 production case (regression guard)', () => {
+      expect(() => validateEnv(buildConfig('true', 'production'))).toThrow(
+        /DEV_TOOLS_ENABLED=true/,
+      );
+    });
   });
 });
 

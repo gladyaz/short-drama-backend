@@ -68,18 +68,59 @@ export function validateEnv(
 
   validateStorageDriver(config);
 
-  // Phase 10, work unit 10-B5: dev-only entitlement grant/revoke routes must
-  // never be reachable in a production deployment. Fail the app's boot
-  // entirely rather than silently ignoring the flag, so a misconfigured
-  // production environment cannot expose these routes by accident.
-  if (config.DEV_TOOLS_ENABLED === 'true' && config.NODE_ENV === 'production') {
-    throw new Error(
-      'DEV_TOOLS_ENABLED=true is not allowed when NODE_ENV=production. ' +
-        'Dev-only entitlement grant/revoke routes must never be reachable in production.',
-    );
-  }
+  validateDevToolsNodeEnv(config);
 
   return config;
+}
+
+/**
+ * Phase 10, work unit 10-B5 originally added this as a denylist
+ * (`config.NODE_ENV === 'production'`) so dev-only entitlement grant/revoke
+ * routes could never be reachable in a production deployment. The Phase 12,
+ * work unit 12D-B2 security review escalated that denylist to HIGH: an
+ * unset, empty, misspelled, or differently-cased `NODE_ENV` (e.g.
+ * `"Production"`) silently passed the old `!== 'production'`-shaped check,
+ * and the same `DEV_TOOLS_ENABLED` flag also gates the entire `/dev/*`
+ * surface — including `/dev/admin/*`'s self-service admin-role grant/revoke
+ * routes (`AdminController`), not just `/dev/entitlements/*`. Under that
+ * misconfiguration a caller could grant themselves admin: a
+ * privilege-escalation path, not merely a dev-token leak.
+ *
+ * Replaced with a fail-closed ALLOWLIST, mirroring the shape
+ * `src/retention/retention-env-guard.ts` established one work unit earlier
+ * (12D-B1) for exactly the same reason (`TASK_QUEUE.md` follow-up item 5):
+ * `undefined`, `''`, a typo, or any value not explicitly recognized as safe
+ * is treated as UNSAFE by default, never as "probably fine because it isn't
+ * literally the word production". Deliberately NOT imported from that file —
+ * its own doc comment states it is an independent gate specific to the
+ * retention job, and this fix is scoped to `env.validation.ts` only.
+ */
+const DEV_TOOLS_ALLOWED_NODE_ENVS = ['development', 'test'] as const;
+
+function validateDevToolsNodeEnv(config: Record<string, unknown>): void {
+  if (config.DEV_TOOLS_ENABLED !== 'true') {
+    return;
+  }
+
+  const nodeEnv =
+    typeof config.NODE_ENV === 'string' ? config.NODE_ENV : undefined;
+  const isAllowed = (DEV_TOOLS_ALLOWED_NODE_ENVS as readonly string[]).includes(
+    nodeEnv ?? '',
+  );
+
+  if (!isAllowed) {
+    throw new Error(
+      'Refusing to boot with DEV_TOOLS_ENABLED=true: ' +
+        `NODE_ENV=${JSON.stringify(nodeEnv ?? null)} is not one of the ` +
+        `explicitly allowed values (${DEV_TOOLS_ALLOWED_NODE_ENVS.join(', ')}). ` +
+        'This is a fail-closed ALLOWLIST, not a "!== production" check — an ' +
+        'unset, empty, misspelled, or differently-cased NODE_ENV (including ' +
+        'literally "production") is treated as unsafe by default. Dev-only ' +
+        'entitlement grant/revoke routes and the /dev/admin/* self-service ' +
+        'admin-role-grant routes must never be reachable outside an ' +
+        'explicit development/test environment.',
+    );
+  }
 }
 
 /**

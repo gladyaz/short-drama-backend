@@ -691,6 +691,96 @@ endpoint individually) but far more generous than account deletion's 5/15min
 (export is read-only and fully reversible, so a legitimate retry/re-export
 should not be punished).
 
+## Retention & cleanup jobs (Phase 12, work unit 12D-B1)
+
+`src/retention/RetentionService` implements the retention/cleanup jobs
+`phases/phase-12.md`'s "12D" scope calls for — expired/revoked sessions,
+`AuthAuditEvent`/`AnalyticsEvent` TTL, deleted-account residue, and stale
+watch progress. **This work unit builds and tests these jobs but does NOT
+run them against production data this phase** — dry-run/opt-in only, per
+`DECISIONS.md`.
+
+**Nothing here runs automatically.** There is no `@Cron`, no
+`OnModuleInit`/startup hook, and no HTTP route — `RetentionService` is
+deliberately **not** imported by `AppModule`/`main.ts` at all, so the code is
+not even loaded when the server boots, in any environment. The only way to
+invoke it is the explicit CLI script below, run by hand:
+
+```bash
+# Dry run (the default) — reports what WOULD be deleted, deletes nothing,
+# against any database:
+npm run retention
+
+# Destructive — additionally requires NODE_ENV to be exactly "development"
+# or "test" (see src/retention/retention-env-guard.ts; this is a deliberate
+# ALLOWLIST, not env.validation.ts's exact-string "!== production" check —
+# an unset NODE_ENV is refused, not silently treated as safe):
+NODE_ENV=development npm run retention -- --commit
+```
+
+Per `AGENT_RULES.md`, this job must never be run against `short_drama_dev`
+or any real company data — the CLI's own guard makes a misconfigured
+production run structurally difficult, but that does not itself authorize
+running it anywhere; see `TASK_QUEUE.md`'s 12D-B1 row for the full
+acceptance record.
+
+### Targets and windows
+
+| Target | Column(s) | Window | Why |
+|---|---|---|---|
+| `Session` | `revokedAt` (if set) OR `expiresAt` | 30 days | A session that is revoked or naturally expired can never authenticate again (`AuthService.refresh` rejects both), and `GET /auth/sessions` only ever lists `revokedAt: null` rows — there is no "session history" surface anywhere in this app. 30 days leaves room for a realistic "I noticed something odd a few weeks ago" investigation via `ipHash`/`userAgent`/`lastUsedAt` before the row is pruned. |
+| `AuthAuditEvent` | `createdAt` | 180 days | The operational SECURITY audit trail. Deliberately **longer** than `AnalyticsEvent` below — lower volume, higher evidentiary value per row, and a real investigation can surface weeks after the fact. Applies uniformly regardless of `userId` null-ness (see "Deleted-account residue" below). |
+| `AnalyticsEvent` | `receivedAt` | 90 days | Product telemetry — deliberately kept on a **separate, shorter** window from `AuthAuditEvent` (these two models are never merged into one TTL). This codebase has no analytics warehouse/rollup downstream of this table, so nothing reads a row older than a few months. |
+| `WatchProgress` | `updatedAt` | 730 days (2 years) | The one target that is genuinely user-**visible** data ("resume where I left off"), not backend exhaust — deleting it early is a real, noticeable product regression, not freed disk space. Growth is bounded by `active users x catalog size` (a `@@unique([userId, seriesId])` constraint), not by request volume, so there is no storage-pressure argument for an aggressive window. This is a deliberately conservative **engineering** default, not a product decision about what "abandoned" means — a human product owner may reasonably want a different number. |
+| Deleted-account residue | n/a (no time window) | n/a | See below. |
+
+Every cutoff is computed at UTC-**day** granularity (`dayGranularityCutoff` in
+`retention.util.ts`), never at hour/minute precision — see the bound inherited
+from work unit 12D-B0 below.
+
+### The `Session.revokedAt` timezone bound (inherited from 12D-B0)
+
+12D-B0 (commit `642a3af`) fixed `AuthService.changePassword`'s raw-SQL write
+to `Session.revokedAt`, which previously stored a value up to **+7 hours**
+later than the true revocation instant on this server's `Asia/Jakarta`
+(UTC+7, no DST) Postgres session `TimeZone`. Historical rows predating that
+fix were deliberately **not backfilled** (affected and correct rows are not
+reliably distinguishable after the fact, so a blanket correction would
+corrupt the correct ones).
+
+Because the skew is structurally one-directional (a stored value can only
+read **later** than reality, never earlier), a **day-granularity** retention
+window is safe: the worst case is an affected row is purged up to ~7 hours
+**late**, never early. `RetentionService` therefore never compares
+`revokedAt` at hour precision, and this bound is written directly into
+`retention.constants.ts`'s doc comments so a future maintainer does not
+"tighten" the window and silently reintroduce the risk.
+
+### Deleted-account residue
+
+A genuine **orphan** row is one with a non-null `userId` that does not
+resolve to any existing `User` row. This is deliberately **not** "any row
+with `userId IS NULL`" — `AnalyticsEvent`/`AuthAuditEvent` rows with a null
+`userId` are the intended, `DECISIONS.md` decision-2-mandated anonymized
+record of a deleted account, not residue, and this job's queries exclude
+them by construction (rows are only ever considered candidates when
+`userId` is a required column in the first place, or, for the two
+nullable-`userId` models, only when `userId: { not: null }`).
+
+Every one of the 8 `User`-relation models in `prisma/schema.prisma` carries
+a **real Postgres foreign-key constraint** (`onDelete: Cascade` for
+`Session`/`UserVideoInteraction`/`WatchProgress`/`Entitlement`/
+`PasswordResetToken`/`AccountLockout`, `onDelete: SetNull` for
+`AnalyticsEvent`/`AuthAuditEvent`) — a row referencing a nonexistent
+`userId` cannot be **inserted** at all, regardless of whether the write goes
+through Prisma's typed client or raw SQL. So under this schema's current
+constraints, a genuine orphan is expected to be **impossible**, and this
+job's correct, normal outcome is zero matches for all 8 models, always (see
+`retention.integration.spec.ts`'s direct proof that Postgres rejects an
+attempt to create one). It is still implemented as a real scan, not a
+hardcoded zero, so it keeps working as a defensive drift-detector if a
+future migration ever weakens one of these constraints.
+
 ## Interactions & Progress API (Phase 9)
 
 Backed by two new Prisma tables added in work unit 9-B1:

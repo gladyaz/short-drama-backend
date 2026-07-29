@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { JwtModule } from '@nestjs/jwt';
+import { AccountDeletionController } from './account-deletion.controller';
 import { AccountLockoutService } from './account-lockout.service';
 import { AuthAuditService } from './auth-audit.service';
 import { AuthController } from './auth.controller';
@@ -16,7 +17,12 @@ import { JwtAuthGuard } from './guards/jwt-auth.guard';
  */
 @Module({
   imports: [JwtModule.register({})],
-  controllers: [AuthController],
+  // Phase 12, work unit 12C-B1: `AccountDeletionController` hosts `POST
+  // /users/me/deletion` — a separate controller class purely because
+  // `AuthController` carries a fixed `@Controller('auth')` prefix that
+  // cannot host a bare `/users/me/deletion` route (see that controller's
+  // own doc comment).
+  controllers: [AuthController, AccountDeletionController],
   providers: [
     AuthService,
     JwtAuthGuard,

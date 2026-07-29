@@ -173,4 +173,19 @@ export enum AppErrorCode {
    * state.
    */
   INVALID_PASSWORD_RESET_TOKEN = 'INVALID_PASSWORD_RESET_TOKEN',
+  // Phase 12, work unit 12C-B1 (account deletion)
+  /**
+   * Returned by `POST /users/me/deletion` when the authenticated caller's
+   * `User.role` (loaded fresh from the database, never trusted off the
+   * access token) is not `"user"` — DECISIONS.md decision 1 restricts
+   * self-service account deletion to normal user accounts; deleting a
+   * privileged (`admin`/other) account is a separate, not-yet-built process.
+   * Deliberately DISTINCT from the generic `INVALID_CREDENTIALS`: unlike a
+   * wrong password, this is only reachable AFTER the correct current
+   * password was already verified (see `AuthService.deleteAccount`'s doc
+   * comment for why that ordering matters), so a specific, descriptive code
+   * here does not create a new information-leak surface for a caller who
+   * does not already hold the account's real password.
+   */
+  ACCOUNT_DELETION_FORBIDDEN = 'ACCOUNT_DELETION_FORBIDDEN',
 }

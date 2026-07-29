@@ -106,6 +106,30 @@ export const AUTH_AUDIT_METADATA_ALLOWLIST = {
    * regardless of which reason fired.
    */
   password_reset_confirm_failed: ['reason'],
+  /**
+   * Phase 12, work unit 12C-B1: `POST /users/me/deletion` succeeded — every
+   * session was revoked and the `User` row was deleted (cascades removed
+   * every other row this account owns; `AnalyticsEvent` and this very
+   * table's OTHER rows for the account anonymize via `SetNull`, per
+   * DECISIONS.md decision 2). Deliberately emitted WITHOUT a `userId` — see
+   * `AuthService.deleteAccount`'s doc comment for the full reasoning: the
+   * account no longer exists by the time this fires, and a dangling FK
+   * reference would be REJECTED outright at insert time, not merely nulled
+   * (`onDelete: SetNull` only fires when the REFERENCED row is deleted, not
+   * when a new row is inserted pointing at an id that never/no-longer
+   * exists). No metadata needed.
+   */
+  account_deletion_success: [],
+  /**
+   * `POST /users/me/deletion` was refused. `reason` distinguishes
+   * `invalid_current_password` (mirrors `change_password_failed`'s identical
+   * reason string exactly) from `role_not_allowed` (DECISIONS.md decision
+   * 1's normal-user-only restriction — an `admin`/other privileged account
+   * attempted self-service deletion). The account still exists in BOTH
+   * cases (the request was refused before anything was touched), so
+   * `userId` IS included here, unlike the success event above.
+   */
+  account_deletion_failed: ['reason'],
 } as const satisfies Record<string, readonly string[]>;
 
 export type AuthAuditEventName = keyof typeof AUTH_AUDIT_METADATA_ALLOWLIST;

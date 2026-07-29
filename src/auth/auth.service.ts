@@ -3,7 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import * as bcrypt from 'bcryptjs';
 import { createHmac, randomBytes } from 'crypto';
-import type { Prisma, User } from '@prisma/client';
+import { Prisma, type User } from '@prisma/client';
 import { RootConfig } from '../config/configuration';
 import { AppErrorCode } from '../common/errors/app-error-code';
 import { AppException } from '../common/errors/app.exception';
@@ -28,6 +28,7 @@ import {
   PasswordResetRequestResponseDto,
   SessionSummaryDto,
 } from './auth.types';
+import { AccountDeletionDto } from './dto/account-deletion.dto';
 import { ChangePasswordDto } from './dto/change-password.dto';
 import { LoginDto } from './dto/login.dto';
 import { PasswordResetConfirmDto } from './dto/password-reset-confirm.dto';
@@ -82,6 +83,45 @@ function invalidPasswordResetToken(): AppException {
     AppErrorCode.INVALID_PASSWORD_RESET_TOKEN,
     'Invalid or expired password reset token',
     HttpStatus.UNAUTHORIZED,
+  );
+}
+
+/**
+ * Fix cycle 1 (test-reviewer finding, follow-up to work unit 12C-B1):
+ * `Session_userId_fkey` (`prisma/migrations/20260723055428_init_postgresql/
+ * migration.sql`) is the Postgres foreign key that makes a `Session` row
+ * referencing a nonexistent `User` structurally impossible at the database
+ * level. Before `deleteAccount` (12C-B1) shipped, nothing in this file could
+ * ever violate it — every `client.session.create()` call sees a `userId`
+ * this same request just read (`register`/`login`), or already verified
+ * still resolves to a real user (`refresh`, `changePassword`), moments
+ * earlier. `deleteAccount` introduced the first code path that can
+ * hard-delete the `User` row out from under that assumption: a `login()` or
+ * `refresh()` racing a CONCURRENT `deleteAccount()` for the SAME account can
+ * have the `User` row vanish in the narrow window between this request's own
+ * existence check and `issueTokensAndSession`'s `session.create()` —
+ * Postgres then rejects the insert with `P2003`, which nothing previously
+ * caught, so it fell through to `AppExceptionFilter`'s generic catch-all as
+ * an undocumented, raw `500` instead of the clean, already-established
+ * "user vanished mid-flight" error each caller uses elsewhere in this file.
+ *
+ * Matches ONLY the exact constraint `issueTokensAndSession`'s own
+ * `session.create()` can violate (`error.meta.constraint`, verified
+ * empirically against this project's Prisma 6.19.3 + Postgres combination),
+ * not a bare `error.code === 'P2003'` check — `Session` has exactly one
+ * foreign key today, so this is currently redundant, but it costs nothing
+ * and means a future second FK on `Session` (or any other `P2003` this
+ * function might one day encounter) is never silently reinterpreted as "the
+ * user vanished" by this narrow catch.
+ */
+const SESSION_USER_FOREIGN_KEY_VIOLATION = 'P2003';
+const SESSION_USER_FOREIGN_KEY_CONSTRAINT = 'Session_userId_fkey';
+
+function isSessionUserForeignKeyViolation(error: unknown): boolean {
+  return (
+    error instanceof Prisma.PrismaClientKnownRequestError &&
+    error.code === SESSION_USER_FOREIGN_KEY_VIOLATION &&
+    error.meta?.constraint === SESSION_USER_FOREIGN_KEY_CONSTRAINT
   );
 }
 
@@ -225,7 +265,20 @@ export class AuthService {
       ip: context.ip,
       userAgent: context.userAgent,
     });
-    return this.issueTokensAndSession(user, context);
+    // Fix cycle 1 (test-reviewer finding, follow-up to 12C-B1): explicit
+    // `invalidCredentials` (this method's own established error for every
+    // other "no valid account here" outcome above) for the narrow window
+    // where a concurrent `deleteAccount()` deletes this same `user.id`
+    // between the check above and `issueTokensAndSession`'s `session.create`
+    // — see that method's `onUserVanished` doc comment. This is also the
+    // default, so passing it explicitly here changes no behavior; it is
+    // spelled out because this call site is exactly what this fix is for.
+    return this.issueTokensAndSession(
+      user,
+      context,
+      this.prisma,
+      invalidCredentials,
+    );
   }
 
   async refresh(
@@ -336,7 +389,20 @@ export class AuthService {
       throw invalidRefreshToken();
     }
 
-    return this.issueTokensAndSession(user, context);
+    // Fix cycle 1 (test-reviewer finding, follow-up to 12C-B1): explicit
+    // `invalidRefreshToken` — this method's own established error for every
+    // other "this refresh token/session is no longer valid" outcome above
+    // (unknown token, reuse of a revoked token, expired, lost the rotation
+    // race) — for the narrow window where a concurrent `deleteAccount()`
+    // deletes this session's `user.id` between the existence check above and
+    // `issueTokensAndSession`'s `session.create`. See that method's
+    // `onUserVanished` doc comment.
+    return this.issueTokensAndSession(
+      user,
+      context,
+      this.prisma,
+      invalidRefreshToken,
+    );
   }
 
   async logout(refreshToken: string): Promise<void> {
@@ -399,11 +465,26 @@ export class AuthService {
    * SAME `authAuditIpHashSecret` — so a given raw IP/user-agent value is
    * guaranteed to hash/sanitize identically whether it ends up on an audit
    * row or a session row.
+   *
+   * Fix cycle 1 (test-reviewer finding, follow-up to work unit 12C-B1):
+   * `onUserVanished` lets each caller supply the SAME "user no longer
+   * exists" error it already throws for every other version of this
+   * condition, for the one additional way it can now surface here — a
+   * concurrent `deleteAccount()` deleting `user.id` between this call's own
+   * existence check and the `session.create()` below (see
+   * `isSessionUserForeignKeyViolation`'s doc comment). Defaults to
+   * `invalidCredentials` (matching `register`/`login`'s anti-enumeration
+   * posture — a wrong password and a vanished account must stay
+   * indistinguishable) since that is the more restrictive of this file's two
+   * "user vanished" errors; `refresh()` passes `invalidRefreshToken`
+   * explicitly instead, matching what it already throws for every other
+   * "this session/user is no longer valid" case a few lines above.
    */
   private async issueTokensAndSession(
     user: Pick<User, 'id' | 'email' | 'displayName'>,
     context: AuthRequestContext = {},
     client: PrismaClientLike = this.prisma,
+    onUserVanished: () => AppException = invalidCredentials,
   ): Promise<AuthResponseDto> {
     const authConfig = this.configService.get('auth', { infer: true })!;
 
@@ -432,21 +513,39 @@ export class AuthService {
         : undefined;
     const now = new Date();
 
-    await client.session.create({
-      data: {
-        userId: user.id,
-        refreshTokenHash,
-        expiresAt: new Date(Date.now() + REFRESH_TOKEN_TTL_MS),
-        userAgent: userAgent ?? null,
-        ipHash: ipHash ?? null,
-        // The moment this session slot was (re)issued — see this class's
-        // `Session.lastUsedAt` schema doc comment for why "created" and
-        // "refreshed" are the only two events that ever touch this column
-        // in this codebase's current design.
-        lastUsedAt: now,
-      },
-      select: { id: true },
-    });
+    try {
+      await client.session.create({
+        data: {
+          userId: user.id,
+          refreshTokenHash,
+          expiresAt: new Date(Date.now() + REFRESH_TOKEN_TTL_MS),
+          userAgent: userAgent ?? null,
+          ipHash: ipHash ?? null,
+          // The moment this session slot was (re)issued — see this class's
+          // `Session.lastUsedAt` schema doc comment for why "created" and
+          // "refreshed" are the only two events that ever touch this column
+          // in this codebase's current design.
+          lastUsedAt: now,
+        },
+        select: { id: true },
+      });
+    } catch (error) {
+      // Fix cycle 1 (test-reviewer finding, follow-up to 12C-B1): narrowly
+      // catches ONLY the specific FK violation a concurrent `deleteAccount()`
+      // can cause (see `isSessionUserForeignKeyViolation`'s doc comment just
+      // above this class) and maps it to the caller-supplied "user vanished"
+      // error. Deliberately NOT a broad `catch` of every error this
+      // statement could throw — an unrelated database failure (connection
+      // loss, a genuinely unexpected constraint, etc.) still propagates
+      // unchanged and still surfaces as a 500, exactly as before this fix:
+      // silently reinterpreting an unrelated failure as "invalid
+      // credentials"/"invalid refresh token" would trade a visible,
+      // diagnosable error for a much worse, misleading one.
+      if (isSessionUserForeignKeyViolation(error)) {
+        throw onUserVanished();
+      }
+      throw error;
+    }
 
     return {
       user: {
@@ -1360,6 +1459,216 @@ export class AuthService {
 
     await this.authAuditService.emit('password_reset_confirmed', {
       userId: resetToken.userId,
+      ip: context.ip,
+      userAgent: context.userAgent,
+    });
+  }
+
+  /**
+   * Phase 12, work unit 12C-B1: `POST /users/me/deletion` (DECISIONS.md
+   * "Phase 12 ... approved..." entry, decision 1: immediate hard deletion
+   * after an explicit irreversible confirmation plus current-password
+   * re-authentication; revoke every session and delete the `User` row
+   * inside ONE transaction; no grace period; normal-user-only).
+   *
+   * `dto.confirmDeletion` is validated by `AccountDeletionDto` (`@IsBoolean()`
+   * + `@Equals(true)`) at the global `ValidationPipe` BEFORE this method is
+   * ever reached — a request missing it, or sending `false`, never gets
+   * here at all (a clean `400`, never a silent proceed). This method's own
+   * job starts from "the caller genuinely intends this."
+   *
+   * ORDER OF CHECKS (deliberate, not incidental):
+   *   1. Does the access token's `userId` still resolve to a real `User`?
+   *      A "no" here is BOTH this endpoint's idempotency story (a second
+   *      call after the account was already deleted lands here) AND the
+   *      existing, established "authenticated but the user no longer
+   *      exists" precedent (`getUserById`/`changePassword` both throw the
+   *      SAME `INVALID_ACCESS_TOKEN`/401 for this exact condition) — reused
+   *      verbatim rather than inventing a new "already deleted" response
+   *      shape, so a repeated call behaves safely and predictably (a
+   *      clean, documented 401), never an unhandled 500.
+   *   2. Is `dto.currentPassword` correct? Checked BEFORE the role check
+   *      below, deliberately: this is an authenticated endpoint (no
+   *      email-enumeration concern), but `User.role` is never surfaced by
+   *      any other endpoint this app exposes to its own owner (`GET
+   *      /auth/me` returns only `id`/`email`/`displayName` — see
+   *      `AuthUserDto`), so checking role BEFORE password would let a
+   *      caller holding a stolen-but-still-valid access token (without
+   *      knowing the password) learn "this account is privileged" for
+   *      free. Checking password first means that oracle is only
+   *      reachable by someone who ALREADY knows the password — at which
+   *      point they already have full control of the account through
+   *      every other authenticated route anyway, so nothing new leaks. A
+   *      wrong password fails with the SAME generic `INVALID_CREDENTIALS`
+   *      `login`/`changePassword` already use.
+   *   3. Is `user.role === 'user'`? Any other role is refused with a
+   *      DISTINCT, descriptive `403 ACCOUNT_DELETION_FORBIDDEN` (not the
+   *      generic `INVALID_CREDENTIALS`) — safe to be specific here per
+   *      point 2 above (only reachable with the correct password already
+   *      verified), and per decision 1, deleting a privileged account is a
+   *      separate, not-yet-built process this phase deliberately does not
+   *      create.
+   *
+   * SESSION REVOCATION + USER DELETION, ONE TRANSACTION: an explicit
+   * `session.updateMany({ revokedAt: ... })` runs first (the frozen
+   * contract's literal "revoke-all-sessions" step, mirroring `logoutAll`'s
+   * identical shape — deadlock-safe for the same reason documented there:
+   * every concurrent caller's statement converges on the same end state,
+   * so there is no lock-ordering cycle to form), immediately followed by
+   * `user.deleteMany` (NOT `user.delete` — see the idempotency paragraph
+   * below) in the SAME `prisma.$transaction`. The explicit revoke is
+   * technically redundant with what the subsequent delete's cascade already
+   * accomplishes (every `Session` row for this account is removed outright,
+   * a strictly stronger outcome than "revoked but still present") — it is
+   * kept anyway so the "sessions revoked" step is explicit in its own
+   * right, matching this codebase's established pattern for every other
+   * multi-effect auth mutation (`changePassword`, `confirmPasswordReset`),
+   * rather than having this method's behavior depend on cascade
+   * configuration alone.
+   *
+   * `user.deleteMany` (not `user.delete`) makes the delete step itself
+   * idempotent/non-throwing under a genuine concurrent-double-submit race:
+   * `delete` throws `PrismaClientKnownRequestError` (`P2025`, "record not
+   * found") if the row is already gone by the time this statement runs
+   * (e.g. two near-simultaneous requests both pass the checks above, then
+   * race to delete) — an unhandled error this method's own contract
+   * explicitly prohibits. `deleteMany` instead simply matches zero rows and
+   * returns `{ count: 0 }`; this method does not need to distinguish "I
+   * deleted it" (count 1) from "someone else's concurrent call already
+   * had" (count 0) — by the time either caller's transaction returns, the
+   * account IS deleted either way, which is the only thing either caller
+   * actually asked for. No raw SQL is used anywhere in this method — every
+   * statement is Prisma's typed ORM, which (unlike the `$queryRaw` calls
+   * elsewhere in this file that touch `timestamp` columns) already writes
+   * correct UTC values with no `AT TIME ZONE` handling needed.
+   *
+   * CASCADES RELIED ON, NOT RE-IMPLEMENTED (verified against
+   * `prisma/schema.prisma`/the generated migration SQL): `Session`,
+   * `UserVideoInteraction`, `WatchProgress`, `Entitlement`,
+   * `PasswordResetToken`, and `AccountLockout` are all `onDelete: Cascade`
+   * — every row this account owns in those tables is REMOVED outright by
+   * the single `user.deleteMany` below, with no separate cleanup code
+   * needed (and none written) here; a deleted-then-re-registered email
+   * therefore cannot inherit a stale `AccountLockout` row (it is gone, not
+   * merely orphaned). `AnalyticsEvent.userId` and `AuthAuditEvent.userId`
+   * are `onDelete: SetNull` — those rows SURVIVE, anonymized (no email, no
+   * raw IP, no other identifying metadata — see `AUTH_AUDIT_METADATA_ALLOWLIST`'s
+   * existing allowlist and `AnalyticsService`'s equivalent), satisfying
+   * DECISIONS.md decision 2 without any change to either schema or
+   * emission path.
+   *
+   * `AuthAuditEvent` FOR THE DELETION ITSELF — the exact tension this work
+   * unit's own review checklist calls out: an audit row created for THIS
+   * deletion, if it referenced `userId`, would have that very reference
+   * nulled by the `SetNull` cascade the delete triggers (same as every
+   * historical audit row for this account) — so what does "audited" mean
+   * once the row it would reference no longer exists? Two shapes were
+   * considered: (a) write the audit row INSIDE the same transaction,
+   * before the delete, so its insert can validly reference `userId` for an
+   * instant before being nulled by the cascade a moment later; or (b) write
+   * it AFTER the transaction has already committed, deliberately WITHOUT
+   * `userId` at all. (b) is what this method does, for two reasons. First,
+   * correctness under failure: `AuthAuditService.emit` is deliberately
+   * BEST-EFFORT (it swallows its own errors, per its own doc comment)
+   * precisely so an audit-write failure can never break the flow it
+   * observes — but that same property makes it the WRONG tool to call for
+   * a "did this really happen" row from INSIDE a transaction whose success
+   * is exactly what's in question: emitting before/during the transaction
+   * risks recording "success" for a deletion that then fails to commit.
+   * The success event below is therefore emitted ONLY after `$transaction`
+   * has returned without throwing, so it is never written for a deletion
+   * that did not actually happen — matching this class's OWN established
+   * "emit right after the state-changing write that already durably
+   * happened, not inside a still-uncertain operation" precedent
+   * (`register`/`login` already emit `register_success`/`login_success`
+   * this same way, non-transactionally, right after their own
+   * `user.create`/lookup). Second, attempting to CREATE a brand-new
+   * `AuthAuditEvent` row that references `userId` for a user that no
+   * longer exists (i.e. emitting AFTER commit, WITH the id) would violate
+   * the very foreign key this schema relies on — inserting a non-null FK
+   * value that matches no existing row is rejected at the database level
+   * regardless of `onDelete: SetNull` (that action only fires when the
+   * REFERENCED row is deleted, never on an INSERT of a dangling reference)
+   * — so recording `userId` post-commit is not merely stylistically wrong,
+   * it would concretely fail. Omitting `userId` entirely for
+   * `account_deletion_success` (never passing it, so it stores `null` —
+   * see `EmitAuthAuditEventParams`'s existing "omit entirely, don't pass a
+   * stale value" convention) sidesteps both problems while still leaving a
+   * genuinely useful audit trail: an operator can query `AuthAuditEvent`
+   * for `event = 'account_deletion_success'` and get an accurate,
+   * timestamped COUNT of real account deletions — this table's whole
+   * purpose for a deleted account, per its own schema doc comment ("survive
+   * the attacker later deleting the compromised account") — without
+   * retaining any link back to WHICH account, which decision 2 requires
+   * anyway. This exactly mirrors `login_failed`'s existing "unresolved
+   * email → no `userId`, nothing to link to" case, just for the opposite
+   * direction (no longer anything TO link to, rather than not yet). The
+   * two FAILURE events below (`account_deletion_failed`) are the OPPOSITE
+   * case: the account is NOT being deleted (the request was refused), so it
+   * still exists, `userId` is included exactly like `change_password_failed`
+   * already does, and there is no FK/`SetNull` tension to resolve.
+   *
+   * IDOR-safety: this method only ever acts on the `userId` resolved from
+   * the caller's OWN verified access token (`JwtAuthGuard` /
+   * `@CurrentUser()`) — there is no id-shaped input anywhere in
+   * `AccountDeletionDto`, so there is no client-supplied identifier for a
+   * cross-account attempt to even target.
+   */
+  async deleteAccount(
+    userId: string,
+    dto: AccountDeletionDto,
+    context: AuthRequestContext = {},
+  ): Promise<void> {
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+
+    if (!user) {
+      throw new AppException(
+        AppErrorCode.INVALID_ACCESS_TOKEN,
+        'Invalid or expired access token',
+        HttpStatus.UNAUTHORIZED,
+      );
+    }
+
+    const passwordMatches = await bcrypt.compare(
+      dto.currentPassword,
+      user.passwordHash,
+    );
+
+    if (!passwordMatches) {
+      await this.authAuditService.emit('account_deletion_failed', {
+        userId,
+        ip: context.ip,
+        userAgent: context.userAgent,
+        metadata: { reason: 'invalid_current_password' },
+      });
+      throw invalidCredentials();
+    }
+
+    if (user.role !== 'user') {
+      await this.authAuditService.emit('account_deletion_failed', {
+        userId,
+        ip: context.ip,
+        userAgent: context.userAgent,
+        metadata: { reason: 'role_not_allowed' },
+      });
+      throw new AppException(
+        AppErrorCode.ACCOUNT_DELETION_FORBIDDEN,
+        'Self-service account deletion is not available for this account type',
+        HttpStatus.FORBIDDEN,
+      );
+    }
+
+    const now = new Date();
+    await this.prisma.$transaction(async (tx) => {
+      await tx.session.updateMany({
+        where: { userId, revokedAt: null },
+        data: { revokedAt: now },
+      });
+
+      await tx.user.deleteMany({ where: { id: userId } });
+    });
+
+    await this.authAuditService.emit('account_deletion_success', {
       ip: context.ip,
       userAgent: context.userAgent,
     });

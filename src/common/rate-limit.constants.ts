@@ -70,3 +70,25 @@ export const PASSWORD_RESET_REQUEST_RATE_TTL_MS = minutes(10);
  */
 export const PASSWORD_RESET_CONFIRM_RATE_LIMIT = 5;
 export const PASSWORD_RESET_CONFIRM_RATE_TTL_MS = seconds(60);
+
+/**
+ * Phase 12, work unit 12C-B1: `POST /users/me/deletion` is an AUTHENTICATED
+ * route — like `change-password`/`logout-all`/`sessions`, which deliberately
+ * rely on the app-wide default throttler rather than a dedicated override
+ * (see `TASK_QUEUE.md`'s Phase 12 follow-ups, item 2) — but this route gets
+ * its OWN, much tighter limit instead of following that precedent. The
+ * reasoning differs materially: this action is IRREVERSIBLE (DECISIONS.md
+ * decision 1 — immediate hard delete, no grace period, no cancellation),
+ * so a caller holding a stolen-but-still-valid access token who does not
+ * already know the account's password gets far fewer `currentPassword`
+ * guesses before being throttled than the 300/60s default would allow,
+ * meaningfully raising the cost of the single most destructive action this
+ * API exposes. 5 requests per 15 minutes mirrors the persistent
+ * account-lockout threshold's own 15-minute window magnitude
+ * (`LOCKOUT_WINDOW_MS`/`LOCKOUT_DURATION_MS` in
+ * `src/auth/auth.constants.ts`) while staying generous enough for a
+ * legitimate user who mistypes their password once or twice during a
+ * genuine deletion attempt.
+ */
+export const ACCOUNT_DELETION_RATE_LIMIT = 5;
+export const ACCOUNT_DELETION_RATE_TTL_MS = minutes(15);

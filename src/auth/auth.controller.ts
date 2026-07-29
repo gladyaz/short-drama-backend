@@ -26,7 +26,6 @@ import {
 } from '../common/rate-limit.constants';
 import { AuthService } from './auth.service';
 import {
-  AuthRequestContext,
   AuthResponseDto,
   AuthUserDto,
   PasswordResetRequestResponseDto,
@@ -41,25 +40,7 @@ import { RefreshTokenDto } from './dto/refresh-token.dto';
 import { RegisterDto } from './dto/register.dto';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
 import type { AuthenticatedUser } from './guards/jwt-auth.guard';
-
-/**
- * Phase 12, work unit 12A-B3: extracts the RAW client IP / `User-Agent`
- * header from the Express request so `AuthService` can thread them through
- * to `AuthAuditService.emit`. Deliberately just a plain read of
- * `request.ip`/`request.get('user-agent')` — no `trust proxy` configuration
- * is set up in `main.ts`, matching this app's existing behavior everywhere
- * else (nothing in this repo today parses `X-Forwarded-For`); hashing/
- * truncation/sanitization all happen downstream in `AuthAuditService`, never
- * here. `request.get(name)` (unlike indexing `request.headers` directly) is
- * Express's own typed accessor and always returns a single `string |
- * undefined` for any header name other than `set-cookie`.
- */
-function requestContext(request: Request): AuthRequestContext {
-  return {
-    ip: request.ip,
-    userAgent: request.get('user-agent'),
-  };
-}
+import { requestContext } from './request-context';
 
 @Controller('auth')
 export class AuthController {

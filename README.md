@@ -557,6 +557,97 @@ reset token for a deleted account is discarded along with it.
   looking the user up explicitly. This tradeoff was noted during the 8-B6
   review and accepted for this phase to keep per-request auth cheap.
 
+## Data Export API (Phase 12, work unit 12C-B2)
+
+### `GET /users/me/export`
+
+Authenticated (`JwtAuthGuard`). No id in the path or query — the export is
+always for the caller's own account, resolved exclusively from the verified
+access token. Synchronous JSON response (per `DECISIONS.md` decision 5 —
+**no** `DataExport` storage model, background job, or expiring cloud link
+this phase):
+
+```json
+{
+  "exportedAt": "2026-07-29T00:00:00.000Z",
+  "profile": {
+    "email": "user@example.com",
+    "displayName": "Display Name or null",
+    "memberSince": "2026-01-01T00:00:00.000Z"
+  },
+  "interactions": [
+    {
+      "videoId": "video-104-01",
+      "videoTitle": "Episode title, or null if the video no longer exists",
+      "isLiked": true,
+      "isSaved": false,
+      "updatedAt": "2026-07-29T00:00:00.000Z"
+    }
+  ],
+  "watchProgress": [
+    {
+      "seriesId": "series-104",
+      "videoId": "video-104-01",
+      "videoTitle": "Episode title, or null",
+      "episodeNumber": 1,
+      "positionSeconds": 42,
+      "durationSeconds": 300,
+      "updatedAt": "2026-07-29T00:00:00.000Z"
+    }
+  ],
+  "entitlements": [
+    {
+      "tier": "premium",
+      "source": "dev-grant",
+      "grantedAt": "2026-07-29T00:00:00.000Z",
+      "expiresAt": null,
+      "revokedAt": null
+    }
+  ]
+}
+```
+
+**What is deliberately excluded** (DECISIONS.md decision 5): every internal
+database id (including the account's own `User.id`), `role`, `passwordHash`,
+every `Session` field (a refresh-token hash, `ipHash`, `userAgent`,
+timestamps — `GET /auth/sessions` is the correct surface for that, a
+different concern), the entire `AuthAuditEvent`/`AccountLockout`/
+`PasswordResetToken` tables (security/audit metadata), and every `Video`
+storage field (`storageKey`/`objectStorageKey`/`coverImageKey`/
+`thumbnailImageKey`) — resolving a video's `title` for a `videoId` uses an
+explicit Prisma `select: { id, title }`, so no storage path is ever even
+fetched. Product analytics (`AnalyticsEvent`) is deliberately **not**
+included either — see the doc comment in `src/export/export.types.ts` for
+the full reasoning on both calls.
+
+`videoId`/`seriesId` themselves ARE included: they are catalog identifiers
+the client already holds from `/videos/feed`, not internal surrogate ids, and
+without them the interactions/watch-progress entries would be meaningless
+("you liked 1 thing" with no way to tell which one).
+
+Entitlement history (not just the single current-status boolean `GET
+/users/me/entitlement` returns) is included, newest-first, since a personal
+export's point is completeness of "what happened to my account."
+
+A fresh account with no interactions/progress/entitlements exports cleanly —
+every collection is simply `[]`, never an error.
+
+Emits an `AuthAuditEvent` (`data_export_success`, with the caller's `userId`)
+after a successful export — a data export is treated as a security-relevant
+action worth being able to investigate later, even though the action itself
+is read-only.
+
+Errors: `401 INVALID_ACCESS_TOKEN` — no `Authorization` header, or a token
+whose account has since been deleted (the same generic error `GET /auth/me`
+already uses for the identical condition, since `JwtAuthGuard` verifies the
+token without a database hit). Rate-limited to **10 requests per 5 minutes**
+— tighter than the app-wide default (a single call reads several tables and
+returns the caller's entire personal dataset at once, a materially cheaper
+target for a stolen-token harvesting loop than scraping each `/users/me/*`
+endpoint individually) but far more generous than account deletion's 5/15min
+(export is read-only and fully reversible, so a legitimate retry/re-export
+should not be punished).
+
 ## Interactions & Progress API (Phase 9)
 
 Backed by two new Prisma tables added in work unit 9-B1:

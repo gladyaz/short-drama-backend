@@ -130,6 +130,19 @@ export const AUTH_AUDIT_METADATA_ALLOWLIST = {
    * `userId` IS included here, unlike the success event above.
    */
   account_deletion_failed: ['reason'],
+  /**
+   * Phase 12, work unit 12C-B2: `GET /users/me/export` succeeded — the
+   * caller's own personal-data export was assembled and returned. Recorded
+   * because a data export is a security-relevant action worth being able to
+   * investigate later (e.g. "was this account's data harvested shortly
+   * before/after a suspicious login"), even though the action itself is
+   * read-only and not destructive. No metadata needed — the response body
+   * itself is never logged anywhere (see `ExportService`), so there is
+   * nothing non-sensitive left to record beyond "this happened, for this
+   * user, at this time," which the row's own `userId`/`createdAt` already
+   * capture.
+   */
+  data_export_success: [],
 } as const satisfies Record<string, readonly string[]>;
 
 export type AuthAuditEventName = keyof typeof AUTH_AUDIT_METADATA_ALLOWLIST;

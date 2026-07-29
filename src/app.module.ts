@@ -15,6 +15,7 @@ import {
 import configuration from './config/configuration';
 import { validateEnv } from './config/env.validation';
 import { EntitlementsModule } from './entitlements/entitlements.module';
+import { ExportModule } from './export/export.module';
 import { HealthModule } from './health/health.module';
 import { InteractionsModule } from './interactions/interactions.module';
 import { MediaModule } from './media/media.module';
@@ -57,6 +58,7 @@ import { VideosModule } from './videos/videos.module';
     InteractionsModule,
     ProgressModule,
     EntitlementsModule,
+    ExportModule,
     AnalyticsModule,
     StorageModule,
     AdminModule,

@@ -92,3 +92,37 @@ export const PASSWORD_RESET_CONFIRM_RATE_TTL_MS = seconds(60);
  */
 export const ACCOUNT_DELETION_RATE_LIMIT = 5;
 export const ACCOUNT_DELETION_RATE_TTL_MS = minutes(15);
+
+/**
+ * Phase 12, work unit 12C-B2: `GET /users/me/export` is another AUTHENTICATED
+ * route, like `change-password`/`logout-all`/`sessions` (which rely on the
+ * app-wide default throttler — see the Phase 12 follow-ups note in
+ * `TASK_QUEUE.md`, item 2) and like `POST /users/me/deletion` above (which
+ * deliberately does NOT rely on the default). This route gets its own
+ * dedicated, moderately tighter override rather than either extreme:
+ *
+ * - NOT the generous 300/60s default: unlike a typical authenticated GET
+ *   (`GET /users/me/interactions`, `GET /users/me/progress`, `GET
+ *   /auth/sessions`), a single call here does several extra reads (profile +
+ *   interactions + watch progress + entitlements + a batched video-title
+ *   lookup) and returns the caller's ENTIRE personal dataset in one response
+ *   body. A caller holding a stolen-but-still-valid access token could use
+ *   the generous default to harvest that full dataset up to 300 times a
+ *   minute with effectively no cost — a materially cheaper exfiltration path
+ *   than scraping the individual `/users/me/interactions`/`/users/me/progress`
+ *   endpoints separately, and each call is also more expensive for this
+ *   server to serve than those single-table reads.
+ * - NOT as tight as `ACCOUNT_DELETION_RATE_LIMIT` (5/15min): export is
+ *   read-only and fully reversible (unlike deletion, which is permanent by
+ *   design per DECISIONS.md decision 1), and a legitimate user may
+ *   reasonably want to re-export more than once in a short window (e.g.
+ *   retrying after a dropped connection, or trying a second client/viewer
+ *   for the downloaded JSON) — an aggressive limit here would punish normal
+ *   use of a harmless, non-destructive action.
+ *
+ * 10 requests per 5 minutes is generous enough for any legitimate
+ * re-export/retry pattern while still bounding a stolen-token harvesting
+ * loop to a small, fixed number of full-dataset dumps per window.
+ */
+export const DATA_EXPORT_RATE_LIMIT = 10;
+export const DATA_EXPORT_RATE_TTL_MS = minutes(5);

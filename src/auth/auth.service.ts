@@ -811,9 +811,33 @@ export class AuthService {
         // `prisma/migrations/20260723055428_init_postgresql/migration.sql`
         // — uses the exact-cased, quoted identifiers reproduced here:
         // `"Session"`, `"userId"`, `"revokedAt"`, `"id"`).
+        //
+        // `AT TIME ZONE 'UTC'` on the write (`${now}`) side is REQUIRED, not
+        // decorative (Phase 12, work unit 12D-B0 — this was a CRITICAL
+        // defect from 12B-B1 until fixed here). `"revokedAt"` is a
+        // `timestamp(3) WITHOUT time zone` column, and Prisma's own ORM
+        // writes UTC wall-clock digits into it everywhere else in this file
+        // (e.g. the `tx.session.updateMany({ data: { revokedAt: ... } })`
+        // calls a few lines below and in `refresh`/`logoutAll`/etc.). A raw
+        // `$queryRaw` `Date` parameter, in contrast, binds as `timestamptz`;
+        // assigning it directly to a naive column makes Postgres silently
+        // reinterpret it using the DATABASE SESSION'S configured `TimeZone`
+        // (NOT necessarily UTC — this project's Postgres instance is
+        // `Asia/Jakarta`, UTC+7, confirmed via `SHOW TimeZone`), corrupting
+        // the stored value by that offset. `AT TIME ZONE 'UTC'` pins the
+        // conversion to UTC explicitly, matching what the ORM already does
+        // everywhere else in this codebase, and mirrors the identical idiom
+        // used by `confirmPasswordReset`'s `"usedAt" = ${now} AT TIME ZONE
+        // 'UTC'` and `AccountLockoutService.recordFailure`'s `(${now} AT
+        // TIME ZONE 'UTC')` below. The predicate
+        // (`WHERE "userId" = ... AND "revokedAt" IS NULL`) is UNCHANGED —
+        // this fix is scoped strictly to the timezone handling of the value
+        // written, not the statement shape 12B-B1 fought 3 fix cycles to
+        // land (see this method's doc comment above for why that shape is
+        // load-bearing for deadlock-safety and race-resolution).
         const revokedSessions = await tx.$queryRaw<{ id: string }[]>`
           UPDATE "Session"
-          SET "revokedAt" = ${now}
+          SET "revokedAt" = ${now} AT TIME ZONE 'UTC'
           WHERE "userId" = ${userId} AND "revokedAt" IS NULL
           RETURNING "id"
         `;

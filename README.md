@@ -556,6 +556,49 @@ reset token for a deleted account is discarded along with it.
   (~15 minutes), even though `GET /auth/me` itself does catch this case by
   looking the user up explicitly. This tradeoff was noted during the 8-B6
   review and accepted for this phase to keep per-request auth cheap.
+- **Historical `Session.revokedAt` values written by `changePassword` before
+  Phase 12, work unit 12D-B0, may be skewed by this server's Postgres
+  session `TimeZone` (`Asia/Jakarta`, UTC+7 — confirmed via `SHOW
+  TimeZone`).** `AuthService.changePassword`'s revoke-all-sessions
+  statement is raw SQL (`tx.$queryRaw`, required for its `RETURNING "id"`
+  race-resolution clause — see that method's doc comment), and until this
+  work unit assigned a JS `Date` parameter (which Prisma binds as
+  `timestamptz`) directly to the naive `timestamp(3)` `"revokedAt"` column
+  with no `AT TIME ZONE 'UTC'` conversion. Postgres silently reinterpreted
+  the instant using the session's local offset, storing a value measured at
+  ~7 hours (25,200,000ms) LATER than the true revoke instant. This is now
+  fixed (the statement writes `${now} AT TIME ZONE 'UTC'`, mirroring the
+  existing correct idiom in `confirmPasswordReset` and
+  `AccountLockoutService.recordFailure`), verified by a real-database
+  regression test (`src/auth/change-password-session-timezone.spec.ts`) and
+  confirmed non-vacuous by a mutation test (removing the conversion
+  reproduces the ~7-hour-skewed failure). **Rows written before this fix are
+  deliberately left uncorrected**: `Session` has no `revokedBy`/
+  `revokedReason` column, and every OTHER revocation path
+  (`logout`/`logoutAll`/`revokeSession`/`refresh`'s reuse-detection
+  sweep/`confirmPasswordReset`, and even `changePassword`'s OWN second
+  defensive sweep a few lines below the raw SQL) writes `revokedAt` via
+  Prisma's typed ORM, which was independently verified (empirically, via a
+  real `.create()` call logged and compared against the JS wall clock) to
+  already store the correct UTC instant regardless of session timezone — so
+  a historically-corrupted row is not reliably distinguishable, after the
+  fact, from a correct one (a same-account `AuthAuditEvent` timestamp
+  correlation is not precise enough, since the skew's exact magnitude was
+  never itself recorded, multiple `change_password_success` events can exist
+  per account, and the two sweeps within one `changePassword` transaction
+  share the same audit event with no per-row attribution). A blanket
+  "shift every value by 7 hours" backfill would therefore corrupt the
+  (unknown, but likely larger) set of already-correct rows it cannot avoid
+  touching, so no data migration was made — a destructive/irreversible
+  correction is a hard prohibition for this phase regardless. **For Phase
+  12D-B1 (retention/cleanup):** the skew, where it exists, is one-directional
+  (an affected row's `revokedAt` reads ~7 hours LATER than reality, never
+  earlier), so a coarse, multi-day retention window (e.g. "purge sessions
+  revoked more than N days ago") is not at risk of deleting data
+  prematurely from this specific defect — at worst an affected row is kept
+  for a few hours longer than strictly necessary before the next run
+  catches it. Retention logic should not, however, assume `revokedAt` is
+  precise to the hour for any row that predates this fix.
 
 ## Data Export API (Phase 12, work unit 12C-B2)
 

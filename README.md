@@ -1301,32 +1301,55 @@ node/app version — an operator signal beyond the public liveness ping at
 `GET /health`.
 
 As of Phase 11, work unit 11G-4, it also includes a `storage` section — a
-secret-free storage-readiness signal:
+secret-free storage-readiness signal (Phase 11, work unit 11I-B1 corrected
+its `r2` definition and added `publicDeliveryAvailable`):
 
 ```json
 { "storage": { "driver": "local", "ready": true, "configPresent": true } }
 ```
 
+```json
+{
+  "storage": {
+    "driver": "r2",
+    "ready": true,
+    "configPresent": true,
+    "publicDeliveryAvailable": false
+  }
+}
+```
+
 - `driver` — the active `STORAGE_DRIVER` (`"local"` or `"r2"`).
 - `configPresent` — whether the required config variable **names** for the
-  active driver are all set (`local` → `STORAGE_ROOT`; `r2` → all six
-  `OBJECT_STORAGE_*` names, **including** `OBJECT_STORAGE_PUBLIC_BASE_URL`)
-  — presence only, never a value. This is deliberately a **superset** of
-  what `env.validation.ts` requires to *boot* in `r2` mode (five names, as
-  of Phase 11, work unit 11H-B1 — see "Private vs. public R2" above): a
-  booted private-R2 deployment (the five boot-required names set,
-  `OBJECT_STORAGE_PUBLIC_BASE_URL` intentionally absent) will report
-  `configPresent: false` / `ready: false` here even though presigned
-  PUT/HEAD/GET/DELETE work correctly. This endpoint's readiness definition
-  was intentionally left unchanged by 11H-B1, whose approved scope covered
-  only boot validation and `buildPublicUrl`; whether `/health/details`
-  should treat a private-R2 deployment as "ready" is a separate, open
-  product question.
+  active driver are all set (`local` → `STORAGE_ROOT`; `r2` → every name in
+  `env.validation.ts`'s `REQUIRED_R2_KEYS`) — presence only, never a value.
+  This is the **same canonical list boot validation uses**, imported rather
+  than restated: `StorageReadinessService` has no requirement list of its
+  own, so the two cannot drift. (They did, between work units 11H-B1 and
+  11I-B1: this endpoint kept a hard-coded sixth requirement,
+  `OBJECT_STORAGE_PUBLIC_BASE_URL`, after boot validation dropped it, which
+  made a correctly configured **private** R2 deployment report
+  `ready: false` permanently. Fixed in 11I-B1.)
 - `ready` — `local`: `STORAGE_ROOT` exists and is a readable directory (a
   local `fs.stat`, never a network call). `r2`: always equal to
   `configPresent` — this endpoint deliberately never makes a live network/R2
   probe, so `ready: true` in `r2` mode means "the required config names are
   set," not "R2 was successfully contacted."
+- `publicDeliveryAvailable` (**`r2` mode only**) — whether
+  `OBJECT_STORAGE_PUBLIC_BASE_URL` is configured, i.e. whether this
+  deployment can hand out **public** (non-presigned) object URLs via
+  `StorageService.buildPublicUrl`. Presence only, never the URL. It has **no
+  effect on `ready` or `configPresent`**: a private bucket (no public
+  access, no `r2.dev`, no custom domain) serves media exclusively through
+  presigned PUT/GET and is fully ready with `publicDeliveryAvailable:
+  false`. See "Private vs. public R2" above.
+  **Omitted entirely in `local` mode** rather than reported as `false`:
+  public object-storage delivery does not exist for that driver (nothing
+  reads `OBJECT_STORAGE_PUBLIC_BASE_URL` there — the app serves bytes
+  itself), so a hard-coded `false` would look like a degraded capability on
+  a perfectly healthy local deployment, and a `true` from a stale `.env`
+  line would be an outright false claim. Absent means "not applicable to
+  this driver".
 
 Booleans and the driver enum only — never the endpoint URL, bucket name,
 region, access key, secret, or any absolute storage path. See

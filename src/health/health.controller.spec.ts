@@ -79,4 +79,22 @@ describe('HealthController', () => {
     expect(checkStorageReadiness).toHaveBeenCalledTimes(1);
     expect(details.storage).toEqual(fixtureReadiness);
   });
+
+  // Phase 11, work unit 11I-B1: the controller must forward the new
+  // `publicDeliveryAvailable` field verbatim too — it neither adds nor
+  // strips it (the field's presence is the service's decision, per driver).
+  it('passes an r2 readiness result through untouched, including publicDeliveryAvailable', async () => {
+    const r2Readiness: StorageReadinessResponse = {
+      driver: 'r2',
+      ready: true,
+      configPresent: true,
+      publicDeliveryAvailable: false,
+    };
+    checkStorageReadiness.mockReturnValue(r2Readiness);
+
+    const details = await controller.getDetails();
+
+    expect(details.storage).toEqual(r2Readiness);
+    expect(details.storage.publicDeliveryAvailable).toBe(false);
+  });
 });

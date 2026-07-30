@@ -26,11 +26,25 @@ in each operator's local, uncommitted `.env`.
 }
 ```
 
+In `r2` mode it carries one extra field:
+
+```json
+{
+  "storage": {
+    "driver": "r2",
+    "ready": true,
+    "configPresent": true,
+    "publicDeliveryAvailable": false
+  }
+}
+```
+
 - `driver` — the active `STORAGE_DRIVER` (`"local"` or `"r2"`). Not a secret.
 - `configPresent` — are the required config variable **names** for the
-  active driver all set? (`local` → `STORAGE_ROOT`; `r2` → every
-  `OBJECT_STORAGE_*` name `env.validation.ts` requires.) Presence only —
-  never a value.
+  active driver all set? (`local` → `STORAGE_ROOT`; `r2` → every name in
+  `env.validation.ts`'s `REQUIRED_R2_KEYS`, imported from that one canonical
+  list, never restated here or in the service.) Presence only — never a
+  value.
 - `ready` —
   - `local`: `STORAGE_ROOT` exists and is a readable directory (a local
     `fs.stat`, never a network call).
@@ -39,6 +53,13 @@ in each operator's local, uncommitted `.env`.
     "the required config names are set", not "R2 was successfully
     contacted". Verifying real connectivity is what the disposable-object
     smoke test (section 3) and the one-test-file step (section 2) are for.
+- `publicDeliveryAvailable` (**`r2` mode only**, added by Phase 11, work
+  unit 11I-B1) — is `OBJECT_STORAGE_PUBLIC_BASE_URL` configured, i.e. can
+  this deployment hand out **public** (non-presigned) object URLs? Presence
+  only, never the URL. **It does not affect `ready` or `configPresent`**: a
+  private bucket serves media through presigned PUT/GET only and is fully
+  ready with `publicDeliveryAvailable: false`. Omitted entirely under
+  `local`, where public object-storage delivery does not apply.
 
 The response never includes the endpoint URL, bucket name, region, access
 key, secret, or any absolute filesystem path.
@@ -54,18 +75,29 @@ and no network call was made against R2 in this unit's implementation.
    the target Cloudflare R2 bucket and an R2 API token scoped to that bucket
    only (read+write, not account-wide).
 2. **Put the real values in `.env`** (never `.env.example`, never
-   committed):
+   committed). The five uncommented names below are the required ones
+   (`env.validation.ts`'s `REQUIRED_R2_KEYS`);
+   `OBJECT_STORAGE_PUBLIC_BASE_URL` is **optional** and is correctly left
+   unset/empty for a private bucket:
    ```
    OBJECT_STORAGE_ENDPOINT=https://<YOUR_ACCOUNT_ID>.r2.cloudflarestorage.com
    OBJECT_STORAGE_REGION=auto
    OBJECT_STORAGE_BUCKET=<YOUR_BUCKET>
    OBJECT_STORAGE_ACCESS_KEY_ID=<YOUR_ACCESS_KEY_ID>
    OBJECT_STORAGE_SECRET_ACCESS_KEY=<YOUR_SECRET_ACCESS_KEY>
-   OBJECT_STORAGE_PUBLIC_BASE_URL=<YOUR_PUBLIC_CDN_BASE_URL>
+   # OPTIONAL — set ONLY if the bucket genuinely has public delivery
+   # (r2.dev or a custom domain). Private bucket → leave this out entirely.
+   # OBJECT_STORAGE_PUBLIC_BASE_URL=<YOUR_PUBLIC_CDN_BASE_URL>
    ```
+   **Never invent a placeholder value for it to "satisfy" boot** — boot
+   does not want it, and any non-empty value makes
+   `publicDeliveryAvailable` (section 1) falsely report `true` for a
+   deployment that has no public delivery at all.
 3. **Set `STORAGE_DRIVER=r2`** in `.env` and restart the app. Boot fails
-   fast (secret-free error message, variable name only) if any name above
-   is missing — see `env.validation.ts`.
+   fast (secret-free error message, variable name only) if any of the
+   **five** names in `env.validation.ts`'s `REQUIRED_R2_KEYS` is missing.
+   `OBJECT_STORAGE_PUBLIC_BASE_URL` is not one of them and never blocks
+   boot.
 4. **Check the readiness endpoint**: `GET /health/details` (dev tools
    enabled) → confirm `storage.driver === "r2"` and
    `storage.configPresent === true`. Remember `ready` here reflects config

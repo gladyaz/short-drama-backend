@@ -55,7 +55,7 @@ mobile app (Expo/React Native)  -->  NestJS backend  -->  local company storage 
 | `PORT`                | Port the server listens on (binds `0.0.0.0` so a simulator/device on the same network can reach it) |
 | `PUBLIC_BASE_URL`     | Base URL used to build each video's `playbackUrl`                        |
 | `STORAGE_ROOT`        | Absolute path to the company video storage folder (read-only)            |
-| `CORS_ORIGINS`        | Comma-separated list of allowed origins (e.g. the Expo dev server)        |
+| `CORS_ORIGINS`        | Comma-separated list of allowed origins (e.g. the Expo dev server on `:8081`, the admin dashboard's Vite dev server on `:5173`) — see "Development flow: admin dashboard + mobile app" below |
 | `DATABASE_URL`        | Prisma connection string for the PostgreSQL dev database (e.g. `postgresql://USER:PASSWORD@localhost:5433/short_drama_dev`) — added in Phase 8, migrated from SQLite to PostgreSQL in Phase 8P |
 | `DATABASE_URL_TEST`   | Prisma connection string for a **dedicated** PostgreSQL test database (e.g. `.../short_drama_test`) — added in Phase 8P so `npm run test:e2e` never runs against dev data; required, or e2e tests fail loudly at startup (see "Database" below) |
 | `JWT_ACCESS_SECRET`   | Secret used to sign/verify short-lived (~15 min) access tokens — added in Phase 8 |
@@ -106,7 +106,7 @@ Then edit `.env` with real local values, for example:
 PORT=3000
 PUBLIC_BASE_URL=http://localhost:3000
 STORAGE_ROOT=/absolute/path/to/your/company-video-storage
-CORS_ORIGINS=http://localhost:8081
+CORS_ORIGINS=http://localhost:8081,http://localhost:5173
 ```
 
 For testing from a physical device on the same Wi-Fi network, set
@@ -116,6 +116,33 @@ For testing from a physical device on the same Wi-Fi network, set
 `.env` is git-ignored and must never be committed — it contains the real,
 machine-specific `STORAGE_ROOT` path. `.env.example` holds only generic
 placeholder values and is safe to commit.
+
+### Development flow: admin dashboard + mobile app (Phase 12, work unit 12F-B1)
+
+Two separate frontends normally talk to this backend directly — neither
+needs a reverse proxy:
+
+- The **mobile app** (Expo dev server) runs on `http://localhost:8081` and
+  calls this backend on `http://localhost:3000`.
+- The **admin dashboard** (`short-drama-admin`, Vite dev server) runs on
+  `http://localhost:5173` and also calls this backend on
+  `http://localhost:3000`.
+
+Both origins are cross-origin from this backend's point of view, so **both
+must be present in `CORS_ORIGINS`** or the browser's CORS preflight
+(`OPTIONS`) will reject the request before it ever reaches a route handler —
+this looks like a generic "Something went wrong"/network error in the
+browser, not an obviously CORS-shaped message. `.env.example` ships both
+`http://localhost:8081` and `http://localhost:5173` as placeholder-safe
+local-development origins; make sure your own `.env` includes both (plus
+any LAN-IP variant you use for physical-device testing) rather than
+narrowing this list down to just one frontend.
+
+`CORS_ORIGINS` is parsed as an explicit, comma-separated allowlist (see
+`src/config/configuration.ts`) — there is no wildcard, no reflected-`Origin`
+fallback, and no "allow everything outside production" branch. An origin
+not present in the list is always refused, in every environment, including
+production; see "CORS allowlist behavior" below for the full detail.
 
 ## Running the server
 
@@ -128,6 +155,41 @@ npm run start        # single run
 
 On startup you should see logs confirming the port, public base URL, and CORS
 origins — and an immediate, readable error if `STORAGE_ROOT` is misconfigured.
+
+### CORS allowlist behavior (Phase 12, work unit 12F-B1)
+
+`app.enableCors({ origin: appConfig.corsOrigins })` in `src/main.ts` is
+given the parsed `string[]` from `CORS_ORIGINS`, never a raw string. The
+underlying `cors` middleware treats an array `origin` as an **explicit
+allowlist**, not a wildcard: it only sets `Access-Control-Allow-Origin` when
+the request's `Origin` header exactly matches one entry, and otherwise sets
+no CORS header at all — the browser then blocks the request client-side.
+This means:
+
+- **No wildcard.** `CORS_ORIGINS` is never passed to `enableCors` as the
+  literal string `origin: '*'`, and the array form is not treated as a
+  wildcard even if an operator mistakenly put a literal `*` entry in it
+  (the `cors` package only special-cases `*` when `origin` itself is the
+  string `'*'`, not an array containing it) — so accidental "unblock
+  everything" misconfiguration is not possible for this call shape.
+- **No reflected `Origin`.** Only origins present in the parsed list ever
+  get echoed back; the request's `Origin` header is never returned verbatim
+  for a non-allowlisted origin.
+- **No "allow everything outside production" branch.** `corsOrigins` is
+  built the same way regardless of `NODE_ENV` — there is no environment
+  check anywhere in this path.
+- **Unset/empty `CORS_ORIGINS` is not permissive.** `CORS_ORIGINS` is a
+  required environment variable (`src/config/env.validation.ts`); the app
+  refuses to boot at all if it is missing. If it is set to a value that
+  parses down to zero usable origins (e.g. only whitespace or a lone
+  comma — `src/config/configuration.ts`'s `split(',').map(trim).filter`
+  drops empty entries so a trailing/stray comma never becomes an empty
+  allowed origin), the resulting allowlist is simply empty and **every**
+  origin is refused, including in production — fails closed, not open.
+- **Credentials support is unchanged by this work unit.** `enableCors` here
+  does not set `credentials: true`, so `Access-Control-Allow-Credentials` is
+  not sent today; this file's auth flow does not rely on browser-managed
+  cookies for the admin dashboard or mobile app, so this was left as-is.
 
 ## How videos are mapped
 

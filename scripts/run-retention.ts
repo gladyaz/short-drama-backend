@@ -18,9 +18,11 @@ import { RetentionReport } from '../src/retention/retention.types';
  * DESTRUCTIVE (`--commit`): additionally requires BOTH of two independent
  * gates in `../src/retention/retention-env-guard.ts` to pass — (1) `NODE_ENV`
  * must be exactly `development` or `test` (an ALLOWLIST, robust to an unset
- * `NODE_ENV`, unlike `env.validation.ts`'s pre-existing exact-string
- * `!== 'production'` check flagged in `TASK_QUEUE.md`'s Phase 12 follow-up
- * item 5), AND (2) `DATABASE_URL` must resolve to the SAME database as
+ * `NODE_ENV` — `env.validation.ts`'s own check is now also allowlist-shaped,
+ * since Phase 12, work unit 12D-B2, commit `7cfd411`; the two are
+ * independent gates for two different surfaces — dev-tools boot vs. this
+ * destructive retention run — and neither is implemented in terms of the
+ * other), AND (2) `DATABASE_URL` must resolve to the SAME database as
  * `DATABASE_URL_TEST` (`assertDestructiveRetentionDatabaseAllowed`) — added
  * as a fast-follow because `NODE_ENV=development` alone is not sufficient: a
  * normal local dev shell has `NODE_ENV=development` while `DATABASE_URL`

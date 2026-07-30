@@ -7,19 +7,23 @@ import { redactSensitiveText } from '../common/logging/redact';
  * never be runnable against a production database this phase.
  *
  * Deliberately an ALLOWLIST (`NODE_ENV` must be exactly one of the values
- * below), not `env.validation.ts`'s existing pattern of denying only the
- * exact string `'production'`. `TASK_QUEUE.md`'s Phase 12 follow-ups record
- * that pattern as a MEDIUM finding (item 5): an unset `NODE_ENV` slips
- * through a `!== 'production'` check silently. This work unit's own
- * instructions require this guard to be "robust to an unset value" rather
- * than depending solely on that existing check — an allowlist achieves that
- * for free: `undefined`, `''`, a typo (`'produciton'`), or any value this
- * file does not explicitly recognize as safe is treated as UNSAFE, not as
- * "probably fine because it isn't literally the word production". This
- * deliberately does NOT modify `env.validation.ts`'s existing check itself
- * (that is `TASK_QUEUE.md` follow-up item 5, a separate, not-yet-scoped
- * work unit) — this file adds an independent, additional gate specific to
- * the retention job, it does not touch the pre-existing one.
+ * below). `env.validation.ts`'s own boot-time check started out the
+ * opposite shape — Phase 10, work unit 10-B5's exact-string
+ * `!== 'production'` denylist, under which an unset `NODE_ENV` slipped
+ * through silently. `TASK_QUEUE.md`'s Phase 12 follow-ups recorded that as
+ * a MEDIUM finding (item 5). This work unit's own instructions required
+ * this guard to be "robust to an unset value" rather than depending on
+ * that pre-existing check, so this file's allowlist was built
+ * independently of it: `undefined`, `''`, a typo (`'produciton'`), or any
+ * value this file does not explicitly recognize as safe is treated as
+ * UNSAFE, not as "probably fine because it isn't literally the word
+ * production". Follow-up item 5 is now resolved — Phase 12, work unit
+ * 12D-B2 (commit `7cfd411`) replaced `env.validation.ts`'s denylist with an
+ * allowlist of its own, using this file's design as the model. The two
+ * checks remain independent, separately maintained gates for two different
+ * surfaces (dev-tools boot vs. this destructive retention job): this file
+ * does not call into `env.validation.ts`, and neither is implemented in
+ * terms of the other.
  *
  * Fast-follow (independent `test-reviewer` pass, MEDIUM): `NODE_ENV` alone
  * is necessary but not sufficient — a normal local dev shell legitimately

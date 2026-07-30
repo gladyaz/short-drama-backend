@@ -1869,14 +1869,16 @@ describe('AuthService', () => {
 
     /**
      * DECISIONS.md decision 3: the raw token is returned ONLY when
-     * `DEV_TOOLS_ENABLED=true && NODE_ENV != production`. `env.validation.ts`
-     * already refuses to boot the app at all if that flag is combined with
-     * `NODE_ENV=production` (Phase 10, work unit 10-B5's existing fail-loud
-     * check), so a SEPARATE module instance with `app.devToolsEnabled: true`
-     * (this test process's own `NODE_ENV` is never `production`) is the
-     * correct way to exercise this branch — mirrors this file's existing
-     * "otherModule"/"otherPrisma" pattern used above for a different
-     * config override.
+     * `DEV_TOOLS_ENABLED=true` AND `NODE_ENV` is exactly `development` or
+     * `test`. `env.validation.ts` already refuses to boot the app at all
+     * unless `NODE_ENV` is one of those two exact values while the flag is
+     * on — a deliberate allowlist, not merely "not production" (Phase 12,
+     * work unit 12D-B2, commit `7cfd411`, replacing the original Phase 10,
+     * work unit 10-B5 exact-string denylist check), so a SEPARATE module
+     * instance with `app.devToolsEnabled: true` (this test process's own
+     * `NODE_ENV` is never `production`) is the correct way to exercise this
+     * branch — mirrors this file's existing "otherModule"/"otherPrisma"
+     * pattern used above for a different config override.
      */
     describe('with DEV_TOOLS_ENABLED=true', () => {
       let devToolsService: AuthService;

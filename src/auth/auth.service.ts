@@ -1169,10 +1169,12 @@ export class AuthService {
    * flag check lives HERE instead, deciding only whether the `devToken`
    * field is attached to an otherwise-identical response — the route itself
    * always executes normally. `env.validation.ts` already refuses to boot
-   * the app at all when `DEV_TOOLS_ENABLED=true` is combined with
-   * `NODE_ENV=production` (Phase 10, work unit 10-B5's existing fail-loud
-   * check), so by the time this code runs, `devToolsEnabled: true` can only
-   * ever be observed in a genuinely non-production environment — no second,
+   * the app at all unless `NODE_ENV` is exactly `development` or `test`
+   * while `DEV_TOOLS_ENABLED=true` — a deliberate allowlist, not merely "not
+   * production" (Phase 12, work unit 12D-B2, commit `7cfd411`, replacing the
+   * original Phase 10, work unit 10-B5 exact-string denylist check), so by
+   * the time this code runs, `devToolsEnabled: true` can only ever be
+   * observed in a genuinely non-production environment — no second,
    * redundant `NODE_ENV` check is needed here.
    */
   async requestPasswordReset(

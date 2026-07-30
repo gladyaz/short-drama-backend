@@ -475,17 +475,20 @@ way" precedent, applied here at the "does this email exist" layer:
   table cannot be used to enumerate which emails are registered, even with
   raw database access.
 - **The raw reset token is returned in the response body (as `devToken`)
-  ONLY when `DEV_TOOLS_ENABLED=true` AND `NODE_ENV` is not `production`.**
-  `env.validation.ts` already refuses to boot the app at all if that
-  combination is misconfigured (the existing Phase 10, work unit 10-B5
-  fail-loud check — see that file), so this can only ever be observed on a
-  developer's own machine, never in production. This conditional
-  deliberately lives in the RESPONSE SHAPING, not a `DevToolsGuard` route
-  guard: a guard would reject the ENTIRE route (404) whenever the flag is
-  off, which would break this endpoint's own "always returns 202" contract
-  for every environment except a developer's own machine with the flag on.
-  The route always executes normally; only the `devToken` field is
-  conditionally attached.
+  ONLY when `DEV_TOOLS_ENABLED=true` AND `NODE_ENV` is exactly `development`
+  or `test`.** `env.validation.ts` already refuses to boot the app at all
+  unless `NODE_ENV` is one of those two exact values while the flag is on —
+  a deliberate allowlist, not merely "not production" (Phase 12, work unit
+  12D-B2, commit `7cfd411` — see the "Entitlements API" section's
+  `/dev/entitlements/grant` writeup below for the full history, including
+  the original Phase 10, work unit 10-B5 exact-string denylist check this
+  replaced), so this can only ever be observed on a developer's own
+  machine, never in production. This conditional deliberately lives in the
+  RESPONSE SHAPING, not a `DevToolsGuard` route guard: a guard would reject
+  the ENTIRE route (404) whenever the flag is off, which would break this
+  endpoint's own "always returns 202" contract for every environment except
+  a developer's own machine with the flag on. The route always executes
+  normally; only the `devToken` field is conditionally attached.
 - **No real email or SMS is ever sent this phase** — that is an explicit,
   hard-scoped-out integration for a future phase. In production (or any
   environment with `DEV_TOOLS_ENABLED` off), the caller has no way to
@@ -545,9 +548,18 @@ reset token for a deleted account is discarded along with it.
 
 ### Known gaps in the Auth API
 
-- **No rate limiting yet** on `/auth/login` or `/auth/register`. This was
-  flagged during the Phase 8 security review and is tracked as a
-  pre-production requirement, not yet implemented.
+- ~~No rate limiting on `/auth/login` or `/auth/register`~~ — **resolved**
+  in Phase 12, work unit 12A-B1 (commit `5570c79`): `@nestjs/throttler`
+  enforces `POST /auth/login` at 5/min/IP, `POST /auth/register` at
+  3/10min/IP, and `POST /auth/refresh` at 30/min/IP
+  (`src/common/rate-limit.constants.ts`), plus a **persistent**
+  PostgreSQL-backed `AccountLockout` model (15-minute lockout after 10
+  failed logins within 15 minutes for the same account) that survives a
+  server restart, unlike the IP throttling. The IP-level throttling itself
+  remains in-memory per app instance (a shared/persistent IP-rate store
+  across multiple backend instances is deliberately deferred to Phase 13,
+  DECISIONS.md decision 4) — that in-memory scope is the one part of this
+  item still open, not the absence of any limiting at all.
 - **`JwtAuthGuard` does not re-check user existence per request.** It only
   verifies the access token's signature and expiry; it does not query the
   database on every guarded request (unlike refresh-token handling, which is
@@ -599,6 +611,127 @@ reset token for a deleted account is discarded along with it.
   for a few hours longer than strictly necessary before the next run
   catches it. Retention logic should not, however, assume `revokedAt` is
   precise to the hour for any row that predates this fix.
+
+## Account Deletion API (Phase 12, work unit 12C-B1)
+
+### `POST /users/me/deletion`
+
+Requires `Authorization: Bearer <accessToken>`. Body:
+
+```json
+{
+  "currentPassword": "the caller's existing password",
+  "confirmDeletion": true
+}
+```
+
+- `confirmDeletion` must be the **literal boolean `true`** — a missing
+  field, `false`, or the **string** `"true"` are each rejected with a clean
+  `400` by the global `ValidationPipe` (`@IsBoolean()` then `@Equals(true)`
+  on `AccountDeletionDto`) before the request ever reaches `AuthService`.
+  This is decision 1's "explicit irreversible confirmation payload", not
+  merely a client-side prompt.
+- `currentPassword`: re-verified server-side via `bcrypt.compare` against
+  the stored hash, same as `POST /auth/change-password`.
+- There is no id in the path, query, or body — the account acted on is
+  always the caller's own, resolved exclusively from the verified access
+  token (`JwtAuthGuard` / `@CurrentUser()`), so there is no client-supplied
+  identifier for a cross-account attempt to even target.
+
+**This is the most destructive endpoint in this codebase. Deletion is
+immediate, hard, and irreversible: there is no grace period, no "undo",
+and no cancellation endpoint.** Once `200 { "success": true }` is
+returned, the `User` row and everything decision 1/2 say should cascade
+with it are already gone.
+
+On success, returns `200 { "success": true }` and, in one
+`prisma.$transaction`:
+
+- Revokes every session for the account (`Session.revokedAt` set for all
+  outstanding rows).
+- Hard-deletes the `User` row.
+
+**What is cascade-deleted vs. what survives, anonymized** (DECISIONS.md
+decision 2) — every `User`-relation model in `prisma/schema.prisma` falls
+into exactly one of two buckets, both enforced by real Postgres foreign-key
+constraints, not application code:
+
+- **Cascade-deleted (`onDelete: Cascade`), removed outright:** `Session`,
+  `UserVideoInteraction`, `WatchProgress`, `Entitlement`,
+  `PasswordResetToken`, `AccountLockout`. A deleted-then-re-registered email
+  therefore cannot inherit a stale lockout or a leftover interaction/progress
+  row — it is gone, not merely orphaned.
+- **Anonymized, not deleted (`onDelete: SetNull`), survives:**
+  `AnalyticsEvent.userId` and `AuthAuditEvent.userId` are set to `null`.
+  **This is required by decision 2, not an oversight** — it preserves
+  aggregate product/security history (e.g. "how many accounts were deleted
+  this month") without retaining any link back to which account it was.
+  Neither table stores a raw IP, email, or other identifying metadata that
+  would defeat the anonymization (`AnalyticsEvent` has no IP column at all;
+  `AuthAuditEvent.ipHash`/`userAgent` are already hashed/truncated at write
+  time — see "Session metadata" above).
+
+`account_deletion_success` is emitted to `AuthAuditEvent` **after** the
+transaction commits, and **deliberately without a `userId`** — two separate
+reasons, not one: (1) emitting inside the transaction could record a
+"success" for a deletion that then fails to commit, since `AuthAuditService.emit`
+is intentionally best-effort and swallows its own errors; (2) inserting a
+**new** row with a non-null `userId` for a user that no longer exists would
+be rejected by the foreign key outright — `SetNull` only fires when an
+*existing* referenced row is deleted, never on an insert of a dangling
+reference. Omitting `userId` still leaves a genuinely useful record (an
+accurate, timestamped count of real account deletions) without violating
+decision 2. The two `account_deletion_failed` audit events below (wrong
+password / forbidden role) are the opposite case — the account still
+exists, so `userId` **is** included, matching `change_password_failed`'s
+existing precedent.
+
+**Order of checks (deliberate, not incidental) — see the doc comment on
+`AuthService.deleteAccount` for the full reasoning:**
+
+1. Does the access token's `userId` still resolve to a real `User`? If not,
+   `401 INVALID_ACCESS_TOKEN` — the same code `GET /auth/me` already uses
+   for "authenticated but the user no longer exists". This is also this
+   endpoint's **idempotency story**: a second `POST /users/me/deletion`
+   call with the same (still cryptographically valid, since access tokens
+   are stateless) access token after the account was already deleted lands
+   here, not a 500.
+2. Is `currentPassword` correct? Checked **before** the role check below.
+   No other endpoint this app exposes to its own owner surfaces `User.role`
+   (`GET /auth/me` returns only `id`/`email`/`displayName`), so checking
+   role first would let a caller holding a stolen-but-still-valid access
+   token learn "this account is privileged" for free, without ever knowing
+   the password. Checking the password first means that information is only
+   reachable by someone who already knows it — at which point they already
+   have full control of the account through every other authenticated
+   route, so nothing new leaks. A wrong password fails with the same generic
+   `401 INVALID_CREDENTIALS` `POST /auth/login` uses.
+3. Is `user.role === 'user'`? Any other role (e.g. `admin`) is refused with
+   a distinct `403 ACCOUNT_DELETION_FORBIDDEN` — safe to be specific here
+   precisely because it is only reachable after the correct password was
+   already verified (point 2 above). Self-service deletion of a privileged
+   account is a separate, not-yet-built process this phase deliberately
+   does not create.
+
+Errors:
+
+- `400` — `confirmDeletion` missing, `false`, or a non-boolean value
+  (including the string `"true"`). The account is untouched.
+- `401 INVALID_CREDENTIALS` — wrong `currentPassword`. The account is
+  untouched.
+- `401 INVALID_ACCESS_TOKEN` — missing/malformed/expired/invalid access
+  token, **or** the account behind a still-valid access token has already
+  been deleted (the idempotency case above — a repeated call after
+  deletion always lands here, never a 500).
+- `403 ACCOUNT_DELETION_FORBIDDEN` — the authenticated account's role is
+  not `"user"` (e.g. `admin`/operator). Admin and operator accounts are
+  refused by design; deleting one requires a separate, not-yet-built
+  process.
+- `429` — rate-limited to **5 requests per 15 minutes**, a dedicated,
+  tighter-than-default `@Throttle()` override (unlike `change-password`/
+  `logout-all`/`sessions`, which rely on the app-wide default) precisely
+  because this action is irreversible — see `ACCOUNT_DELETION_RATE_LIMIT`'s
+  doc comment in `src/common/rate-limit.constants.ts`.
 
 ## Data Export API (Phase 12, work unit 12C-B2)
 
@@ -711,11 +844,9 @@ invoke it is the explicit CLI script below, run by hand:
 # against any database:
 npm run retention
 
-# Destructive — additionally requires NODE_ENV to be exactly "development"
-# or "test" (see src/retention/retention-env-guard.ts; this is a deliberate
-# ALLOWLIST, not env.validation.ts's exact-string "!== production" check —
-# an unset NODE_ENV is refused, not silently treated as safe):
-NODE_ENV=development npm run retention -- --commit
+# Destructive — requires BOTH independent gates below to pass (NODE_ENV
+# allowlist AND DATABASE_URL pointed at the isolated test database):
+NODE_ENV=development DATABASE_URL="$DATABASE_URL_TEST" npm run retention -- --commit
 ```
 
 Per `AGENT_RULES.md`, this job must never be run against `short_drama_dev`
@@ -723,6 +854,30 @@ or any real company data — the CLI's own guard makes a misconfigured
 production run structurally difficult, but that does not itself authorize
 running it anywhere; see `TASK_QUEUE.md`'s 12D-B1 row for the full
 acceptance record.
+
+**Two independent gates must both pass before a `--commit` run deletes
+anything** (`src/retention/retention-env-guard.ts`), checked before a
+single Prisma call is issued:
+
+1. **`NODE_ENV` allowlist.** `NODE_ENV` must be exactly `development` or
+   `test`. This is a deliberate **allowlist**, not `env.validation.ts`'s
+   own (also now allowlist-shaped, since Phase 12 work unit 12D-B2, commit
+   `7cfd411`) check — the two are independent gates for two different
+   surfaces (dev-tools boot vs. this destructive job) and neither is
+   implemented in terms of the other. An unset, empty, misspelled, or
+   differently-cased `NODE_ENV` is refused, never silently treated as safe.
+2. **`DATABASE_URL`-identity gate**, added in this work unit's own fix
+   cycle after review found gate 1 alone insufficient: a normal local shell
+   legitimately has `NODE_ENV=development` while `DATABASE_URL` still
+   resolves to `short_drama_dev` (the real seeded/QA database) — without
+   this second gate, `NODE_ENV=development npm run retention -- --commit`
+   would delete against real local data. This gate requires `DATABASE_URL`
+   to match `DATABASE_URL_TEST` by a **credential-free** identity
+   (`protocol://host:port/dbname`, structurally never reading the
+   `user:password@` segment of either string), and pipes every refusal
+   message through `redactSensitiveText` as defense in depth. Both gates
+   are independent — passing one never satisfies the other — and a refusal
+   from either means **zero** database activity for that run.
 
 ### Targets and windows
 
@@ -901,9 +1056,21 @@ default decision 4).
 **Development/testing only — stand in for a real payment webhook, which is
 explicitly out of scope for this phase.** Disabled (`404
 DEV_TOOLS_DISABLED`) unless `DEV_TOOLS_ENABLED=true` in your local `.env`.
-The app refuses to boot at all if `DEV_TOOLS_ENABLED=true` while
-`NODE_ENV=production` (see `src/config/env.validation.ts`) — these routes
-must never be reachable in a real deployment.
+The app refuses to boot at all if `DEV_TOOLS_ENABLED=true` unless `NODE_ENV`
+is exactly `development` or `test` (see `src/config/env.validation.ts`) —
+these routes, and the separate `/dev/admin/*` self-service admin-role-grant
+routes (not otherwise documented in this README — see
+`src/admin/admin.controller.ts`), must never be reachable in a real
+deployment. **This is a deliberate allowlist, not merely "not
+production"** (Phase 12, work unit 12D-B2, commit `7cfd411`): the original
+check compared `NODE_ENV` against the exact
+string `'production'`, so an unset, empty, misspelled, or differently-cased
+`NODE_ENV` (e.g. `"Production"`) silently passed it and booted with dev
+tooling — including this self-service admin-grant surface — live. That was
+found to be a HIGH-severity privilege-escalation path in the Phase 12
+backend security review (a caller could grant themselves admin) and fixed by
+replacing the denylist with an allowlist: only an explicit `development` or
+`test` boots with dev tools enabled, everything else refuses to start.
 
 Body (both optional):
 
@@ -1483,8 +1650,9 @@ one work unit.
 
 ### Known gaps
 
-- **No rate limiting yet** on `/auth/login` or `/auth/register` (see "Known
-  gaps in the Auth API" above).
+- ~~No rate limiting on `/auth/login` or `/auth/register`~~ — **resolved**
+  (see "Known gaps in the Auth API" above for the full detail and remaining
+  scoped-out item: IP throttling is in-memory per instance until Phase 13).
 - **`JwtAuthGuard` does not re-check user existence per request** — see
   "Known gaps in the Auth API" above.
 - ~~`sortOrder` not set for future/newly-seeded videos~~ — **resolved** in
@@ -1519,12 +1687,22 @@ replacing the temporary Python HTTP server and wiring `storageKey` /
 database and `/auth/*` module described above. Phase 9 added per-user
 Like/Save and watch-progress endpoints described in "Interactions & Progress
 API" above. Phase 8P migrated that database from SQLite to PostgreSQL — see
-"Database" above for the full setup and command reference. Phase 10 (this
-backend's most recent phase) added account-wide premium entitlement and
-closed a real gap: `GET /videos/:id/stream` previously had no guard at all
-(any client with a video id could stream any file); it now requires
-`Authorization: Bearer <accessToken>` and, for episode 6+, an active
-entitlement — see "Entitlements API" above. Known gaps carried forward for a
-future phase: no rate limiting on `/auth/login` / `/auth/register` (see
-"Known gaps in the Auth API"), and the other items under the Database
-section's "Known gaps".
+"Database" above for the full setup and command reference. Phase 10 added
+account-wide premium entitlement and closed a real gap: `GET
+/videos/:id/stream` previously had no guard at all (any client with a video
+id could stream any file); it now requires `Authorization: Bearer
+<accessToken>` and, for episode 6+, an active entitlement — see
+"Entitlements API" above. Phase 11 added analytics/monitoring, the
+credential-free media/thumbnail/import tooling, and the admin content-
+management API described above. Phase 12 (this backend's most recent phase)
+is a security, privacy, and account-lifecycle pass: rate limiting +
+persistent account lockout, `helmet` + a 256kb body limit, the
+`AuthAuditEvent` audit trail, change-password/logout-all/session-list/
+session-revoke, password reset, account deletion, data export, and the
+retention/cleanup jobs described in their respective sections above, plus an
+admin-authorization review and a full backend security review (see
+`reports/phase-12-*` in the control workspace). Known gaps carried forward:
+`JwtAuthGuard` not re-checking user existence per request, IP-level
+throttling staying in-memory per instance until Phase 13, and the other
+items under "Known gaps in the Auth API" and the Database section's "Known
+gaps" above.

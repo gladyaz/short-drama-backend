@@ -1577,11 +1577,33 @@ export class AuthService {
    * needed (and none written) here; a deleted-then-re-registered email
    * therefore cannot inherit a stale `AccountLockout` row (it is gone, not
    * merely orphaned). `AnalyticsEvent.userId` and `AuthAuditEvent.userId`
-   * are `onDelete: SetNull` — those rows SURVIVE, anonymized (no email, no
-   * raw IP, no other identifying metadata — see `AUTH_AUDIT_METADATA_ALLOWLIST`'s
-   * existing allowlist and `AnalyticsService`'s equivalent), satisfying
-   * DECISIONS.md decision 2 without any change to either schema or
-   * emission path.
+   * are `onDelete: SetNull` — those rows SURVIVE. For `AnalyticsEvent` that
+   * is the whole story: the model has no `ipHash`/`userAgent` column at
+   * all, so `SetNull` alone (plus the existing `EVENT_PROPERTY_ALLOWLIST`
+   * at emission time) already leaves nothing behind that could re-link a
+   * surviving row to the deleted account. `AuthAuditEvent` is different and
+   * `SetNull` is NOT sufficient for it on its own: that cascade only ever
+   * touches the `userId` FK column it is declared on — it does nothing to
+   * `ipHash` (Phase 12E, work unit 12E-B1: DECISIONS.md 2026-07-30 decision
+   * 1 — an unsalted, unrotated HMAC of the client IP is a globally stable
+   * value, so a row that kept it after `userId` went `NULL` would still be
+   * correlatable to any other live session/account sharing that same IP,
+   * with no brute-forcing required; decision 1 is explicit that calling
+   * that "anonymized" would be wrong) or to `userAgent`/`metadata` (neither
+   * has any `onDelete` behavior of its own — they are just plain nullable
+   * columns). The explicit `tx.authAuditEvent.updateMany(...)` scrub a few
+   * lines below this comment — INSIDE this same transaction, and BEFORE
+   * `tx.user.deleteMany` — is what actually does that work: it nulls
+   * `userId`/`ipHash`/`userAgent`/`metadata` while the row can still be
+   * found by `userId`, preserving only `event` and `createdAt` (decision
+   * 1's exact instruction). Ordering here is load-bearing, not stylistic:
+   * `onDelete: SetNull` fires synchronously, inside this same transaction,
+   * the instant `tx.user.deleteMany` runs — so a scrub placed AFTER that
+   * call would query `where: { userId }` against rows that already have
+   * `userId: null` and silently match zero rows, scrubbing nothing. See the
+   * scrub's own inline comment for the rest of this reasoning, and
+   * `account-deletion.service.spec.ts` for the regression test that pins
+   * this ordering by mutation.
    *
    * `AuthAuditEvent` FOR THE DELETION ITSELF — the exact tension this work
    * unit's own review checklist calls out: an audit row created for THIS
@@ -1689,6 +1711,51 @@ export class AuthService {
       await tx.session.updateMany({
         where: { userId, revokedAt: null },
         data: { revokedAt: now },
+      });
+
+      // Phase 12, work unit 12E-B1 (DECISIONS.md 2026-07-30, decision 1):
+      // scrub this account's OWN `AuthAuditEvent` rows BEFORE `tx.user.deleteMany`
+      // below — see this method's own doc comment ("CASCADES RELIED ON")
+      // for the full ordering rationale. In short: `AuthAuditEvent.userId`
+      // is `onDelete: SetNull`, and Postgres fires that cascade
+      // synchronously, inside this SAME transaction, the instant the user
+      // row is deleted — so a scrub placed after the delete would query
+      // `where: { userId }` against rows whose `userId` is already `null`
+      // and silently match nothing. Running it here, first, means this
+      // `updateMany` still finds every row this account owns.
+      //
+      // `userId` is nulled explicitly (redundant with the cascade that is
+      // about to fire anyway — kept for clarity, matching this method's
+      // existing "explicit even when cascade-redundant" precedent for
+      // session revocation above) alongside `ipHash` and `userAgent`,
+      // NEITHER of which the cascade ever touches (it only affects the FK
+      // column it is declared on): `ipHash` is an unsalted, unrotated HMAC
+      // of the client IP — a globally stable value — so leaving it behind
+      // would keep the row correlatable to any other live session/account
+      // sharing that IP with no brute-forcing required, which is exactly
+      // the overstated "anonymized" claim decision 1 forbids describing.
+      // `event` and `createdAt` are the only columns left untouched,
+      // matching decision 1's "preserve only the allowlisted event type and
+      // the timestamp" instruction exactly.
+      //
+      // `metadata` is nulled WHOLESALE (`Prisma.DbNull` — true SQL `NULL`;
+      // NOT `Prisma.JsonNull`, which would instead persist the JSON scalar
+      // `null` and leave the column non-NULL) rather than stripped
+      // key-by-key against `AUTH_AUDIT_METADATA_ALLOWLIST`. Every allowlisted
+      // value today is already a small, non-identifying enum string (see
+      // `auth-audit.types.ts`) — selective stripping would preserve
+      // negligible operational value over nulling outright, while adding a
+      // second place that has to be kept in sync with that allowlist
+      // forever, and a second way to get it wrong. Wholesale nulling cannot
+      // leak regardless of what a future event/metadata key adds.
+      await tx.authAuditEvent.updateMany({
+        where: { userId },
+        data: {
+          userId: null,
+          ipHash: null,
+          userAgent: null,
+          metadata: Prisma.DbNull,
+        },
       });
 
       await tx.user.deleteMany({ where: { id: userId } });

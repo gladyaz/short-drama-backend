@@ -38,6 +38,14 @@ describe('AuthService.deleteAccount', () => {
   let service: AuthService;
   let prisma: PrismaService;
   let originalDatabaseUrl: string | undefined;
+  // Phase 12, work unit 12E-B1: a genuinely SCRUBBED `AuthAuditEvent` row
+  // has `userId`/`ipHash`/`userAgent`/`metadata` all null by design — which
+  // means, by design, it can no longer be found via ANY of the marker-based
+  // `deleteMany` cleanup queries below (that IS the feature). Tests that
+  // create a row they expect to end up scrubbed push its `id` here so
+  // `afterEach` can still find and remove it directly, instead of leaking
+  // permanently-orphaned rows into `short_drama_test` on every run.
+  let scrubbedAuditEventIds: string[];
 
   // Kept short deliberately: `@IsEmail()` (via `validator.js`) enforces the
   // RFC 5321 64-character local-part limit, and this prefix is combined with
@@ -84,6 +92,7 @@ describe('AuthService.deleteAccount', () => {
     service = module.get<AuthService>(AuthService);
     prisma = module.get<PrismaService>(PrismaService);
     await prisma.onModuleInit();
+    scrubbedAuditEventIds = [];
   });
 
   afterEach(async () => {
@@ -98,6 +107,14 @@ describe('AuthService.deleteAccount', () => {
     await prisma.authAuditEvent.deleteMany({
       where: { user: { email: { contains: emailPrefix } } },
     });
+    // Phase 12, work unit 12E-B1: rows a test expects to end up genuinely
+    // SCRUBBED (userId/ipHash/userAgent all null) can't be found by either
+    // query above — see this file's `scrubbedAuditEventIds` doc comment.
+    if (scrubbedAuditEventIds.length > 0) {
+      await prisma.authAuditEvent.deleteMany({
+        where: { id: { in: scrubbedAuditEventIds } },
+      });
+    }
     await prisma.analyticsEvent.deleteMany({
       where: { eventName: { contains: emailPrefix } },
     });
@@ -281,7 +298,7 @@ describe('AuthService.deleteAccount', () => {
   });
 
   describe('cascade + anonymization at the DB level', () => {
-    it('removes every cascade-configured owned row, and anonymizes AnalyticsEvent/AuthAuditEvent via SET NULL with no identifying data retained', async () => {
+    it('removes every cascade-configured owned row; AnalyticsEvent survives anonymized via SET NULL; AuthAuditEvent survives via the explicit pre-delete scrub (Phase 12E-B1) with no identifying data retained', async () => {
       const password = 'correct-horse-battery';
       const ip = '198.51.100.42';
       const { email, result } = await registerUser('cascade', password);
@@ -316,14 +333,20 @@ describe('AuthService.deleteAccount', () => {
         data: { userId, failedCount: 3 },
       });
       // A pre-deletion AuthAuditEvent that DOES reference this user (e.g. a
-      // real login-failure event) — must survive the delete, anonymized.
-      await prisma.authAuditEvent.create({
+      // real login-failure event) — must survive the delete, scrubbed. Sets
+      // `ipHash`/`metadata` directly (not just `userAgent`) so this
+      // composition test covers all three scrubbed columns, not only the
+      // one the ORIGINAL (pre-12E-B1) version of this test happened to set.
+      const preexistingAuditRow = await prisma.authAuditEvent.create({
         data: {
           userId,
           event: 'login_failed',
           userAgent: `${emailPrefix}-preexisting-audit-agent`,
+          ipHash: `${emailPrefix}-preexisting-audit-iphash`,
+          metadata: { reason: 'invalid_password' },
         },
       });
+      scrubbedAuditEventIds.push(preexistingAuditRow.id);
       // A pre-deletion AnalyticsEvent — must ALSO survive, anonymized.
       await prisma.analyticsEvent.create({
         data: {
@@ -363,12 +386,24 @@ describe('AuthService.deleteAccount', () => {
         await prisma.accountLockout.findMany({ where: { userId } }),
       ).toHaveLength(0);
 
-      // Anonymized, not deleted: still present, `userId` nulled.
-      const auditRows = await prisma.authAuditEvent.findMany({
-        where: { userAgent: `${emailPrefix}-preexisting-audit-agent` },
+      // Scrubbed, not deleted: still present via its stable `id` (its
+      // `userAgent` — the marker used to find it BEFORE this fix — is now
+      // one of the columns that gets nulled, so it can no longer be used to
+      // locate the row; that is the point). `userId`/`ipHash`/`userAgent`/
+      // `metadata` are all null; `event`/`createdAt` survive untouched. See
+      // the dedicated "AuthAuditEvent scrub" describe block below for the
+      // full ordering/mutation proof — this assertion only confirms the
+      // scrub composes correctly alongside every OTHER cascade this same
+      // transaction relies on.
+      const scrubbedAuditRow = await prisma.authAuditEvent.findUniqueOrThrow({
+        where: { id: preexistingAuditRow.id },
       });
-      expect(auditRows).toHaveLength(1);
-      expect(auditRows[0].userId).toBeNull();
+      expect(scrubbedAuditRow.userId).toBeNull();
+      expect(scrubbedAuditRow.ipHash).toBeNull();
+      expect(scrubbedAuditRow.userAgent).toBeNull();
+      expect(scrubbedAuditRow.metadata).toBeNull();
+      expect(scrubbedAuditRow.event).toBe('login_failed');
+      expect(scrubbedAuditRow.createdAt).toEqual(preexistingAuditRow.createdAt);
 
       const analyticsRows = await prisma.analyticsEvent.findMany({
         where: { eventName: `${emailPrefix}-video_play` },
@@ -377,7 +412,7 @@ describe('AuthService.deleteAccount', () => {
       expect(analyticsRows[0].userId).toBeNull();
 
       // No identifying value (email, raw IP) leaks into any surviving row.
-      const serializedAudit = JSON.stringify(auditRows);
+      const serializedAudit = JSON.stringify(scrubbedAuditRow);
       const serializedAnalytics = JSON.stringify(analyticsRows);
       expect(serializedAudit).not.toContain(email);
       expect(serializedAudit).not.toContain(ip);
@@ -395,6 +430,176 @@ describe('AuthService.deleteAccount', () => {
       expect(successRows[0].userId).toBeNull();
       expect(JSON.stringify(successRows[0])).not.toContain(email);
       expect(JSON.stringify(successRows[0])).not.toContain(ip);
+    });
+  });
+
+  /**
+   * Phase 12, work unit 12E-B1 (DECISIONS.md 2026-07-30, decision 1,
+   * resolving `TASK_QUEUE.md` follow-up 7). Dedicated coverage for the
+   * `AuthAuditEvent` scrub itself, separate from the broader "cascade +
+   * anonymization" composition test above.
+   */
+  describe('AuthAuditEvent scrub at deletion (Phase 12E-B1)', () => {
+    it("scrubs the deleted account's OWN AuthAuditEvent rows — userId, ipHash, userAgent AND metadata all null; event and createdAt preserved", async () => {
+      const password = 'correct-horse-battery';
+      const ip = '203.0.113.77';
+      const { email, result } = await registerUser('scrub', password);
+      const userId = result.user.id;
+
+      // A REAL pre-existing audit row, produced by the actual
+      // `AuthAuditService.emit` -> `hashIp`/`sanitizeUserAgent` pipeline (a
+      // genuine failed login), not a hand-crafted fixture — so `ipHash`
+      // below is a real HMAC digest, exactly what a live attacker's or
+      // operator's row would contain.
+      await expect(
+        service.login(
+          { email, password: 'totally-wrong-password' },
+          { ip, userAgent: `${emailPrefix}-scrub-preexisting-agent` },
+        ),
+      ).rejects.toMatchObject({
+        code: AppErrorCode.INVALID_CREDENTIALS,
+        status: HttpStatus.UNAUTHORIZED,
+      } as Partial<AppException>);
+
+      const preDeletionRow = await prisma.authAuditEvent.findFirstOrThrow({
+        where: { userId, event: 'login_failed' },
+      });
+      scrubbedAuditEventIds.push(preDeletionRow.id);
+      // Sanity: confirm the fixture genuinely has something to scrub before
+      // asserting it got scrubbed — otherwise this test would pass
+      // vacuously even with the scrub deleted entirely.
+      expect(preDeletionRow.userId).toBe(userId);
+      expect(preDeletionRow.ipHash).not.toBeNull();
+      expect(preDeletionRow.ipHash).not.toBe(ip);
+      expect(preDeletionRow.userAgent).toBe(
+        `${emailPrefix}-scrub-preexisting-agent`,
+      );
+      expect(
+        (preDeletionRow.metadata as { reason?: string } | null)?.reason,
+      ).toBe('invalid_password');
+
+      await service.deleteAccount(
+        userId,
+        { currentPassword: password, confirmDeletion: true },
+        { userAgent: `${emailPrefix}-scrub-deletion-agent` },
+      );
+
+      const scrubbedRow = await prisma.authAuditEvent.findUniqueOrThrow({
+        where: { id: preDeletionRow.id },
+      });
+      expect(scrubbedRow.userId).toBeNull();
+      expect(scrubbedRow.ipHash).toBeNull();
+      expect(scrubbedRow.userAgent).toBeNull();
+      expect(scrubbedRow.metadata).toBeNull();
+      // Preserved exactly, per decision 1's "preserve only the allowlisted
+      // event type and the timestamp".
+      expect(scrubbedRow.event).toBe('login_failed');
+      expect(scrubbedRow.createdAt).toEqual(preDeletionRow.createdAt);
+    });
+
+    /**
+     * THE ordering test. `AuthAuditEvent.userId` is `onDelete: SetNull`
+     * (`prisma/schema.prisma`), and Postgres fires that cascade
+     * SYNCHRONOUSLY, inside the same transaction, the instant
+     * `tx.user.deleteMany` runs — so if the scrub were moved to AFTER that
+     * call, its `where: { userId }` filter would already match zero rows
+     * (the column is already `null`) and it would silently update nothing.
+     * That failure mode produces NO thrown error and NO 500 — the deletion
+     * still "succeeds" from the caller's point of view, which is exactly
+     * why this needs its own explicit, named regression test rather than
+     * relying on the ordering "obviously" being correct. Manually verified
+     * non-vacuous: moving the scrub in `auth.service.ts` to after
+     * `tx.user.deleteMany` makes this test fail (ipHash/userAgent/metadata
+     * stay populated instead of turning null); restoring the original order
+     * makes it pass again.
+     */
+    it('ORDERING (load-bearing): the scrub runs before the User row is deleted, not after', async () => {
+      const password = 'correct-horse-battery';
+      const { result } = await registerUser('scrub-ordering', password);
+      const userId = result.user.id;
+
+      const rowA = await prisma.authAuditEvent.create({
+        data: {
+          userId,
+          event: 'login_failed',
+          userAgent: `${emailPrefix}-scrub-ordering-agent-a`,
+          ipHash: `${emailPrefix}-scrub-ordering-iphash-a`,
+          metadata: { reason: 'invalid_password' },
+        },
+      });
+      const rowB = await prisma.authAuditEvent.create({
+        data: {
+          userId,
+          event: 'login_success',
+          userAgent: `${emailPrefix}-scrub-ordering-agent-b`,
+          ipHash: `${emailPrefix}-scrub-ordering-iphash-b`,
+        },
+      });
+      scrubbedAuditEventIds.push(rowA.id, rowB.id);
+
+      await service.deleteAccount(
+        userId,
+        { currentPassword: password, confirmDeletion: true },
+        { userAgent: `${emailPrefix}-scrub-ordering-deletion-agent` },
+      );
+
+      const [scrubbedA, scrubbedB] = await Promise.all([
+        prisma.authAuditEvent.findUniqueOrThrow({ where: { id: rowA.id } }),
+        prisma.authAuditEvent.findUniqueOrThrow({ where: { id: rowB.id } }),
+      ]);
+
+      for (const row of [scrubbedA, scrubbedB]) {
+        expect(row.userId).toBeNull();
+        expect(row.ipHash).toBeNull();
+        expect(row.userAgent).toBeNull();
+        expect(row.metadata).toBeNull();
+      }
+      expect(scrubbedA.event).toBe('login_failed');
+      expect(scrubbedB.event).toBe('login_success');
+    });
+
+    it("does NOT touch a DIFFERENT account's own AuthAuditEvent rows", async () => {
+      const password = 'correct-horse-battery';
+      const { result: deletedAccount } = await registerUser(
+        'scrub-other-deleted',
+        password,
+      );
+      const { result: otherAccount } = await registerUser(
+        'scrub-other-survivor',
+        password,
+      );
+
+      const otherAccountRow = await prisma.authAuditEvent.create({
+        data: {
+          userId: otherAccount.user.id,
+          event: 'login_success',
+          userAgent: `${emailPrefix}-scrub-other-survivor-agent`,
+          ipHash: `${emailPrefix}-scrub-other-survivor-iphash`,
+        },
+      });
+
+      await service.deleteAccount(
+        deletedAccount.user.id,
+        { currentPassword: password, confirmDeletion: true },
+        { userAgent: `${emailPrefix}-scrub-other-deleted-deletion-agent` },
+      );
+
+      const untouchedRow = await prisma.authAuditEvent.findUniqueOrThrow({
+        where: { id: otherAccountRow.id },
+      });
+      expect(untouchedRow.userId).toBe(otherAccount.user.id);
+      expect(untouchedRow.ipHash).toBe(
+        `${emailPrefix}-scrub-other-survivor-iphash`,
+      );
+      expect(untouchedRow.userAgent).toBe(
+        `${emailPrefix}-scrub-other-survivor-agent`,
+      );
+
+      // The surviving account is otherwise completely unaffected too.
+      const survivorUser = await prisma.user.findUnique({
+        where: { id: otherAccount.user.id },
+      });
+      expect(survivorUser).not.toBeNull();
     });
   });
 

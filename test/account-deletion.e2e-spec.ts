@@ -55,6 +55,13 @@ describe('Account deletion (e2e)', () => {
   const deletionUserAgent = `${emailPrefix}-deletion-agent`;
   const uniqueEmail = (label: string): string =>
     `${emailPrefix}-${label}-${Date.now()}-${Math.random().toString(36).slice(2)}@example.test`;
+  // Phase 12, work unit 12E-B1 (DECISIONS.md 2026-07-30, decision 1): a
+  // genuinely SCRUBBED `AuthAuditEvent` row has `userId`/`ipHash`/
+  // `userAgent`/`metadata` all null by design — so, by design, it can no
+  // longer be found via the marker-`userAgent` or `user.email` join cleanup
+  // queries below. Tests that expect a row to end up scrubbed push its `id`
+  // here so `afterAll` can still find and remove it directly.
+  const scrubbedAuditEventIds: string[] = [];
 
   beforeAll(async () => {
     process.env.DEV_TOOLS_ENABLED = 'true';
@@ -90,6 +97,11 @@ describe('Account deletion (e2e)', () => {
     await prisma.authAuditEvent.deleteMany({
       where: { user: { email: { contains: emailPrefix } } },
     });
+    if (scrubbedAuditEventIds.length > 0) {
+      await prisma.authAuditEvent.deleteMany({
+        where: { id: { in: scrubbedAuditEventIds } },
+      });
+    }
     await prisma.session.deleteMany({
       where: { user: { email: { contains: emailPrefix } } },
     });
@@ -311,6 +323,93 @@ describe('Account deletion (e2e)', () => {
     await request(app.getHttpServer())
       .post('/auth/refresh')
       .send({ refreshToken: authB.refreshToken })
+      .expect(HttpStatus.OK);
+  });
+
+  it("scrubs the account's own pre-existing AuthAuditEvent rows at the DB level — userId, ipHash, userAgent and metadata all null; event and createdAt preserved (Phase 12E-B1)", async () => {
+    const password = 'correct-horse-battery';
+    const { email, auth } = await registerAccount('scrub', password);
+    const preExistingAgent = `${emailPrefix}-scrub-preexisting-agent`;
+
+    // A REAL pre-existing audit row, produced by the actual HTTP login flow
+    // (a genuine wrong-password attempt against a real account) — not a
+    // hand-crafted DB fixture — so `ipHash` below is a real HMAC digest.
+    await request(app.getHttpServer())
+      .post('/auth/login')
+      .set('User-Agent', preExistingAgent)
+      .send({ email, password: 'totally-wrong-password' })
+      .expect(HttpStatus.UNAUTHORIZED);
+
+    const preDeletionRow = await prisma.authAuditEvent.findFirstOrThrow({
+      where: { userAgent: preExistingAgent, event: 'login_failed' },
+    });
+    scrubbedAuditEventIds.push(preDeletionRow.id);
+    // Sanity: the fixture genuinely has something to scrub.
+    expect(preDeletionRow.userId).not.toBeNull();
+    expect(preDeletionRow.ipHash).not.toBeNull();
+    expect(preDeletionRow.userAgent).toBe(preExistingAgent);
+    expect(
+      (preDeletionRow.metadata as { reason?: string } | null)?.reason,
+    ).toBe('invalid_password');
+
+    await request(app.getHttpServer())
+      .post('/users/me/deletion')
+      .set('Authorization', `Bearer ${auth.accessToken}`)
+      .set('User-Agent', deletionUserAgent)
+      .send({ currentPassword: password, confirmDeletion: true })
+      .expect(HttpStatus.OK);
+
+    const scrubbedRow = await prisma.authAuditEvent.findUniqueOrThrow({
+      where: { id: preDeletionRow.id },
+    });
+    expect(scrubbedRow.userId).toBeNull();
+    expect(scrubbedRow.ipHash).toBeNull();
+    expect(scrubbedRow.userAgent).toBeNull();
+    expect(scrubbedRow.metadata).toBeNull();
+    expect(scrubbedRow.event).toBe('login_failed');
+    expect(scrubbedRow.createdAt).toEqual(preDeletionRow.createdAt);
+  });
+
+  it("does NOT scrub a DIFFERENT account's own AuthAuditEvent rows (Phase 12E-B1)", async () => {
+    const password = 'correct-horse-battery';
+    const { auth: authDeleted } = await registerAccount(
+      'scrub-other-deleted',
+      password,
+    );
+    const { email: emailSurvivor, auth: authSurvivor } = await registerAccount(
+      'scrub-other-survivor',
+      password,
+    );
+    const survivorAgent = `${emailPrefix}-scrub-other-survivor-agent`;
+
+    await request(app.getHttpServer())
+      .post('/auth/login')
+      .set('User-Agent', survivorAgent)
+      .send({ email: emailSurvivor, password: 'totally-wrong-password' })
+      .expect(HttpStatus.UNAUTHORIZED);
+
+    const survivorRow = await prisma.authAuditEvent.findFirstOrThrow({
+      where: { userAgent: survivorAgent, event: 'login_failed' },
+    });
+
+    await request(app.getHttpServer())
+      .post('/users/me/deletion')
+      .set('Authorization', `Bearer ${authDeleted.accessToken}`)
+      .set('User-Agent', deletionUserAgent)
+      .send({ currentPassword: password, confirmDeletion: true })
+      .expect(HttpStatus.OK);
+
+    const untouchedRow = await prisma.authAuditEvent.findUniqueOrThrow({
+      where: { id: survivorRow.id },
+    });
+    expect(untouchedRow.userId).not.toBeNull();
+    expect(untouchedRow.ipHash).not.toBeNull();
+    expect(untouchedRow.userAgent).toBe(survivorAgent);
+
+    // The survivor account is otherwise unaffected too.
+    await request(app.getHttpServer())
+      .post('/auth/refresh')
+      .send({ refreshToken: authSurvivor.refreshToken })
       .expect(HttpStatus.OK);
   });
 

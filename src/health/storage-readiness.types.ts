@@ -20,9 +20,13 @@ export interface StorageReadinessResponse {
   ready: boolean;
   /**
    * Whether the required config variable NAMES for the active driver are
-   * all set. `local` → `STORAGE_ROOT` set. `r2` → every
-   * `OBJECT_STORAGE_*` name required by `env.validation.ts`'s
-   * `REQUIRED_R2_KEYS` is set. Presence only — never a value.
+   * all set. `local` → `STORAGE_ROOT` set. `r2` → all six
+   * `OBJECT_STORAGE_*` fields on `StorageConfig` (NOT the same set as
+   * `env.validation.ts`'s `REQUIRED_R2_KEYS`, which is five names as of
+   * Phase 11, work unit 11H-B1 — `OBJECT_STORAGE_PUBLIC_BASE_URL` is
+   * optional for boot but still checked here; see the doc comment on
+   * `checkR2Readiness` in `storage-readiness.service.ts`). Presence only —
+   * never a value.
    */
   configPresent: boolean;
 }

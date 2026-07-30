@@ -33,9 +33,11 @@ const TEST_STORAGE_CONFIG: RootConfig['storage'] = {
   publicBaseUrl: 'https://media.example.test',
 };
 
-function buildFakeConfigService(): ConfigService<RootConfig> {
+function buildFakeConfigService(
+  overrides: Partial<RootConfig['storage']> = {},
+): ConfigService<RootConfig> {
   return {
-    get: () => TEST_STORAGE_CONFIG,
+    get: () => ({ ...TEST_STORAGE_CONFIG, ...overrides }),
   } as unknown as ConfigService<RootConfig>;
 }
 
@@ -304,6 +306,98 @@ describe('StorageService', () => {
       expect(service.buildPublicUrl('/videos/abc.mp4')).toBe(
         'https://media.example.test/videos/abc.mp4',
       );
+    });
+
+    it('tolerates a trailing slash on the configured base URL', () => {
+      const svc = new StorageService(
+        buildFakeConfigService({
+          publicBaseUrl: 'https://media.example.test/',
+        }),
+        mockClient as unknown as S3Client,
+      );
+
+      expect(svc.buildPublicUrl('videos/abc.mp4')).toBe(
+        'https://media.example.test/videos/abc.mp4',
+      );
+    });
+
+    /**
+     * Phase 11, work unit 11H-B1 / 11H-T1: `OBJECT_STORAGE_PUBLIC_BASE_URL`
+     * is now optional (`StorageConfig.publicBaseUrl` is `string | undefined`
+     * — see `configuration.ts`). `buildPublicUrl` must throw a clear
+     * configuration error naming the variable, never fabricate a bogus URL
+     * from an empty/missing base. This has zero callers in production code
+     * today (only this spec exercises it) — see `env.validation.ts`'s
+     * `REQUIRED_R2_KEYS` doc comment for that grounding fact.
+     *
+     * Mutation-tested: temporarily changing `buildPublicUrl` to fall back to
+     * `?? ''` and keep returning a string (i.e. reverting to pre-11H-B1
+     * behavior) was manually verified to fail the "does not return a
+     * string" assertion below, then reverted — see the 11H-T1 handoff notes
+     * for that run's output.
+     */
+    describe('without a configured base URL (Phase 11, work unit 11H-B1)', () => {
+      it('throws — and does not return a string — when publicBaseUrl is undefined', () => {
+        const svc = new StorageService(
+          buildFakeConfigService({ publicBaseUrl: undefined }),
+          mockClient as unknown as S3Client,
+        );
+
+        let thrown: unknown;
+        let returned: unknown;
+        try {
+          returned = svc.buildPublicUrl('videos/abc.mp4');
+        } catch (error) {
+          thrown = error;
+        }
+
+        expect(returned).toBeUndefined();
+        expect(thrown).toBeInstanceOf(Error);
+        expect(typeof thrown).not.toBe('string');
+      });
+
+      it('throws when publicBaseUrl is an empty string too (never assembles a path-shaped bogus URL)', () => {
+        const svc = new StorageService(
+          buildFakeConfigService({ publicBaseUrl: '' }),
+          mockClient as unknown as S3Client,
+        );
+
+        expect(() => svc.buildPublicUrl('videos/abc.mp4')).toThrow();
+      });
+
+      it('names OBJECT_STORAGE_PUBLIC_BASE_URL in the thrown error message', () => {
+        const svc = new StorageService(
+          buildFakeConfigService({ publicBaseUrl: undefined }),
+          mockClient as unknown as S3Client,
+        );
+
+        expect(() => svc.buildPublicUrl('videos/abc.mp4')).toThrow(
+          /OBJECT_STORAGE_PUBLIC_BASE_URL/,
+        );
+      });
+
+      it('never leaks other configured credential-shaped values in the thrown error message', () => {
+        const SENTINEL = 'SENTINEL-11H-BUILDPUBLICURL-DO-NOT-LEAK-4d21f8';
+        const svc = new StorageService(
+          buildFakeConfigService({
+            publicBaseUrl: undefined,
+            accessKeyId: SENTINEL,
+            secretAccessKey: SENTINEL,
+            bucket: SENTINEL,
+            endpoint: `https://${SENTINEL}.example.test`,
+          }),
+          mockClient as unknown as S3Client,
+        );
+
+        let message = '';
+        try {
+          svc.buildPublicUrl('videos/abc.mp4');
+        } catch (error) {
+          message = (error as Error).message;
+        }
+
+        expect(message).not.toContain(SENTINEL);
+      });
     });
   });
 });

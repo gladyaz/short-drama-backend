@@ -72,13 +72,43 @@ directory, with a clear error message.
 behavior byte-for-byte and only requires `STORAGE_ROOT` above —
 `OBJECT_STORAGE_*` variables stay fully optional. `STORAGE_DRIVER=r2` is a
 feature flag only: it makes the app fail fast at startup (a clear,
-secret-free message naming the missing variable, never its value) if any
-`OBJECT_STORAGE_*` variable is unset, plus a shape-only check that
-`OBJECT_STORAGE_ENDPOINT` is a valid `http(s)` URL. Neither mode makes a
-network call at startup, and setting `STORAGE_DRIVER=r2` does not yet change
-what `StorageService` actually does — real request-time R2 wiring is a
-separate, later, human-gated step. See `docs/r2-readiness.md` for the full
-rollback and credential-insertion runbook.
+secret-free message naming the missing variable, never its value) if any of
+the **five required** `OBJECT_STORAGE_*` variables is unset, plus a
+shape-only check that `OBJECT_STORAGE_ENDPOINT` is a valid `http(s)` URL.
+Neither mode makes a network call at startup, and setting
+`STORAGE_DRIVER=r2` does not yet change what `StorageService` actually
+does — real request-time R2 wiring is a separate, later, human-gated step.
+See `docs/r2-readiness.md` for the full rollback and credential-insertion
+runbook.
+
+#### Private vs. public R2: the sixth variable (Phase 11, work unit 11H-B1)
+
+`STORAGE_DRIVER=r2` requires exactly **five** variable names to boot:
+`OBJECT_STORAGE_ENDPOINT`, `OBJECT_STORAGE_REGION`, `OBJECT_STORAGE_BUCKET`,
+`OBJECT_STORAGE_ACCESS_KEY_ID`, `OBJECT_STORAGE_SECRET_ACCESS_KEY`. A
+**sixth**, `OBJECT_STORAGE_PUBLIC_BASE_URL`, is **optional** — the app boots
+fine without it.
+
+This split exists because the dev R2 bucket is **private**: `r2.dev` public
+access is disabled and no custom domain is configured, so upload and
+playback both go through **presigned PUT/GET URLs**
+(`StorageService.createPresignedPutUrl`/`createPresignedGetUrl`), never a
+public URL. None of `createPresignedPutUrl`, `createPresignedGetUrl`,
+`headObject`, `objectExists`, `deleteObject`, or `putObject` ever read
+`publicBaseUrl` — only `StorageService.buildPublicUrl` does, and that method
+has **zero callers in production code** today (only its own spec exercises
+it).
+
+`OBJECT_STORAGE_PUBLIC_BASE_URL` only matters once a **public** bucket or a
+**custom domain** exists to serve public object URLs from. If
+`buildPublicUrl` is ever called without one configured, it throws a clear,
+secret-free configuration error naming the missing variable (never a value)
+instead of silently assembling an invalid URL — an empty base URL would
+otherwise produce something that merely *looks* like a valid relative path
+(e.g. `/videos/abc.mp4`), which is a worse failure mode than a loud error.
+When a base URL **is** configured, `buildPublicUrl`'s behavior (including
+its trailing-slash/leading-slash normalisation) is unchanged from before
+this work unit.
 
 An opt-in, real-network disposable-object smoke test
 (`src/storage/storage-r2-smoke.spec.ts`, work unit 11G-4) round-trips a
@@ -1279,8 +1309,19 @@ secret-free storage-readiness signal:
 
 - `driver` — the active `STORAGE_DRIVER` (`"local"` or `"r2"`).
 - `configPresent` — whether the required config variable **names** for the
-  active driver are all set (`local` → `STORAGE_ROOT`; `r2` → every
-  `OBJECT_STORAGE_*` name) — presence only, never a value.
+  active driver are all set (`local` → `STORAGE_ROOT`; `r2` → all six
+  `OBJECT_STORAGE_*` names, **including** `OBJECT_STORAGE_PUBLIC_BASE_URL`)
+  — presence only, never a value. This is deliberately a **superset** of
+  what `env.validation.ts` requires to *boot* in `r2` mode (five names, as
+  of Phase 11, work unit 11H-B1 — see "Private vs. public R2" above): a
+  booted private-R2 deployment (the five boot-required names set,
+  `OBJECT_STORAGE_PUBLIC_BASE_URL` intentionally absent) will report
+  `configPresent: false` / `ready: false` here even though presigned
+  PUT/HEAD/GET/DELETE work correctly. This endpoint's readiness definition
+  was intentionally left unchanged by 11H-B1, whose approved scope covered
+  only boot validation and `buildPublicUrl`; whether `/health/details`
+  should treat a private-R2 deployment as "ready" is a separate, open
+  product question.
 - `ready` — `local`: `STORAGE_ROOT` exists and is a readable directory (a
   local `fs.stat`, never a network call). `r2`: always equal to
   `configPresent` — this endpoint deliberately never makes a live network/R2

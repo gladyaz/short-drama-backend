@@ -23,13 +23,26 @@ const REQUIRED_KEYS = [
 
 /**
  * Phase 11, work unit 11G-3: `OBJECT_STORAGE_*` env var NAMES required only
- * when `STORAGE_DRIVER=r2` — these are exactly the fields `StorageConfig`
- * exposes and that `StorageService`/`StorageModule` read: `bucket` (every
- * S3 command in `storage.service.ts`), `endpoint`/`region`/`accessKeyId`/
- * `secretAccessKey` (the `S3Client` constructed in `storage.module.ts`),
- * and `publicBaseUrl` (`StorageService.buildPublicUrl`). This is
+ * when `STORAGE_DRIVER=r2` — these are exactly the five fields
+ * `StorageService`/`StorageModule` need to construct an `S3Client` and issue
+ * every command they make: `endpoint`/`region`/`accessKeyId`/
+ * `secretAccessKey` (the `S3Client` constructed in `storage.module.ts`) and
+ * `bucket` (every S3 command in `storage.service.ts`). This is
  * presence/name validation only — no value is ever read into an error
  * message and no network call is made here.
+ *
+ * Phase 11, work unit 11H-B1 update: `OBJECT_STORAGE_PUBLIC_BASE_URL` is
+ * DELIBERATELY NOT in this list (it used to be — this list was six names
+ * before 11H-B1). It is read only by `StorageService.buildPublicUrl`, which
+ * has ZERO callers in production code (only its own spec exercises it) and
+ * is never touched by `createPresignedPutUrl`/`createPresignedGetUrl`/
+ * `headObject`/`objectExists`/`deleteObject`/`putObject`. The dev R2 bucket
+ * is private, `r2.dev` is disabled, and no custom domain exists, so private
+ * upload/playback uses presigned PUT/GET exclusively — requiring a public
+ * base URL at boot blocked a correctly-configured private bucket from ever
+ * starting, for a value it has no use for. `buildPublicUrl` still fails
+ * loudly (naming this exact variable, never a value) if it is ever called
+ * without one configured — see its doc comment in `storage.service.ts`.
  *
  * Exported (Phase 11, work unit 11G-4) so `StorageReadinessService` and the
  * opt-in disposable-object smoke test can reuse the exact same list of
@@ -43,7 +56,6 @@ export const REQUIRED_R2_KEYS = [
   'OBJECT_STORAGE_BUCKET',
   'OBJECT_STORAGE_ACCESS_KEY_ID',
   'OBJECT_STORAGE_SECRET_ACCESS_KEY',
-  'OBJECT_STORAGE_PUBLIC_BASE_URL',
 ] as const;
 
 export function validateEnv(

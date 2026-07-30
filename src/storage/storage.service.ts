@@ -169,9 +169,35 @@ export class StorageService {
     );
   }
 
-  /** Builds a public CDN URL for `key` from the configured public base URL. */
+  /**
+   * Builds a public CDN URL for `key` from the configured public base URL.
+   *
+   * Phase 11, work unit 11H-B1: `OBJECT_STORAGE_PUBLIC_BASE_URL` is
+   * optional (see `env.validation.ts`'s `REQUIRED_R2_KEYS`) — it is only
+   * needed once a public bucket or a custom domain exists to serve public
+   * object URLs from. Today's dev R2 bucket is private, `r2.dev` is
+   * disabled, and no custom domain exists, so this method has ZERO callers
+   * in production code (only its own spec exercises it); presigned
+   * PUT/HEAD/GET/DELETE never read `publicBaseUrl` and work regardless.
+   * When a base URL IS configured, this method's behavior — including the
+   * trailing-slash/leading-slash normalisation below — is unchanged from
+   * before this work unit.
+   */
   buildPublicUrl(key: string): string {
-    const base = this.storageConfig.publicBaseUrl.replace(/\/+$/, '');
+    const configuredBase = this.storageConfig.publicBaseUrl;
+
+    if (configuredBase === undefined || configuredBase.length === 0) {
+      throw new Error(
+        'Cannot build a public object URL: OBJECT_STORAGE_PUBLIC_BASE_URL ' +
+          'is not configured. This variable is only needed to build ' +
+          'public-object URLs (a public bucket or a custom domain) — see ' +
+          '.env.example. A private bucket serves objects via presigned ' +
+          'PUT/GET URLs instead (createPresignedPutUrl/createPresignedGetUrl), ' +
+          'which never call this method.',
+      );
+    }
+
+    const base = configuredBase.replace(/\/+$/, '');
     const safeKey = key.replace(/^\/+/, '');
     return `${base}/${safeKey}`;
   }

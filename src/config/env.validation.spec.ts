@@ -1,4 +1,4 @@
-import { validateEnv } from './env.validation';
+import { REQUIRED_R2_KEYS, validateEnv } from './env.validation';
 
 /** Shallow copy of `config` with `key` removed — avoids unused-binding lint noise from destructure-to-omit. */
 function omitKey(
@@ -214,5 +214,144 @@ describe('validateEnv — STORAGE_DRIVER (Phase 11, 11G-3)', () => {
     expect(() =>
       validateEnv({ ...VALID_CONFIG, STORAGE_DRIVER: 'foo' }),
     ).toThrow(/Invalid STORAGE_DRIVER: "foo"/);
+  });
+});
+
+/**
+ * Phase 11, work unit 11H-B1 / 11H-T1: `OBJECT_STORAGE_PUBLIC_BASE_URL` is
+ * REMOVED from `REQUIRED_R2_KEYS` — it is now optional even in `r2` mode.
+ * This is the dedicated non-vacuous regression coverage for that change:
+ * local mode with zero R2 vars; the **private** R2 case this slice exists
+ * for (the five remaining names present, the sixth absent); the **public**
+ * R2 case (all six present, preserved for a future custom domain); a
+ * malformed endpoint still rejected in the private case; each of the five
+ * required names individually rejected by name; and an explicit
+ * no-credential-values-in-errors check using a distinctive, grep-able
+ * sentinel for every `OBJECT_STORAGE_*` variable (including the now-optional
+ * sixth).
+ *
+ * Every case here is genuinely able to fail: `REQUIRED_R2_KEYS`'s exact
+ * five-name shape is asserted directly, and the "boots without the sixth
+ * name" test was manually verified to fail (mutation-tested) by temporarily
+ * re-adding `OBJECT_STORAGE_PUBLIC_BASE_URL` to `REQUIRED_R2_KEYS` in
+ * `env.validation.ts`, observing the failure, then reverting — see the
+ * 11H-T1 handoff notes for that run's output.
+ */
+describe('validateEnv — 11H-B1/11H-T1: OBJECT_STORAGE_PUBLIC_BASE_URL is optional', () => {
+  const REQUIRED_R2_NAMES = [
+    'OBJECT_STORAGE_ENDPOINT',
+    'OBJECT_STORAGE_REGION',
+    'OBJECT_STORAGE_BUCKET',
+    'OBJECT_STORAGE_ACCESS_KEY_ID',
+    'OBJECT_STORAGE_SECRET_ACCESS_KEY',
+  ] as const;
+
+  /** Five names only — no `OBJECT_STORAGE_PUBLIC_BASE_URL` — the private-bucket case this slice exists for. */
+  const PRIVATE_R2_CONFIG: Record<string, unknown> = {
+    ...VALID_CONFIG,
+    STORAGE_DRIVER: 'r2',
+    OBJECT_STORAGE_ENDPOINT: 'https://private.example.invalid',
+    OBJECT_STORAGE_REGION: 'auto',
+    OBJECT_STORAGE_BUCKET: 'private-test-bucket',
+    OBJECT_STORAGE_ACCESS_KEY_ID: 'private-test-access-key-id',
+    OBJECT_STORAGE_SECRET_ACCESS_KEY: 'private-test-secret-access-key',
+  };
+
+  it('REQUIRED_R2_KEYS is exactly the five names above (no OBJECT_STORAGE_PUBLIC_BASE_URL)', () => {
+    expect(REQUIRED_R2_KEYS).toEqual(REQUIRED_R2_NAMES);
+    expect(REQUIRED_R2_KEYS).not.toContain('OBJECT_STORAGE_PUBLIC_BASE_URL');
+  });
+
+  it('boots in local mode with zero OBJECT_STORAGE_* variables set at all', () => {
+    expect('STORAGE_DRIVER' in VALID_CONFIG).toBe(false);
+    for (const name of [
+      ...REQUIRED_R2_NAMES,
+      'OBJECT_STORAGE_PUBLIC_BASE_URL',
+    ]) {
+      expect(name in VALID_CONFIG).toBe(false);
+    }
+
+    expect(() => validateEnv({ ...VALID_CONFIG })).not.toThrow();
+  });
+
+  it('boots in r2 mode with only the five required names present — private R2, no public base URL', () => {
+    expect('OBJECT_STORAGE_PUBLIC_BASE_URL' in PRIVATE_R2_CONFIG).toBe(false);
+
+    expect(() => validateEnv({ ...PRIVATE_R2_CONFIG })).not.toThrow();
+  });
+
+  it('boots in r2 mode with all six names present — public R2, preserved for a future custom domain', () => {
+    expect(() =>
+      validateEnv({
+        ...PRIVATE_R2_CONFIG,
+        OBJECT_STORAGE_PUBLIC_BASE_URL: 'https://media.example.invalid',
+      }),
+    ).not.toThrow();
+  });
+
+  it('rejects a malformed OBJECT_STORAGE_ENDPOINT in the private (no public base URL) case', () => {
+    expect(() =>
+      validateEnv({
+        ...PRIVATE_R2_CONFIG,
+        OBJECT_STORAGE_ENDPOINT: 'not-a-valid-url',
+      }),
+    ).toThrow(/OBJECT_STORAGE_ENDPOINT must be a valid absolute http\(s\) URL/);
+  });
+
+  it.each(REQUIRED_R2_NAMES)(
+    'rejects r2 mode when %s is individually missing, naming it in the error',
+    (key) => {
+      const config = omitKey(PRIVATE_R2_CONFIG, key);
+
+      expect(() => validateEnv(config)).toThrow(
+        new RegExp(`Missing required environment variable: ${key}`),
+      );
+    },
+  );
+
+  describe('no credential values ever appear in an error message', () => {
+    const SENTINEL = 'SENTINEL-11H-DO-NOT-LEAK-7f3c9a2b';
+
+    /** Every OBJECT_STORAGE_* variable — including the optional sixth — set to a distinctive, grep-able fake value. */
+    const SENTINEL_R2_CONFIG: Record<string, unknown> = {
+      ...VALID_CONFIG,
+      STORAGE_DRIVER: 'r2',
+      OBJECT_STORAGE_ENDPOINT: `https://${SENTINEL}.example.invalid`,
+      OBJECT_STORAGE_REGION: SENTINEL,
+      OBJECT_STORAGE_BUCKET: SENTINEL,
+      OBJECT_STORAGE_ACCESS_KEY_ID: SENTINEL,
+      OBJECT_STORAGE_SECRET_ACCESS_KEY: SENTINEL,
+      OBJECT_STORAGE_PUBLIC_BASE_URL: `https://${SENTINEL}.example.invalid`,
+    };
+
+    function thrownMessage(config: Record<string, unknown>): string {
+      try {
+        validateEnv(config);
+      } catch (error) {
+        return (error as Error).message;
+      }
+      throw new Error(
+        'expected validateEnv(config) to throw in this test case, but it did not',
+      );
+    }
+
+    it.each(REQUIRED_R2_NAMES)(
+      'never leaks the sentinel value when %s is the missing name',
+      (missingKey) => {
+        const message = thrownMessage(omitKey(SENTINEL_R2_CONFIG, missingKey));
+
+        expect(message).not.toContain(SENTINEL);
+        expect(message).toContain(missingKey);
+      },
+    );
+
+    it('never leaks the sentinel value on a malformed endpoint', () => {
+      const message = thrownMessage({
+        ...SENTINEL_R2_CONFIG,
+        OBJECT_STORAGE_ENDPOINT: 'not-a-valid-url',
+      });
+
+      expect(message).not.toContain(SENTINEL);
+    });
   });
 });

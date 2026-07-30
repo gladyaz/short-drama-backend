@@ -12,10 +12,18 @@ import { StorageReadinessResponse } from './storage-readiness.types';
  * booleans (see `storage-readiness.types.ts`).
  *
  * `r2` mode intentionally does NOT probe R2 live: `ready` there is defined
- * as equal to `configPresent` (are the required `OBJECT_STORAGE_*` variable
- * NAMES set?), matching the same six names `env.validation.ts`'s
- * `REQUIRED_R2_KEYS` already requires at boot. A live network/R2 round-trip
- * belongs to the separate, human-gated disposable-object smoke test (see
+ * as equal to `configPresent` (are all six `OBJECT_STORAGE_*` fields on
+ * `StorageConfig` set?) — this predates, and is DELIBERATELY UNCHANGED by,
+ * Phase 11, work unit 11H-B1, which removed `OBJECT_STORAGE_PUBLIC_BASE_URL`
+ * from `env.validation.ts`'s `REQUIRED_R2_KEYS` (now five names) so a
+ * private-R2 deployment can boot without it. This service was NOT part of
+ * 11H-B1's approved scope, so it still requires all six names, including
+ * `publicBaseUrl`, for `configPresent`/`ready` — meaning a booted private-R2
+ * deployment (the five `REQUIRED_R2_KEYS` names set, `publicBaseUrl`
+ * intentionally absent) will report `ready: false` here. Whether that
+ * should change is an open, separate product decision, not resolved by this
+ * comment. A live network/R2 round-trip belongs to the separate,
+ * human-gated disposable-object smoke test (see
  * `src/storage/storage-r2-smoke.spec.ts` for the unrelated, opt-in real-R2
  * test — this service is never involved in that path), not a request-time
  * health check, so `/health/details` stays fast and entirely
@@ -55,7 +63,18 @@ function checkR2Readiness(
     storageConfig.bucket,
     storageConfig.accessKeyId,
     storageConfig.secretAccessKey,
-    storageConfig.publicBaseUrl,
+    // Phase 11, work unit 11H-B1: `publicBaseUrl` became `string | undefined`
+    // (it is now optional even at boot — see `env.validation.ts`'s
+    // `REQUIRED_R2_KEYS`, which no longer includes it). This `?? ''`
+    // deliberately PRESERVES this service's pre-11H-B1 behavior byte for
+    // byte (an absent public base URL still makes `configPresent`/`ready`
+    // false here) rather than silently loosening what "ready" means —
+    // 11H-B1's approved scope covers boot validation and
+    // `StorageService.buildPublicUrl` only, not this readiness signal.
+    // Whether a private-R2 deployment (5 names set, this one intentionally
+    // absent) should report `ready: true` here is a real, separate product
+    // question, deliberately left open rather than decided in this slice.
+    storageConfig.publicBaseUrl ?? '',
   ].every((value) => value.trim().length > 0);
 
   return { driver: 'r2', configPresent, ready: configPresent };

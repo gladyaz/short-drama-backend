@@ -59,6 +59,16 @@ export const DEFAULT_STORAGE_DRIVER: StorageDriver = 'local';
  * now required by `env.validation.ts`, but ONLY when `STORAGE_DRIVER=r2`
  * (see `driver` below); in the default `local` mode they remain fully
  * optional, exactly as before this unit.
+ *
+ * Phase 11, work unit 11H-B1 update: `publicBaseUrl` is `string | undefined`
+ * (not `string`), and the factory below no longer falls back to `?? ''`.
+ * This is deliberate: `OBJECT_STORAGE_PUBLIC_BASE_URL` is optional even in
+ * `r2` mode (see `env.validation.ts`'s `REQUIRED_R2_KEYS`), and an empty
+ * string is a worse failure mode than a missing one — `''` would let
+ * `StorageService.buildPublicUrl` silently assemble `"/videos/abc.mp4"`,
+ * which *looks* like a valid relative path. `undefined` instead forces
+ * `buildPublicUrl` to throw a clear configuration error (see its doc
+ * comment in `storage.service.ts`) rather than ever returning a bogus URL.
  */
 export interface StorageConfig {
   driver: StorageDriver;
@@ -67,7 +77,7 @@ export interface StorageConfig {
   bucket: string;
   accessKeyId: string;
   secretAccessKey: string;
-  publicBaseUrl: string;
+  publicBaseUrl: string | undefined;
 }
 
 export interface RootConfig {
@@ -99,7 +109,7 @@ export default (): RootConfig => ({
     bucket: process.env.OBJECT_STORAGE_BUCKET ?? '',
     accessKeyId: process.env.OBJECT_STORAGE_ACCESS_KEY_ID ?? '',
     secretAccessKey: process.env.OBJECT_STORAGE_SECRET_ACCESS_KEY ?? '',
-    publicBaseUrl: process.env.OBJECT_STORAGE_PUBLIC_BASE_URL ?? '',
+    publicBaseUrl: process.env.OBJECT_STORAGE_PUBLIC_BASE_URL,
   },
 });
 

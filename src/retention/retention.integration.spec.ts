@@ -656,7 +656,7 @@ describe('RetentionService (real database, DATABASE_URL_TEST only)', () => {
       expect(residue?.deletedCount).toBe(0);
     });
 
-    it('does NOT delete an anonymized (userId: null) AnalyticsEvent/AuthAuditEvent row required by decision 2 — old or fresh', async () => {
+    it('does NOT delete an anonymized (userId: null) AnalyticsEvent/AuthAuditEvent row (decision 2 for AnalyticsEvent, decision 1/12E-B1 for AuthAuditEvent) — old or fresh', async () => {
       const freshAnalytics = await createAnalyticsEvent(
         'residue-anon-fresh-ae',
       );

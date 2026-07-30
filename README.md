@@ -651,25 +651,43 @@ On success, returns `200 { "success": true }` and, in one
   outstanding rows).
 - Hard-deletes the `User` row.
 
-**What is cascade-deleted vs. what survives, anonymized** (DECISIONS.md
-decision 2) — every `User`-relation model in `prisma/schema.prisma` falls
-into exactly one of two buckets, both enforced by real Postgres foreign-key
-constraints, not application code:
+**What is cascade-deleted vs. what survives, scrubbed/anonymized**
+(DECISIONS.md decision 2, and decision 1 of the 2026-07-30 "Phase 12
+decision-resolution remediation slice (12E)" entry) — every `User`-relation
+model in `prisma/schema.prisma` falls into exactly one of two buckets, both
+enforced by real Postgres foreign-key constraints, not application code:
 
 - **Cascade-deleted (`onDelete: Cascade`), removed outright:** `Session`,
   `UserVideoInteraction`, `WatchProgress`, `Entitlement`,
   `PasswordResetToken`, `AccountLockout`. A deleted-then-re-registered email
   therefore cannot inherit a stale lockout or a leftover interaction/progress
   row — it is gone, not merely orphaned.
-- **Anonymized, not deleted (`onDelete: SetNull`), survives:**
-  `AnalyticsEvent.userId` and `AuthAuditEvent.userId` are set to `null`.
-  **This is required by decision 2, not an oversight** — it preserves
-  aggregate product/security history (e.g. "how many accounts were deleted
-  this month") without retaining any link back to which account it was.
-  Neither table stores a raw IP, email, or other identifying metadata that
-  would defeat the anonymization (`AnalyticsEvent` has no IP column at all;
-  `AuthAuditEvent.ipHash`/`userAgent` are already hashed/truncated at write
-  time — see "Session metadata" above).
+- **Survives, `userId` set to `null` (`onDelete: SetNull`):**
+  `AnalyticsEvent.userId` and `AuthAuditEvent.userId`. For `AnalyticsEvent`
+  that is the whole story — the model has no `ipHash`/`userAgent`/other
+  IP-derived column, so nulling `userId` alone genuinely anonymizes the row,
+  as decision 2 requires. **`AuthAuditEvent` is different, and `SetNull`
+  alone is NOT sufficient**: `ipHash` is an unsalted, unrotated HMAC of the
+  client IP — a globally stable value — so a row that kept it after `userId`
+  went `null` would still be correlatable to any other live session/account
+  sharing that IP, with no brute-forcing required. Calling that
+  "anonymized" would be wrong (this is what `TASK_QUEUE.md` follow-up 7
+  flagged, and `DECISIONS.md`'s 2026-07-30 decision 1 is explicit that a
+  globally stable HMAC must never be described as anonymous). **Work unit
+  12E-B1 closes that gap:** inside this same deletion transaction, **before**
+  `tx.user.deleteMany` runs, the caller's own `AuthAuditEvent` rows are
+  explicitly scrubbed — `userId`, `ipHash`, `userAgent`, and `metadata` (via
+  `Prisma.DbNull`, a true SQL `NULL`, not `Prisma.JsonNull`) are all set to
+  `null`, preserving only `event` and `createdAt`. **Ordering is
+  load-bearing, not stylistic:** `onDelete: SetNull` fires synchronously the
+  instant `tx.user.deleteMany` runs, so a scrub placed AFTER that call would
+  query `where: { userId }` against rows whose `userId` is already `null`
+  and silently scrub nothing — see `AuthService.deleteAccount`'s doc comment
+  (`src/auth/auth.service.ts`) and `account-deletion.service.spec.ts`'s
+  dedicated ordering test for the full reasoning and the regression test
+  that pins it. After this scrub, a deleted user's `AuthAuditEvent` rows
+  genuinely carry no `userId`/`ipHash`/`userAgent`/`metadata` — only
+  `event`/`createdAt` remain, which is real, not cosmetic, anonymization.
 
 `account_deletion_success` is emitted to `AuthAuditEvent` **after** the
 transaction commits, and **deliberately without a `userId`** — two separate
@@ -779,6 +797,14 @@ this phase):
       "expiresAt": null,
       "revokedAt": null
     }
+  ],
+  "analyticsEvents": [
+    {
+      "eventName": "video_play",
+      "timestamp": "2026-07-29T00:00:00.000Z",
+      "platform": "ios",
+      "properties": { "videoId": "video-104-01" }
+    }
   ]
 }
 ```
@@ -792,9 +818,33 @@ different concern), the entire `AuthAuditEvent`/`AccountLockout`/
 storage field (`storageKey`/`objectStorageKey`/`coverImageKey`/
 `thumbnailImageKey`) — resolving a video's `title` for a `videoId` uses an
 explicit Prisma `select: { id, title }`, so no storage path is ever even
-fetched. Product analytics (`AnalyticsEvent`) is deliberately **not**
-included either — see the doc comment in `src/export/export.types.ts` for
-the full reasoning on both calls.
+fetched.
+
+**`analyticsEvents` (Phase 12, work unit 12E-B2 — `DECISIONS.md` decision 2,
+2026-07-30):** the caller's own `AnalyticsEvent` history, INCLUDED. This
+reverses 12C-B2's original launch-time exclude call (which had been flagged
+for human confirmation as `TASK_QUEUE.md` follow-up 10 rather than decided
+unilaterally). Per row: `eventName` (already restricted at ingestion to
+`EVENT_PROPERTY_ALLOWLIST`'s keys) and `properties`, re-filtered against the
+**current** `EVENT_PROPERTY_ALLOWLIST` **at read time**
+(`filterEventPropertiesForExport`, `src/analytics/analytics.types.ts`) as
+defence in depth — the write-time scrub alone only reflects the allowlist as
+it existed when a given row was inserted, so a row written under a past or
+future allowlist version could otherwise leak a since-removed key.
+`id`/`userId` are excluded (surrogate/redundant, same reasoning as every
+other section here). Two deliberate, documented judgment calls: `platform`
+(`"ios"`/`"android"`/`"web"`) is INCLUDED — it is a coarse, three-valued
+category shared across every user on that platform, not a device/IP
+identifier, so it does not fall under decision 2's "IP/device identifiers"
+exclusion; and `timestamp` is `AnalyticsEvent.receivedAt` (server-stamped),
+**not** the caller-suppliable `clientTimestamp` — see the "Judgment call 1/2
+of 2" sections in `src/export/export.types.ts`'s doc comment for the full
+reasoning on both. No cap or pagination is added for this section even
+though it is the one part of this export whose size can grow materially
+faster than the other three (a long-lived, actively-used account's analytics
+history has no automatic pruning today — retention for this table is
+dry-run/unscheduled, see "Retention & cleanup jobs" below) — decision 2 does
+not authorize truncating a user's data.
 
 `videoId`/`seriesId` themselves ARE included: they are catalog identifiers
 the client already holds from `/videos/feed`, not internal surrogate ids, and
@@ -824,14 +874,25 @@ endpoint individually) but far more generous than account deletion's 5/15min
 (export is read-only and fully reversible, so a legitimate retry/re-export
 should not be punished).
 
-## Retention & cleanup jobs (Phase 12, work unit 12D-B1)
+## Retention & cleanup jobs (Phase 12, work units 12D-B1, 12E-B3)
 
 `src/retention/RetentionService` implements the retention/cleanup jobs
 `phases/phase-12.md`'s "12D" scope calls for — expired/revoked sessions,
-`AuthAuditEvent`/`AnalyticsEvent` TTL, deleted-account residue, and stale
-watch progress. **This work unit builds and tests these jobs but does NOT
-run them against production data this phase** — dry-run/opt-in only, per
-`DECISIONS.md`.
+expired/used password-reset tokens, `AuthAuditEvent`/`AnalyticsEvent` TTL,
+deleted-account residue, and stale watch progress. **These jobs are built
+and tested but do NOT run against production data this phase** —
+dry-run/opt-in only, per `DECISIONS.md`.
+
+**The four windows below other than `WatchProgress` are human-decided
+values** (`DECISIONS.md` "Phase 12 decision-resolution remediation slice
+(12E) approved..." entry, decision 3, 2026-07-30, work unit 12E-B3),
+superseding 12D-B1's original engineering defaults. `WatchProgress` is the
+one target decision 3 does not mention — it is **deliberately left
+unchanged at 730 days**, a conservative engineering default (not a product
+decision), since it is the only target here that is genuinely user-visible
+data rather than backend bookkeeping (see its row below). `PasswordResetToken`
+is a **new** retention target added by 12E-B3 — it was not covered by
+12D-B1's original five targets at all.
 
 **Nothing here runs automatically.** There is no `@Cron`, no
 `OnModuleInit`/startup hook, and no HTTP route — `RetentionService` is
@@ -883,10 +944,11 @@ single Prisma call is issued:
 
 | Target | Column(s) | Window | Why |
 |---|---|---|---|
-| `Session` | `revokedAt` (if set) OR `expiresAt` | 30 days | A session that is revoked or naturally expired can never authenticate again (`AuthService.refresh` rejects both), and `GET /auth/sessions` only ever lists `revokedAt: null` rows — there is no "session history" surface anywhere in this app. 30 days leaves room for a realistic "I noticed something odd a few weeks ago" investigation via `ipHash`/`userAgent`/`lastUsedAt` before the row is pruned. |
-| `AuthAuditEvent` | `createdAt` | 180 days | The operational SECURITY audit trail. Deliberately **longer** than `AnalyticsEvent` below — lower volume, higher evidentiary value per row, and a real investigation can surface weeks after the fact. Applies uniformly regardless of `userId` null-ness (see "Deleted-account residue" below). |
-| `AnalyticsEvent` | `receivedAt` | 90 days | Product telemetry — deliberately kept on a **separate, shorter** window from `AuthAuditEvent` (these two models are never merged into one TTL). This codebase has no analytics warehouse/rollup downstream of this table, so nothing reads a row older than a few months. |
-| `WatchProgress` | `updatedAt` | 730 days (2 years) | The one target that is genuinely user-**visible** data ("resume where I left off"), not backend exhaust — deleting it early is a real, noticeable product regression, not freed disk space. Growth is bounded by `active users x catalog size` (a `@@unique([userId, seriesId])` constraint), not by request volume, so there is no storage-pressure argument for an aggressive window. This is a deliberately conservative **engineering** default, not a product decision about what "abandoned" means — a human product owner may reasonably want a different number. |
+| `Session` | `revokedAt` (if set) OR `expiresAt` | 90 days | A session that is revoked or naturally expired can never authenticate again (`AuthService.refresh` rejects both), and `GET /auth/sessions` only ever lists `revokedAt: null` rows — there is no "session history" surface anywhere in this app. **90 days is human-decided** (decision 3, superseding 12D-B1's original 30-day engineering default); it leaves room for a realistic "I noticed something odd a few weeks ago" investigation via `ipHash`/`userAgent`/`lastUsedAt` before the row is pruned. |
+| `PasswordResetToken` | `usedAt` (if set) OR `expiresAt` | 90 days | A new target, added by 12E-B3 — not covered by 12D-B1 at all. Mirrors `Session`'s "explicit end OR natural expiry" shape: `usedAt` non-null is the "revoked" half (the token was consumed and can never be reused), `expiresAt` in the past is the "expired" half. **90 days is human-decided** (decision 3), chosen equal to `SESSION_RETENTION_DAYS` — both are used-or-expired credential/token bookkeeping with no remaining live purpose. |
+| `AuthAuditEvent` | `createdAt` | 730 days | The operational SECURITY audit trail. Deliberately the **longest** window here — lower volume, higher evidentiary value per row, and a real investigation can surface weeks after the fact. **730 days is human-decided** (decision 3, superseding 12D-B1's original 180-day engineering default). Applies uniformly regardless of `userId` null-ness — a scrubbed/anonymized row and an identified row age out on the exact same schedule (see "Deleted-account residue" below). |
+| `AnalyticsEvent` | `receivedAt` | 180 days | Product telemetry — deliberately kept on a **separate** window from `AuthAuditEvent` (these two models are never merged into one TTL). **180 days is human-decided** (decision 3, superseding 12D-B1's original 90-day engineering default). |
+| `WatchProgress` | `updatedAt` | 730 days (2 years, **unchanged by 12E-B3**) | The one target that is genuinely user-**visible** data ("resume where I left off"), not backend exhaust — deleting it early is a real, noticeable product regression, not freed disk space. Growth is bounded by `active users x catalog size` (a `@@unique([userId, seriesId])` constraint), not by request volume, so there is no storage-pressure argument for an aggressive window. Decision 3's table does not mention this target, so it stays a deliberately conservative **engineering** default, not a product decision about what "abandoned" means — a human product owner may reasonably want a different number. |
 | Deleted-account residue | n/a (no time window) | n/a | See below. |
 
 Every cutoff is computed at UTC-**day** granularity (`dayGranularityCutoff` in
@@ -916,11 +978,18 @@ window is safe: the worst case is an affected row is purged up to ~7 hours
 A genuine **orphan** row is one with a non-null `userId` that does not
 resolve to any existing `User` row. This is deliberately **not** "any row
 with `userId IS NULL`" — `AnalyticsEvent`/`AuthAuditEvent` rows with a null
-`userId` are the intended, `DECISIONS.md` decision-2-mandated anonymized
-record of a deleted account, not residue, and this job's queries exclude
-them by construction (rows are only ever considered candidates when
-`userId` is a required column in the first place, or, for the two
-nullable-`userId` models, only when `userId: { not: null }`).
+`userId` are the intended, anonymized record of a deleted account, not
+residue, and this job's queries exclude them by construction (rows are only
+ever considered candidates when `userId` is a required column in the first
+place, or, for the two nullable-`userId` models, only when
+`userId: { not: null }`). The two models reach that anonymized state by
+different mechanisms: `AnalyticsEvent` via `onDelete: SetNull` alone
+(`DECISIONS.md` decision 2 — the model has no `ipHash`/`userAgent` column,
+so nulling `userId` is sufficient); `AuthAuditEvent` via `SetNull` **plus**
+the explicit pre-delete scrub described in "Account Deletion API" above
+(`DECISIONS.md` 2026-07-30 decision 1, work unit 12E-B1) — `SetNull` alone
+would leave its stable `ipHash` behind, which must never be described as
+anonymizing the row on its own.
 
 Every one of the 8 `User`-relation models in `prisma/schema.prisma` carries
 a **real Postgres foreign-key constraint** (`onDelete: Cascade` for

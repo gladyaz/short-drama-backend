@@ -41,11 +41,16 @@ model User {
   accountLockout      AccountLockout?
   /// Phase 12, work unit 12A-B3: operational security audit trail. Nullable
   /// FK with `onDelete: SetNull` (NOT `Cascade`), mirroring the existing
-  /// `AnalyticsEvent.userId` precedent — deleting a `User` anonymizes their
-  /// audit history instead of destroying it, which matters for an
+  /// `AnalyticsEvent.userId` precedent — deleting a `User` lets their audit
+  /// history survive instead of being destroyed, which matters for an
   /// operational-security log (e.g. investigating account-takeover activity
-  /// must survive the attacker later deleting the compromised account). See
-  /// `AuthAuditEvent` below for the full design rationale.
+  /// must survive the attacker later deleting the compromised account).
+  /// `SetNull` alone only nulls this `userId` column, though — it does NOT
+  /// by itself anonymize a surviving row, because `ipHash` (a globally
+  /// stable, unsalted, unrotated HMAC) would still correlate it. Phase 12E,
+  /// work unit 12E-B1 adds an explicit pre-delete scrub of
+  /// `ipHash`/`userAgent`/`metadata` that does the real anonymizing work.
+  /// See `AuthAuditEvent` below for the full design rationale.
   authAuditEvents     AuthAuditEvent[]
   /// Phase 12, work unit 12B-B3: `POST /auth/password-reset/*`. Cascades
   /// with the `User` (`onDelete: Cascade`, NOT `SetNull`) — unlike
@@ -384,10 +389,19 @@ model AnalyticsEvent {
 //     this column, regardless of what a caller passes to `emit`.
 // `userId` is nullable with `onDelete: SetNull` (see `User.authAuditEvents`
 // above) rather than `Cascade`, so a deleted account's security history
-// survives (anonymized) instead of disappearing — the opposite tradeoff from
+// survives instead of disappearing — the opposite tradeoff from
 // `Session`/`AccountLockout`, which intentionally DO cascade-delete, because
 // this table exists specifically to be read AFTER something has already gone
-// wrong with an account, which can include its own deletion.
+// wrong with an account, which can include its own deletion. `SetNull` by
+// itself nulls only `userId`; it does NOT anonymize a surviving row, because
+// `ipHash` is a globally stable, unsalted, unrotated HMAC that would still
+// correlate the row to any other live session/account sharing that IP —
+// calling `SetNull` alone "anonymized" would be exactly the overstated claim
+// DECISIONS.md's 2026-07-30 decision 1 forbids. Phase 12, work unit 12E-B1
+// closes that gap with an explicit pre-delete scrub (inside the same
+// transaction, before the `User` row is deleted) that additionally nulls
+// `ipHash`/`userAgent`/`metadata`, leaving only `event`/`createdAt` — see
+// `AuthService.deleteAccount`'s doc comment for the full mechanism.
 model AuthAuditEvent {
   id        String   @id @default(cuid())
   userId    String?
@@ -439,7 +453,7 @@ model AuthAuditEvent {
 // outstanding reset token for an account that no longer exists is useless
 // dead weight, not an audit trail worth preserving — this mirrors
 // `Session`/`AccountLockout`'s existing cascade precedent, not
-// `AuthAuditEvent`'s anonymize-on-delete precedent.
+// `AuthAuditEvent`'s survive-and-get-scrubbed precedent.
 model PasswordResetToken {
   id        String    @id @default(cuid())
   userId    String

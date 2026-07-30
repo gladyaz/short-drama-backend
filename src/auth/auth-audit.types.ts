@@ -109,9 +109,19 @@ export const AUTH_AUDIT_METADATA_ALLOWLIST = {
   /**
    * Phase 12, work unit 12C-B1: `POST /users/me/deletion` succeeded — every
    * session was revoked and the `User` row was deleted (cascades removed
-   * every other row this account owns; `AnalyticsEvent` and this very
-   * table's OTHER rows for the account anonymize via `SetNull`, per
-   * DECISIONS.md decision 2). Deliberately emitted WITHOUT a `userId` — see
+   * every other row this account owns; `AnalyticsEvent`'s OTHER rows for the
+   * account anonymize via `SetNull` alone, per DECISIONS.md decision 2 — that
+   * model has no `ipHash`/`userAgent` column, so nulling `userId` is the
+   * whole story. This very table's OTHER rows do NOT anonymize via `SetNull`
+   * alone: `SetNull` only nulls `userId`, and this table's `ipHash` is a
+   * globally stable, unsalted, unrotated HMAC that would keep a row
+   * correlatable to it if left behind — calling that "anonymized" is exactly
+   * what DECISIONS.md's 2026-07-30 decision 1 forbids. Work unit **12E-B1**
+   * adds an explicit `tx.authAuditEvent.updateMany(...)` scrub, INSIDE this
+   * same deletion transaction and BEFORE `tx.user.deleteMany`, that nulls
+   * `userId`/`ipHash`/`userAgent`/`metadata` together — see
+   * `AuthService.deleteAccount`'s doc comment for the full ordering
+   * rationale). Deliberately emitted WITHOUT a `userId` — see
    * `AuthService.deleteAccount`'s doc comment for the full reasoning: the
    * account no longer exists by the time this fires, and a dangling FK
    * reference would be REJECTED outright at insert time, not merely nulled

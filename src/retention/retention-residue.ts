@@ -13,12 +13,19 @@ import {
  * A genuine ORPHAN row is one with a non-null `userId` that does not resolve
  * to any existing `User` row. Deliberately NOT "any row with `userId IS
  * NULL`" — `AnalyticsEvent`/`AuthAuditEvent` rows with a null `userId` are
- * the intended, decision-2-mandated anonymized record of a deleted account,
- * not residue, and the queries below EXCLUDE them by construction (every
- * check either only looks at models where `userId` is a required column in
- * the first place, or, for the two nullable-`userId` models, explicitly
- * filters to `userId: { not: null }` before ever considering a row a
- * candidate).
+ * the intended, anonymized record of a deleted account, not residue, and the
+ * queries below EXCLUDE them by construction (every check either only looks
+ * at models where `userId` is a required column in the first place, or, for
+ * the two nullable-`userId` models, explicitly filters to
+ * `userId: { not: null }` before ever considering a row a candidate). The
+ * two models get there by different mechanisms, not one shared one:
+ * `AnalyticsEvent` is anonymized by `onDelete: SetNull` alone (decision 2 —
+ * it has no `ipHash`/`userAgent` column, so nulling `userId` is sufficient);
+ * `AuthAuditEvent` additionally needs, and gets, an explicit pre-delete scrub
+ * of `ipHash`/`userAgent`/`metadata` (decision 1, `DECISIONS.md`
+ * 2026-07-30, work unit 12E-B1) — `SetNull` alone would leave its globally
+ * stable, unsalted `ipHash` behind, which decision 1 is explicit must never
+ * be described as anonymizing the row.
  *
  * Given every one of the 8 `User`-relation models in `prisma/schema.prisma`
  * (`Session`, `UserVideoInteraction`, `WatchProgress`, `Entitlement`,
@@ -114,9 +121,11 @@ export async function processDeletedAccountResidue(
         }),
     ),
     // The two `onDelete: SetNull` models: `findRows` filters to
-    // `userId: { not: null }` explicitly, so a decision-2-mandated
-    // anonymized row (`userId: null`) is never fetched as a candidate at
-    // all, let alone flagged as an orphan or deleted.
+    // `userId: { not: null }` explicitly, so an anonymized row
+    // (`userId: null` — decision 2 for `AnalyticsEvent`, decision 1 plus the
+    // 12E-B1 scrub for `AuthAuditEvent`, see this file's header comment) is
+    // never fetched as a candidate at all, let alone flagged as an orphan or
+    // deleted.
     await checkOptionalUserIdModel(
       prisma,
       'analyticsEvent',
@@ -194,9 +203,10 @@ async function checkRequiredUserIdModel(
 /**
  * Optional-`userId` models (`AnalyticsEvent`, `AuthAuditEvent`): the
  * caller-supplied `findRows` MUST already filter to `userId: { not: null }`
- * (see the two call sites above) — this is what guarantees a
- * decision-2-mandated anonymized row (`userId: null`) can never even be
- * fetched as a candidate here, let alone flagged as an "orphan" or deleted.
+ * (see the two call sites above) — this is what guarantees an anonymized row
+ * (`userId: null` — see this file's header comment for the two different
+ * mechanisms that get each model there) can never even be fetched as a
+ * candidate here, let alone flagged as an "orphan" or deleted.
  */
 async function checkOptionalUserIdModel(
   prisma: PrismaService,

@@ -1,14 +1,33 @@
 # Admin API Contract
 
-**Frozen for Slice #4 wiring (2026-07-25).** This document is the
-authoritative, frozen contract for every admin-guarded route this backend
-currently exposes. It was produced by work unit **11F-5** (the gate before
-any admin/mobile wiring — see the control workspace's `DECISIONS.md`,
-"2026-07-25 — Phase 11 credential-free endpoint slice: formal approval
-(ratify + expand) → Slice #4") and reflects exactly what is implemented on
-`short-drama-backend` as of commit `1214f2c` (11F-1..11F-4 landed). It
-documents **only** routes, fields, shapes, status codes, and error codes that
-actually exist in this repository today — nothing here is aspirational.
+**Frozen for Slice #4 wiring (2026-07-25); re-frozen 2026-07-30 (work unit
+12E-B4).** This document is the authoritative, frozen contract for every
+admin-guarded route this backend currently exposes, **plus the cross-cutting
+request-level behaviors (rate limiting, request body size limit) that apply
+to those routes**, added by the re-freeze below. It was originally produced
+by work unit **11F-5** (the gate before any admin/mobile wiring — see the
+control workspace's `DECISIONS.md`, "2026-07-25 — Phase 11 credential-free
+endpoint slice: formal approval (ratify + expand) → Slice #4") and reflected
+exactly what was implemented on `short-drama-backend` as of commit `1214f2c`
+(11F-1..11F-4 landed).
+
+**Re-freeze, 2026-07-30 (work unit 12E-B4, resolving `TASK_QUEUE.md`
+follow-up 19 / `DECISIONS.md`'s 2026-07-30 "Phase 12 decision-resolution
+remediation slice (12E) approved..." entry, decision 4):** independent
+verification against the source found that Phase 12 (work units 12A-B1 and
+12A-B2, landed well before this re-freeze) had added two cross-cutting
+behaviors this document never mentioned — IP-based request throttling
+(`429`) and a JSON request body size limit (`413`) — both of which apply to
+every route below. **Nothing about route behavior changed to produce this
+re-freeze**; the routes, fields, shapes, and existing status/error codes
+documented below are unchanged from the 2026-07-25 freeze. Only the two new
+sections ("Rate limiting" and "Request body size limit") and the
+correspondingly updated error-codes table are new. This document reflects
+exactly what is implemented on `short-drama-backend` as of commit `7d58b8b`
+(everything through Phase 12, work units 12A-B1..12E-B3, in addition to the
+11F-1..11F-4 baseline above). It documents **only** routes, fields, shapes,
+status codes, and error codes that actually exist in this repository today —
+nothing here is aspirational.
 
 **Consumers of this freeze:**
 - **11F-6** (`short-drama-admin` repo) — wires the admin dashboard's badged
@@ -432,6 +451,70 @@ episodes, use `archive` instead — it has no such restriction.
   contract does not add, remove, or change any payment or entitlement
   logic.
 
+## Rate limiting (added by the 2026-07-30 re-freeze)
+
+**`429` is reachable on every route this contract documents**, including
+`GET /admin/whoami` and every `admin/media`/`admin/series` route above —
+not called out at the 2026-07-25 freeze, but present since Phase 12, work
+unit 12A-B1 (`src/app.module.ts`, `src/common/rate-limit.constants.ts`),
+which predates that freeze.
+
+- `ThrottlerGuard` is registered globally as an `APP_GUARD`
+  (`src/app.module.ts`) with a single named (`"default"`) throttler:
+  **300 requests per 60 seconds, per IP.** No admin/media/series controller
+  or route in this contract carries a `@Throttle()`/`@SkipThrottle()`
+  override, so every route above is subject to exactly this generous
+  default — deliberately high enough that no legitimate admin-dashboard
+  traffic pattern comes close to tripping it; it exists purely as coarse
+  abuse protection, not a meaningful per-route limit for this surface.
+- This is coarse, **in-memory, per-application-instance** throttling — it
+  does not survive a restart and is not shared across multiple backend
+  instances (a persistent/shared IP-rate store is explicitly deferred to
+  Phase 13, per `DECISIONS.md`). It is a separate mechanism from the
+  persistent PostgreSQL account-lockout state referenced in the "Auth
+  (context)" table's routes below, which is unrelated to this contract's
+  admin surface.
+- The **"Auth (context)" table's own routes carry tighter, route-specific
+  overrides** that also predate this freeze and were likewise never listed
+  in the error-codes table below: `POST /auth/login` is 5 requests/minute/IP
+  and `POST /auth/refresh` is 30 requests/minute/IP (`LOGIN_RATE_LIMIT`/
+  `REFRESH_RATE_LIMIT`, `src/common/rate-limit.constants.ts`) — these
+  override, rather than add to, the 300/60s default for just those two
+  routes. (`POST /auth/register`, also unauthenticated but not itself part
+  of this admin contract, carries its own 3/10min override on the same
+  mechanism.)
+- **Response shape on `429`:** `ThrottlerGuard` throws `ThrottlerException`
+  (a plain Nest `HttpException`, not an `AppException`), so it is caught by
+  `AppExceptionFilter`'s generic `HttpException` branch — same envelope
+  convention as every other unrecognized-field/validation `400` documented
+  in "Conventions" above, just with `statusCode: 429`:
+  `{ "statusCode": 429, "code": "HTTP_ERROR", "message": "Too many requests. Please try again later." }`
+  (the message text is `ThrottlerModule.forRoot`'s configured
+  `errorMessage`). There is no dedicated `AppErrorCode` for rate limiting.
+
+## Request body size limit (added by the 2026-07-30 re-freeze)
+
+Also present since Phase 12 (work unit 12A-B2, `src/main.ts`) and also never
+previously listed here: every JSON/urlencoded request body on **every**
+route in this backend, including every route in this contract, is capped at
+**256kb** (`JSON_BODY_LIMIT`, `src/main.ts`). A body larger than that is
+rejected with **`413`** before Nest's routing/validation pipeline (and
+therefore before any controller/service code, including `AdminMediaService`/
+`SeriesService`) ever inspects it. In practice, no route this contract
+documents can realistically hit this ceiling — every admin body here is a
+metadata-only JSON object (the largest, `CreateMediaUploadDto`, is a small,
+bounded set of short string/number/boolean fields; real media/thumbnail
+bytes never transit this JSON body pipeline at all, since `POST /admin/media`
+and the cover/thumbnail routes only ever return a **presigned URL** for the
+client to `PUT` bytes directly to object storage — see "Explicitly still
+GATED" below) — but the limit is a real, global constraint on this API
+surface and is documented here for completeness, not because any route
+above is expected to trip it. **Response shape:** the same `AppExceptionFilter`
+envelope as `429` above — `body-parser`'s `PayloadTooLargeError` is an
+`http-errors`-shaped client error, not a Nest `HttpException`, so it is
+caught by the filter's dedicated exposed-client-error branch and returned as
+`{ "statusCode": 413, "code": "HTTP_ERROR", "message": "<body-parser's own message>" }`.
+
 ## Error codes referenced by the routes above
 
 | Code | HTTP status | Meaning |
@@ -447,7 +530,7 @@ episodes, use `archive` instead — it has no such restriction.
 | `INVALID_MEDIA_LIFECYCLE_TRANSITION` | 400 | `complete-upload`/`publish`/`unpublish`: not a valid state edge |
 | `ADMIN_ROLE_REQUIRED` | 403 | `AdminGuard`: caller is authenticated but not an admin (or `request.user` missing) |
 | `INVALID_ACCESS_TOKEN` | 401 | `JwtAuthGuard`: missing/malformed/expired/invalid token |
-| `HTTP_ERROR` | 400 (usually) | Generic class-validator/`forbidNonWhitelisted` failure — see "Conventions" above |
+| `HTTP_ERROR` | 400 (usually); also 429 (rate limit, see "Rate limiting" above) and 413 (body too large, see "Request body size limit" above) | Generic class-validator/`forbidNonWhitelisted` failure, or a generic exposed `HttpException`/`http-errors`-shaped client error from outside the service layer — see "Conventions" above |
 | `INTERNAL_ERROR` | 500 | Unhandled exception fallback |
 
 ## Explicitly still GATED (do NOT wire as real in 11F-6)

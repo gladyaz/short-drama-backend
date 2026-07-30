@@ -152,9 +152,11 @@ export class RetentionService {
    * `AuthAuditEvent` TTL — see `AUTH_AUDIT_EVENT_RETENTION_DAYS`'s doc
    * comment. Deliberately filters ONLY on `createdAt` (Prisma-typed,
    * `@default(now())`, never touched by the 12D-B0 raw-SQL bug), never on
-   * `userId` — an anonymized (post-deletion, decision-2) row and an
+   * `userId` — an anonymized, post-deletion row (scrubbed by 12E-B1's
+   * `ipHash`/`userAgent`/`metadata` scrub, per `DECISIONS.md` 2026-07-30
+   * decision 1 — `SetNull` alone is not sufficient for this table) and an
    * identified row age out on the exact same schedule, which is how
-   * decision-2 rows are preserved for their full, intended retention window
+   * scrubbed rows are preserved for their full, intended retention window
    * rather than being singled out for early or late deletion.
    */
   private async processAuthAuditEvents(

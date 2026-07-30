@@ -10,6 +10,7 @@
 
 export type RetentionTargetName =
   | 'session'
+  | 'passwordResetToken'
   | 'authAuditEvent'
   | 'analyticsEvent'
   | 'watchProgress'

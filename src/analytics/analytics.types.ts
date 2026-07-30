@@ -41,3 +41,59 @@ export const MAX_BATCH_SIZE = 50;
 export interface IngestEventsResponseDto {
   accepted: number;
 }
+
+/**
+ * Phase 12, work unit 12E-B2 (`DECISIONS.md` "Phase 12 decision-resolution
+ * remediation slice (12E) approved..." entry, decision 2): re-applies
+ * `EVENT_PROPERTY_ALLOWLIST` to an ALREADY-PERSISTED `AnalyticsEvent.properties`
+ * value, for `GET /users/me/export` (`ExportService`, `export.types.ts`).
+ *
+ * Deliberately a SEPARATE function from `AnalyticsService.sanitizeProperties`
+ * above, not a shared call site, even though the allowlist/truncation/
+ * scalar-only logic is intentionally identical — that method's job is to
+ * validate WRITE-time input (`Record<string, unknown> | undefined`, already
+ * shaped by `AnalyticsEventInputDto`'s class-validator pipeline); this
+ * function's job is to re-derive the same guarantee at READ time, directly
+ * from whatever is actually sitting in the database column today (typed as
+ * `unknown` here because Prisma's `Json` column type can, in principle, hold
+ * any JSON shape, not just the object this codebase always writes). This is
+ * DEFENCE IN DEPTH, not redundant belt-and-suspenders: the write-time scrub
+ * only reflects the allowlist as it existed AT THE TIME a given row was
+ * inserted — it cannot retroactively fix a row written under a past or
+ * future version of `EVENT_PROPERTY_ALLOWLIST` (a key added, renamed, or
+ * removed for a given `eventName`). Re-deriving the filter from the CURRENT
+ * allowlist on every read closes that gap regardless of a row's age, which
+ * is exactly what a personal-data export needs (see `export.types.ts`'s
+ * `AnalyticsEvent` section for the full reasoning).
+ */
+export function filterEventPropertiesForExport(
+  eventName: string,
+  properties: unknown,
+): Record<string, string | number | boolean> {
+  const filtered: Record<string, string | number | boolean> = {};
+
+  if (
+    properties === null ||
+    properties === undefined ||
+    typeof properties !== 'object' ||
+    Array.isArray(properties)
+  ) {
+    return filtered;
+  }
+
+  const source = properties as Record<string, unknown>;
+
+  for (const key of EVENT_PROPERTY_ALLOWLIST[eventName] ?? []) {
+    const value = source[key];
+
+    if (typeof value === 'string') {
+      filtered[key] = value.slice(0, MAX_PROPERTY_STRING_LENGTH);
+    } else if (typeof value === 'number' && Number.isFinite(value)) {
+      filtered[key] = value;
+    } else if (typeof value === 'boolean') {
+      filtered[key] = value;
+    }
+  }
+
+  return filtered;
+}

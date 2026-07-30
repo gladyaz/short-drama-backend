@@ -1,8 +1,10 @@
 import { HttpStatus, Injectable } from '@nestjs/common';
+import { filterEventPropertiesForExport } from '../analytics/analytics.types';
 import { PrismaService } from '../prisma/prisma.service';
 import { AppErrorCode } from '../common/errors/app-error-code';
 import { AppException } from '../common/errors/app.exception';
 import {
+  ExportedAnalyticsEventDto,
   ExportedEntitlementDto,
   ExportedInteractionDto,
   ExportedWatchProgressDto,
@@ -14,7 +16,9 @@ import {
  * export (`GET /users/me/export`). See `export.types.ts` for the full
  * include/exclude/transform reasoning, model by model, and the frozen
  * contract this implements (`DECISIONS.md` "Phase 12 ... approved..." entry,
- * decision 5).
+ * decision 5). Work unit 12E-B2 (`DECISIONS.md` decision 2, 2026-07-30)
+ * added the `AnalyticsEvent` section below, reversing 12C-B2's original
+ * exclusion — see `export.types.ts`'s dedicated `AnalyticsEvent` discussion.
  *
  * Every Prisma query below uses an explicit `select` (never the bare model)
  * so fields this work unit must exclude — surrogate ids, `Video.storageKey`/
@@ -52,39 +56,54 @@ export class ExportService {
       );
     }
 
-    const [interactionRows, progressRows, entitlementRows] = await Promise.all([
-      this.prisma.userVideoInteraction.findMany({
-        where: { userId },
-        select: {
-          videoId: true,
-          isLiked: true,
-          isSaved: true,
-          updatedAt: true,
-        },
-      }),
-      this.prisma.watchProgress.findMany({
-        where: { userId },
-        select: {
-          seriesId: true,
-          lastWatchedVideoId: true,
-          lastWatchedEpisodeNumber: true,
-          positionSeconds: true,
-          durationSeconds: true,
-          updatedAt: true,
-        },
-      }),
-      this.prisma.entitlement.findMany({
-        where: { userId },
-        select: {
-          tier: true,
-          source: true,
-          grantedAt: true,
-          expiresAt: true,
-          revokedAt: true,
-        },
-        orderBy: { grantedAt: 'desc' },
-      }),
-    ]);
+    const [interactionRows, progressRows, entitlementRows, analyticsEventRows] =
+      await Promise.all([
+        this.prisma.userVideoInteraction.findMany({
+          where: { userId },
+          select: {
+            videoId: true,
+            isLiked: true,
+            isSaved: true,
+            updatedAt: true,
+          },
+        }),
+        this.prisma.watchProgress.findMany({
+          where: { userId },
+          select: {
+            seriesId: true,
+            lastWatchedVideoId: true,
+            lastWatchedEpisodeNumber: true,
+            positionSeconds: true,
+            durationSeconds: true,
+            updatedAt: true,
+          },
+        }),
+        this.prisma.entitlement.findMany({
+          where: { userId },
+          select: {
+            tier: true,
+            source: true,
+            grantedAt: true,
+            expiresAt: true,
+            revokedAt: true,
+          },
+          orderBy: { grantedAt: 'desc' },
+        }),
+        // Phase 12, work unit 12E-B2 (decision 2): `id`/`userId` are never
+        // selected — see `export.types.ts`'s `AnalyticsEvent` section.
+        // `clientTimestamp` is also never selected — only `receivedAt` is
+        // exported, per that same section's timestamp judgment call.
+        this.prisma.analyticsEvent.findMany({
+          where: { userId },
+          select: {
+            eventName: true,
+            properties: true,
+            platform: true,
+            receivedAt: true,
+          },
+          orderBy: { receivedAt: 'desc' },
+        }),
+      ]);
 
     const titleByVideoId = await this.loadVideoTitles([
       ...interactionRows.map((row) => row.videoId),
@@ -123,6 +142,23 @@ export class ExportService {
       }),
     );
 
+    // Re-applies `EVENT_PROPERTY_ALLOWLIST` at READ time — defence in depth,
+    // required so a row that predates an allowlist change (or was ever
+    // inserted outside `AnalyticsService.ingest`'s write-time scrub) cannot
+    // leak a non-allowlisted key through this export. See
+    // `export.types.ts`'s `AnalyticsEvent` section for the full reasoning.
+    const analyticsEvents: ExportedAnalyticsEventDto[] = analyticsEventRows.map(
+      (row) => ({
+        eventName: row.eventName,
+        timestamp: row.receivedAt.toISOString(),
+        platform: row.platform,
+        properties: filterEventPropertiesForExport(
+          row.eventName,
+          row.properties,
+        ),
+      }),
+    );
+
     return {
       exportedAt: new Date().toISOString(),
       profile: {
@@ -133,6 +169,7 @@ export class ExportService {
       interactions,
       watchProgress,
       entitlements,
+      analyticsEvents,
     };
   }
 

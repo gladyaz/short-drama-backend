@@ -3,6 +3,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import {
   ANALYTICS_EVENT_RETENTION_DAYS,
   AUTH_AUDIT_EVENT_RETENTION_DAYS,
+  PASSWORD_RESET_TOKEN_RETENTION_DAYS,
   SESSION_RETENTION_DAYS,
   WATCH_PROGRESS_RETENTION_DAYS,
 } from './retention.constants';
@@ -48,6 +49,10 @@ describe('RetentionService (real database, DATABASE_URL_TEST only)', () => {
 
   const NOW = new Date();
   const sessionCutoff = dayGranularityCutoff(NOW, SESSION_RETENTION_DAYS);
+  const passwordResetTokenCutoff = dayGranularityCutoff(
+    NOW,
+    PASSWORD_RESET_TOKEN_RETENTION_DAYS,
+  );
   const authAuditCutoff = dayGranularityCutoff(
     NOW,
     AUTH_AUDIT_EVENT_RETENTION_DAYS,
@@ -162,6 +167,21 @@ describe('RetentionService (real database, DATABASE_URL_TEST only)', () => {
     });
   }
 
+  async function createPasswordResetToken(
+    userId: string,
+    overrides: { expiresAt?: Date; usedAt?: Date | null } = {},
+  ) {
+    return prisma.passwordResetToken.create({
+      data: {
+        userId,
+        tokenHash: `${prefix}-token-hash-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        expiresAt:
+          overrides.expiresAt ?? new Date(NOW.getTime() + 10 * MS_PER_DAY),
+        usedAt: overrides.usedAt ?? null,
+      },
+    });
+  }
+
   async function createAuthAuditEvent(
     markerSuffix: string,
     createdAt?: Date,
@@ -244,6 +264,13 @@ describe('RetentionService (real database, DATABASE_URL_TEST only)', () => {
         revokedAt: new Date(sessionCutoff.getTime() - MS_PER_DAY),
         expiresAt: new Date(NOW.getTime() + 10 * MS_PER_DAY),
       });
+      const outsidePasswordResetToken = await createPasswordResetToken(
+        user.id,
+        {
+          usedAt: new Date(passwordResetTokenCutoff.getTime() - MS_PER_DAY),
+          expiresAt: new Date(NOW.getTime() + 10 * MS_PER_DAY),
+        },
+      );
       const outsideAudit = await createAuthAuditEvent(
         'dryrun-audit',
         new Date(authAuditCutoff.getTime() - MS_PER_DAY),
@@ -264,6 +291,10 @@ describe('RetentionService (real database, DATABASE_URL_TEST only)', () => {
         report.targets.find((t) => t.target === 'session')?.matchedCount,
       ).toBeGreaterThanOrEqual(1);
       expect(
+        report.targets.find((t) => t.target === 'passwordResetToken')
+          ?.matchedCount,
+      ).toBeGreaterThanOrEqual(1);
+      expect(
         report.targets.find((t) => t.target === 'authAuditEvent')?.matchedCount,
       ).toBeGreaterThanOrEqual(1);
       expect(
@@ -278,6 +309,11 @@ describe('RetentionService (real database, DATABASE_URL_TEST only)', () => {
 
       expect(
         await prisma.session.findUnique({ where: { id: outsideSession.id } }),
+      ).not.toBeNull();
+      expect(
+        await prisma.passwordResetToken.findUnique({
+          where: { id: outsidePasswordResetToken.id },
+        }),
       ).not.toBeNull();
       expect(
         await prisma.authAuditEvent.findUnique({
@@ -439,6 +475,78 @@ describe('RetentionService (real database, DATABASE_URL_TEST only)', () => {
 
       expect(
         await prisma.session.findUnique({ where: { id: active.id } }),
+      ).not.toBeNull();
+    });
+
+    /**
+     * `PasswordResetToken` (Phase 12, work unit 12E-B3, `DECISIONS.md`
+     * decision 3, 2026-07-30) — mirrors the two `Session` boundary tests
+     * immediately above exactly, on the `usedAt`/`expiresAt` pair instead of
+     * `revokedAt`/`expiresAt`.
+     */
+    it('PasswordResetToken (usedAt branch): used just outside the window is deleted; used exactly at the cutoff survives', async () => {
+      const user = await createUser('reset-token-used-boundary');
+      const outside = await createPasswordResetToken(user.id, {
+        usedAt: new Date(passwordResetTokenCutoff.getTime() - 1),
+        expiresAt: new Date(NOW.getTime() + 10 * MS_PER_DAY),
+      });
+      const atCutoff = await createPasswordResetToken(user.id, {
+        usedAt: passwordResetTokenCutoff,
+        expiresAt: new Date(NOW.getTime() + 10 * MS_PER_DAY),
+      });
+
+      await service.run({ commit: true, now: NOW });
+
+      expect(
+        await prisma.passwordResetToken.findUnique({
+          where: { id: outside.id },
+        }),
+      ).toBeNull();
+      expect(
+        await prisma.passwordResetToken.findUnique({
+          where: { id: atCutoff.id },
+        }),
+      ).not.toBeNull();
+    });
+
+    it('PasswordResetToken (expiresAt branch): a naturally-expired-past-the-window token is deleted even if never used; one expiring exactly at the cutoff survives', async () => {
+      const user = await createUser('reset-token-expiry-boundary');
+      const outside = await createPasswordResetToken(user.id, {
+        usedAt: null,
+        expiresAt: new Date(passwordResetTokenCutoff.getTime() - 1),
+      });
+      const atCutoff = await createPasswordResetToken(user.id, {
+        usedAt: null,
+        expiresAt: passwordResetTokenCutoff,
+      });
+
+      await service.run({ commit: true, now: NOW });
+
+      expect(
+        await prisma.passwordResetToken.findUnique({
+          where: { id: outside.id },
+        }),
+      ).toBeNull();
+      expect(
+        await prisma.passwordResetToken.findUnique({
+          where: { id: atCutoff.id },
+        }),
+      ).not.toBeNull();
+    });
+
+    it('an outstanding (unused, unexpired) PasswordResetToken is never touched regardless of age of creation', async () => {
+      const user = await createUser('reset-token-active');
+      const outstanding = await createPasswordResetToken(user.id, {
+        usedAt: null,
+        expiresAt: new Date(NOW.getTime() + 10 * MS_PER_DAY),
+      });
+
+      await service.run({ commit: true, now: NOW });
+
+      expect(
+        await prisma.passwordResetToken.findUnique({
+          where: { id: outstanding.id },
+        }),
       ).not.toBeNull();
     });
 

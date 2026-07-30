@@ -3,6 +3,28 @@
  * `phases/phase-12.md` "12D — Privacy, retention & review sweep" and
  * `TASK_QUEUE.md`'s 12D-B1 row in the control workspace).
  *
+ * **Phase 12, work unit 12E-B3 (`DECISIONS.md` "Phase 12 decision-resolution
+ * remediation slice (12E) approved..." entry, decision 3, 2026-07-30):** the
+ * four windows below other than `WATCH_PROGRESS_RETENTION_DAYS` are now
+ * HUMAN-DECIDED values, not engineering defaults:
+ *
+ * | Data                                    | Retention |
+ * |------------------------------------------|-----------|
+ * | Expired/revoked session records           | 90 days   |
+ * | Password-reset records                    | 90 days   |
+ * | Product analytics events                  | 180 days  |
+ * | Authentication/security audit events      | 730 days  |
+ *
+ * Each constant's doc comment below reflects this — the reasoning is now
+ * "this is what the human decided, and here is why that reading maps onto
+ * this specific model/column," not an implementer's own engineering
+ * trade-off presented as if it alone drove the number. Retention execution
+ * itself remains dry-run and unscheduled — real scheduling is explicitly
+ * deferred to Phase 13 and is NOT authorized by this work unit (decision 3's
+ * own text). `WATCH_PROGRESS_RETENTION_DAYS` is the one target decision 3
+ * does not mention; it is deliberately left untouched by 12E-B3 (see that
+ * constant's own doc comment, unchanged since 12D-B1).
+ *
  * This work unit deliberately keeps `AuthAuditEvent` (security/audit) and
  * `AnalyticsEvent` (product telemetry) on SEPARATE, independently-configurable
  * retention windows — they are different models with different purposes (see
@@ -61,17 +83,56 @@
  * `revokedAt: null` only, by design; there is no "session history" UI or
  * endpoint anywhere in this codebase. Its only remaining latent value is
  * forensic (e.g. correlating `ipHash`/`userAgent`/`lastUsedAt` against an
- * `AuthAuditEvent` investigation opened shortly after the fact), which is
- * exactly why the window below is generous enough to cover a realistic
- * "we noticed something odd a few weeks ago" investigation without also
- * letting this operational table grow forever. `Session.expiresAt` is
- * ALWAYS written by Prisma's typed ORM at session-creation time
- * (`issueTokensAndSession`) — never by the buggy raw SQL — so it carries no
- * timezone-skew risk at all; it is included in this same window purely
- * because "a dead session" is a dead session regardless of which field
- * proves it, not because it shares `revokedAt`'s bug.
+ * `AuthAuditEvent` investigation opened shortly after the fact).
+ * `Session.expiresAt` is ALWAYS written by Prisma's typed ORM at
+ * session-creation time (`issueTokensAndSession`) — never by the buggy raw
+ * SQL — so it carries no timezone-skew risk at all; it is included in this
+ * same window purely because "a dead session" is a dead session regardless
+ * of which field proves it, not because it shares `revokedAt`'s bug.
+ *
+ * **90 days is a human-decided value** (`DECISIONS.md` decision 3,
+ * 2026-07-30, "Expired/revoked session records" — work unit 12E-B3,
+ * superseding this constant's original 12D-B1 engineering default of 30).
+ * The original 30-day engineering rationale (generous enough for a realistic
+ * "we noticed something odd a few weeks ago" investigation, without letting
+ * this operational table grow forever) still describes the SHAPE of the
+ * trade-off; the human's 90-day figure is simply a more conservative point
+ * on the same axis, and is the number that governs execution now.
  */
-export const SESSION_RETENTION_DAYS = 30;
+export const SESSION_RETENTION_DAYS = 90;
+
+/**
+ * `PasswordResetToken` rows: `POST /auth/password-reset/request` /
+ * `POST /auth/password-reset/confirm`'s single-use reset tokens (see
+ * `prisma/schema.prisma`'s `PasswordResetToken` doc comment). Mirrors
+ * `Session`'s own "explicit end OR natural expiry" shape immediately above,
+ * on the same two columns' semantic pairing:
+ *   - `usedAt` (non-null) — the token was successfully consumed by
+ *     `confirmPasswordReset` and can never be used again. This is the
+ *     "revoked" half of decision 3's framing ("expired/revoked password-reset
+ *     records") — a used token is functionally dead the same way an
+ *     explicitly revoked `Session` is, even though this column is named
+ *     `usedAt`, not `revokedAt`.
+ *   - `expiresAt` — the token's own TTL (see `AuthService`'s
+ *     password-reset flow) elapsed without ever being used. This is the
+ *     "expired" half.
+ * A row satisfying NEITHER is still a live, outstanding reset token and must
+ * never be touched by this job — mirrors `Session`'s "an active session is
+ * never touched" property exactly, and is proven by
+ * `retention.integration.spec.ts`.
+ *
+ * **90 days is a human-decided value** (`DECISIONS.md` decision 3,
+ * 2026-07-30, "Password-reset records" — work unit 12E-B3). This is a NEW
+ * retention target: `PasswordResetToken` was not a retention target at all
+ * before 12E-B3 (12D-B1's original five targets were `Session`,
+ * `AuthAuditEvent`, `AnalyticsEvent`, `WatchProgress`, and deleted-account
+ * residue). Chosen equal to `SESSION_RETENTION_DAYS` above, not by
+ * coincidence — decision 3's table lists both at 90 days, and both models
+ * play the identical "used-or-expired credential/token bookkeeping, no
+ * remaining live purpose, retained only for a bounded forensic window" role
+ * in this schema.
+ */
+export const PASSWORD_RESET_TOKEN_RETENTION_DAYS = 90;
 
 /**
  * `AuthAuditEvent` rows: the operational SECURITY audit trail (login/logout/
@@ -84,21 +145,27 @@ export const SESSION_RETENTION_DAYS = 30;
  * happened to this account, and when," so the window here is intentionally
  * LONGER than `AnalyticsEvent`'s below: security audit logs are lower-volume
  * (one row per meaningful auth event, not one per UI interaction) and higher
- * evidentiary value per row than product telemetry. 180 days (~6 months) is
- * a common industry floor for security/audit-log retention outside of a
- * formal compliance regime (which this product is not yet subject to) —
- * long enough to support a slow-to-surface investigation, short enough to
- * still bound table growth and the amount of `ipHash`/`userAgent` data kept
- * about any one account indefinitely. Applies UNIFORMLY regardless of
- * whether `userId` is null (anonymized, post-deletion — decision 2) or not:
- * an anonymized row does not need a SHORTER life than an identified one
- * (there is nothing extra-sensitive left to minimize once anonymized), and
- * it must not get a LONGER one either — this is the mechanism, not a special
- * case, by which decision-2 rows eventually age out like any other row (see
- * `RetentionService.processAuthAuditEvents`, which never filters on
- * `userId`).
+ * evidentiary value per row than product telemetry. Applies UNIFORMLY
+ * regardless of whether `userId` is null (anonymized, post-deletion —
+ * decision 2/12E-B1) or not: an anonymized row does not need a SHORTER life
+ * than an identified one (there is nothing extra-sensitive left to minimize
+ * once anonymized), and it must not get a LONGER one either — this is the
+ * mechanism, not a special case, by which anonymized rows eventually age out
+ * like any other row (see `RetentionService.processAuthAuditEvents`, which
+ * never filters on `userId`).
+ *
+ * **730 days is a human-decided value** (`DECISIONS.md` decision 3,
+ * 2026-07-30, "Authentication/security audit events" — work unit 12E-B3,
+ * superseding this constant's original 12D-B1 engineering default of 180).
+ * At two years, this is now the LONGEST window in this file (WatchProgress's
+ * unchanged 730 aside — see that constant's own doc comment, which arrived
+ * at the identical number independently, for different reasons, and is not
+ * itself part of decision 3) — a deliberately conservative floor for the
+ * one table whose entire purpose is answering "what security-relevant thing
+ * happened to this account, and when" for as long as a slow-to-surface
+ * investigation could plausibly need it.
  */
-export const AUTH_AUDIT_EVENT_RETENTION_DAYS = 180;
+export const AUTH_AUDIT_EVENT_RETENTION_DAYS = 730;
 
 /**
  * `AnalyticsEvent` rows: product telemetry (`feed_view`/`video_play`/
@@ -110,16 +177,24 @@ export const AUTH_AUDIT_EVENT_RETENTION_DAYS = 180;
  * has already been realized — this codebase has no analytics
  * warehouse/rollup/aggregation pipeline downstream of this table, so nothing
  * reads an `AnalyticsEvent` older than a few months for any current product
- * purpose. 90 days (~3 months) is a common default retention window for raw
- * product-analytics events in products without a dedicated long-term
- * warehouse, and this table is also meaningfully higher-volume per user than
- * `AuthAuditEvent` (many events per session, not one per auth action), so a
- * shorter window bounds growth more aggressively where the marginal value
- * per row decays faster. Applies UNIFORMLY regardless of `userId`
- * null-ness, for the same reason as `AuthAuditEvent` above — see
- * `RetentionService.processAnalyticsEvents`.
+ * purpose. This table is also meaningfully higher-volume per user than
+ * `AuthAuditEvent` (many events per session, not one per auth action; see
+ * `export.types.ts`'s `AnalyticsEvent` size-assessment discussion for how
+ * high-volume in practice), so a shorter window bounds growth more
+ * aggressively where the marginal value per row decays faster. Applies
+ * UNIFORMLY regardless of `userId` null-ness, for the same reason as
+ * `AuthAuditEvent` above — see `RetentionService.processAnalyticsEvents`.
+ *
+ * **180 days is a human-decided value** (`DECISIONS.md` decision 3,
+ * 2026-07-30, "Product analytics events" — work unit 12E-B3, superseding
+ * this constant's original 12D-B1 engineering default of 90). Doubling the
+ * original figure still leaves this the SHORTEST TTL window in this file
+ * (`AnalyticsEvent` 180 < `AuthAuditEvent` 730 = `WatchProgress` 730,
+ * coincidentally equal at the top end, for unrelated reasons — see each
+ * constant's own doc comment) — the human's absolute numbers changed, the
+ * shape of the trade-off between the tables did not.
  */
-export const ANALYTICS_EVENT_RETENTION_DAYS = 90;
+export const ANALYTICS_EVENT_RETENTION_DAYS = 180;
 
 /**
  * `WatchProgress` rows: per-`(userId, seriesId)` "resume where I left off"

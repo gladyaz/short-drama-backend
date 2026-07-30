@@ -5,6 +5,7 @@ import { processDeletedAccountResidue } from './retention-residue';
 import {
   ANALYTICS_EVENT_RETENTION_DAYS,
   AUTH_AUDIT_EVENT_RETENTION_DAYS,
+  PASSWORD_RESET_TOKEN_RETENTION_DAYS,
   SESSION_RETENTION_DAYS,
   WATCH_PROGRESS_RETENTION_DAYS,
 } from './retention.constants';
@@ -22,7 +23,12 @@ import { dayGranularityCutoff } from './retention.util';
  * `phases/phase-12.md` "12D — Privacy, retention & review sweep" and
  * `retention.constants.ts` for the per-target window reasoning; the
  * deleted-account-residue logic itself lives in `retention-residue.ts`, kept
- * separate purely for file-size/cohesion).
+ * separate purely for file-size/cohesion). Work unit 12E-B3 (`DECISIONS.md`
+ * decision 3, 2026-07-30) added `PasswordResetToken` as a sixth target
+ * (`processPasswordResetTokens` below) and remapped four of the numeric
+ * windows in `retention.constants.ts` to human-decided values — see that
+ * file's updated doc comments. `WATCH_PROGRESS_RETENTION_DAYS` and
+ * `processWatchProgress` are unchanged by 12E-B3.
  *
  * **This service is deliberately NEVER imported by `AppModule`/`main.ts`.**
  * There is no `RetentionModule`, no `@Cron`, no `OnModuleInit`/startup hook,
@@ -65,6 +71,7 @@ export class RetentionService {
 
     const targets: RetentionTargetReport[] = [
       await this.processSessions(now, commit),
+      await this.processPasswordResetTokens(now, commit),
       await this.processAuthAuditEvents(now, commit),
       await this.processAnalyticsEvents(now, commit),
       await this.processWatchProgress(now, commit),
@@ -100,6 +107,45 @@ export class RetentionService {
       : 0;
 
     return { target: 'session', cutoff, matchedCount, deletedCount };
+  }
+
+  /**
+   * `PasswordResetToken` TTL — Phase 12, work unit 12E-B3 (`DECISIONS.md`
+   * decision 3, 2026-07-30). See `PASSWORD_RESET_TOKEN_RETENTION_DAYS`'s doc
+   * comment for the full "stale" definition. Deliberately ONE combined `OR`
+   * predicate (not two separate `deleteMany` calls), mirroring
+   * `processSessions` above exactly — the same "never double-count a row
+   * matching both branches" reasoning applies, on the `usedAt`/`expiresAt`
+   * pair instead of `Session`'s `revokedAt`/`expiresAt` pair.
+   */
+  private async processPasswordResetTokens(
+    now: Date,
+    commit: boolean,
+  ): Promise<RetentionTargetReport> {
+    const cutoff = dayGranularityCutoff(
+      now,
+      PASSWORD_RESET_TOKEN_RETENTION_DAYS,
+    );
+    const where = {
+      OR: [
+        { usedAt: { not: null, lt: cutoff } },
+        { expiresAt: { lt: cutoff } },
+      ],
+    };
+
+    const matchedCount = await this.prisma.passwordResetToken.count({
+      where,
+    });
+    const deletedCount = commit
+      ? (await this.prisma.passwordResetToken.deleteMany({ where })).count
+      : 0;
+
+    return {
+      target: 'passwordResetToken',
+      cutoff,
+      matchedCount,
+      deletedCount,
+    };
   }
 
   /**

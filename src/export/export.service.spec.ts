@@ -1,4 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
+import { EVENT_PROPERTY_ALLOWLIST } from '../analytics/analytics.types';
 import { AppException } from '../common/errors/app.exception';
 import { PrismaService } from '../prisma/prisma.service';
 import { ExportService } from './export.service';
@@ -75,6 +76,13 @@ describe('ExportService', () => {
     await prisma.entitlement.deleteMany({
       where: { user: { email: { contains: testIdPrefix } } },
     });
+    // `AnalyticsEvent.userId` is `onDelete: SetNull` (not `Cascade`, unlike
+    // the three models above) — this MUST run before `user.deleteMany`
+    // below, or these rows would survive with `userId: null` and leak into
+    // a later test run's "no analytics rows" fixtures.
+    await prisma.analyticsEvent.deleteMany({
+      where: { user: { email: { contains: testIdPrefix } } },
+    });
     await prisma.video.deleteMany({
       where: { id: { contains: testIdPrefix } },
     });
@@ -97,6 +105,7 @@ describe('ExportService', () => {
     expect(result.interactions).toEqual([]);
     expect(result.watchProgress).toEqual([]);
     expect(result.entitlements).toEqual([]);
+    expect(result.analyticsEvents).toEqual([]);
     expect(typeof result.exportedAt).toBe('string');
     expect(new Date(result.exportedAt).toString()).not.toBe('Invalid Date');
   });
@@ -234,7 +243,7 @@ describe('ExportService', () => {
     ]);
   });
 
-  it('ownership isolation: never includes another account interactions/progress/entitlements', async () => {
+  it('ownership isolation: never includes another account interactions/progress/entitlements/analytics events', async () => {
     await prisma.userVideoInteraction.create({
       data: { userId: otherUserId, videoId, isLiked: true, isSaved: true },
     });
@@ -250,12 +259,215 @@ describe('ExportService', () => {
     await prisma.entitlement.create({
       data: { userId: otherUserId, tier: 'premium', source: 'dev-grant' },
     });
+    await prisma.analyticsEvent.create({
+      data: {
+        userId: otherUserId,
+        eventName: 'video_play',
+        properties: { videoId, seriesId: `${testIdPrefix}-series` },
+        platform: 'ios',
+        clientTimestamp: new Date(),
+      },
+    });
 
     const result = await service.exportForUser(userId);
 
     expect(result.interactions).toEqual([]);
     expect(result.watchProgress).toEqual([]);
     expect(result.entitlements).toEqual([]);
+    expect(result.analyticsEvents).toEqual([]);
+  });
+
+  describe('AnalyticsEvent (Phase 12, work unit 12E-B2, DECISIONS.md decision 2)', () => {
+    it('exports eventName, receivedAt (as timestamp), platform, and allowlist-filtered properties — no id/userId', async () => {
+      const created = await prisma.analyticsEvent.create({
+        data: {
+          userId,
+          eventName: 'video_play',
+          properties: {
+            videoId,
+            seriesId: `${testIdPrefix}-series`,
+            episodeNumber: 3,
+          },
+          platform: 'android',
+          clientTimestamp: new Date('2020-01-01T00:00:00.000Z'),
+        },
+      });
+
+      const result = await service.exportForUser(userId);
+
+      expect(result.analyticsEvents).toEqual([
+        {
+          eventName: 'video_play',
+          timestamp: created.receivedAt.toISOString(),
+          platform: 'android',
+          properties: {
+            videoId,
+            seriesId: `${testIdPrefix}-series`,
+            episodeNumber: 3,
+          },
+        },
+      ]);
+      // The exported timestamp is the server-authoritative `receivedAt`,
+      // never the caller-supplied `clientTimestamp` — proves the timestamp
+      // judgment call (`export.types.ts`) is actually implemented, not just
+      // documented.
+      expect(result.analyticsEvents[0].timestamp).not.toBe(
+        created.clientTimestamp.toISOString(),
+      );
+    });
+
+    it('an account with no analytics rows exports an empty analyticsEvents array', async () => {
+      const result = await service.exportForUser(userId);
+      expect(result.analyticsEvents).toEqual([]);
+    });
+
+    it('orders analytics events newest-first (receivedAt desc)', async () => {
+      const older = await prisma.analyticsEvent.create({
+        data: {
+          userId,
+          eventName: 'feed_view',
+          properties: {},
+          platform: 'web',
+          clientTimestamp: new Date(),
+        },
+      });
+      await prisma.analyticsEvent.update({
+        where: { id: older.id },
+        data: { receivedAt: new Date('2025-01-01T00:00:00.000Z') },
+      });
+      const newer = await prisma.analyticsEvent.create({
+        data: {
+          userId,
+          eventName: 'feed_view',
+          properties: {},
+          platform: 'web',
+          clientTimestamp: new Date(),
+        },
+      });
+      await prisma.analyticsEvent.update({
+        where: { id: newer.id },
+        data: { receivedAt: new Date('2025-06-01T00:00:00.000Z') },
+      });
+
+      const result = await service.exportForUser(userId);
+
+      expect(result.analyticsEvents).toHaveLength(2);
+      expect(result.analyticsEvents[0].timestamp).toBe(
+        new Date('2025-06-01T00:00:00.000Z').toISOString(),
+      );
+      expect(result.analyticsEvents[1].timestamp).toBe(
+        new Date('2025-01-01T00:00:00.000Z').toISOString(),
+      );
+    });
+
+    /**
+     * The defence-in-depth proof this work unit requires: a row whose
+     * `properties` contains a key NOT in `EVENT_PROPERTY_ALLOWLIST` for its
+     * `eventName`, inserted directly via `prisma.analyticsEvent.create`
+     * (bypassing `AnalyticsService.sanitizeProperties`'s write-time scrub
+     * entirely) — simulating a historical row written under a different
+     * version of the allowlist, or any other way a non-allowlisted key could
+     * have ended up in the column. If the export only trusted the stored
+     * value, this key would leak; the read-time filter must strip it.
+     *
+     * Mutation proof (see this work unit's report): temporarily changing
+     * `ExportService.exportForUser`'s analytics mapping from
+     * `filterEventPropertiesForExport(row.eventName, row.properties)` to
+     * `row.properties as Record<string, string | number | boolean>` (a
+     * direct pass-through) makes this test fail, because `secretInternalKey`
+     * then appears in the export. Restored byte-for-byte afterward.
+     */
+    it('read-time allowlist filtering strips a non-allowlisted property key from a row that bypassed the write-time scrub', async () => {
+      // `video_play`'s allowlist is ['videoId', 'seriesId', 'episodeNumber']
+      // (`EVENT_PROPERTY_ALLOWLIST`, analytics.types.ts) — `secretInternalKey`
+      // is deliberately not one of them.
+      await prisma.analyticsEvent.create({
+        data: {
+          userId,
+          eventName: 'video_play',
+          properties: {
+            videoId,
+            secretInternalKey: 'should-never-be-exported',
+          },
+          platform: 'ios',
+          clientTimestamp: new Date(),
+        },
+      });
+
+      const result = await service.exportForUser(userId);
+
+      expect(result.analyticsEvents).toHaveLength(1);
+      expect(result.analyticsEvents[0].properties).toEqual({ videoId });
+      expect(result.analyticsEvents[0].properties).not.toHaveProperty(
+        'secretInternalKey',
+      );
+      expect(JSON.stringify(result)).not.toContain('secretInternalKey');
+      expect(JSON.stringify(result)).not.toContain('should-never-be-exported');
+    });
+
+    it('strips all properties for a known event whose own allowlist is empty (feed_view)', async () => {
+      await prisma.analyticsEvent.create({
+        data: {
+          userId,
+          eventName: 'feed_view',
+          // `feed_view`'s allowlist is [] — every key here is a bypass.
+          properties: { unexpectedKey: 'leak-me', anotherOne: 42 },
+          platform: 'web',
+          clientTimestamp: new Date(),
+        },
+      });
+
+      const result = await service.exportForUser(userId);
+
+      expect(result.analyticsEvents).toHaveLength(1);
+      expect(result.analyticsEvents[0].properties).toEqual({});
+    });
+
+    /**
+     * The gap this test closes (found in independent review of this work
+     * unit): the sibling test above ("strips all properties for a known
+     * event whose own allowlist is empty") uses `eventName: 'feed_view'`,
+     * which IS a key in `EVENT_PROPERTY_ALLOWLIST` (with an empty property
+     * list) — it does not exercise an `eventName` that is absent from the
+     * allowlist entirely. `AnalyticsEvent.eventName` is a plain `String`
+     * column with no DB-level enum (`prisma/schema.prisma`), so a row whose
+     * `eventName` predates an allowlist change, or was written by an older
+     * client version, is a real historical shape that can exist in the
+     * table today. `filterEventPropertiesForExport`'s `EVENT_PROPERTY_ALLOWLIST[eventName]
+     * ?? []` fallback is written to handle exactly this case; this test
+     * proves it actually does, for a genuinely unrecognized `eventName`
+     * rather than a known one with an empty list.
+     *
+     * Mutation proof (see this fix's report): temporarily changing
+     * `ExportService.exportForUser`'s analytics mapping from
+     * `filterEventPropertiesForExport(row.eventName, row.properties)` to
+     * `row.properties as Record<string, string | number | boolean>` (a
+     * direct pass-through) makes this test fail, because `secretPayload`
+     * then appears in the export. Restored byte-for-byte afterward.
+     */
+    it('strips all properties for an eventName absent from EVENT_PROPERTY_ALLOWLIST entirely (unrecognized historical event)', async () => {
+      const unknownEventName = 'legacy_unrecognized_event';
+      expect(Object.keys(EVENT_PROPERTY_ALLOWLIST)).not.toContain(
+        unknownEventName,
+      );
+
+      await prisma.analyticsEvent.create({
+        data: {
+          userId,
+          eventName: unknownEventName,
+          properties: { secretPayload: 'leak-me', anotherOne: 42 },
+          platform: 'web',
+          clientTimestamp: new Date(),
+        },
+      });
+
+      const result = await service.exportForUser(userId);
+
+      expect(result.analyticsEvents).toHaveLength(1);
+      expect(result.analyticsEvents[0].properties).toEqual({});
+      expect(JSON.stringify(result)).not.toContain('secretPayload');
+      expect(JSON.stringify(result)).not.toContain('leak-me');
+    });
   });
 
   it("rejects a nonexistent userId with the generic INVALID_ACCESS_TOKEN error (matches GET /auth/me's existing deleted-user precedent)", async () => {
@@ -286,6 +498,15 @@ describe('ExportService', () => {
     const interaction = await prisma.userVideoInteraction.findUniqueOrThrow({
       where: { userId_videoId: { userId, videoId } },
     });
+    const analyticsEvent = await prisma.analyticsEvent.create({
+      data: {
+        userId,
+        eventName: 'video_play',
+        properties: { videoId },
+        platform: 'ios',
+        clientTimestamp: new Date(),
+      },
+    });
 
     const result = await service.exportForUser(userId);
     const serialized = JSON.stringify(result);
@@ -295,5 +516,10 @@ describe('ExportService', () => {
     expect(serialized).not.toContain(userId);
     expect(serialized).not.toContain(entitlement.id);
     expect(serialized).not.toContain(interaction.id);
+    expect(serialized).not.toContain(analyticsEvent.id);
+    // Field-name-level assertion: not just "this particular id value is
+    // absent," but that the DTO never has a reason to carry an `"id":` key
+    // at all, anywhere in the document, regardless of value.
+    expect(serialized).not.toContain('"id":');
   });
 });

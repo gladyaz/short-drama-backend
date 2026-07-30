@@ -2,6 +2,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import {
   ANALYTICS_EVENT_RETENTION_DAYS,
   AUTH_AUDIT_EVENT_RETENTION_DAYS,
+  PASSWORD_RESET_TOKEN_RETENTION_DAYS,
   SESSION_RETENTION_DAYS,
   WATCH_PROGRESS_RETENTION_DAYS,
 } from './retention.constants';
@@ -114,6 +115,7 @@ describe('RetentionService (mocked Prisma, no real database)', () => {
 
     it('every target reports deletedCount 0 in a dry run, even when rows matched', async () => {
       mockPrisma.session.count.mockResolvedValue(3);
+      mockPrisma.passwordResetToken.count.mockResolvedValue(4);
       mockPrisma.authAuditEvent.count.mockResolvedValue(2);
       mockPrisma.analyticsEvent.count.mockResolvedValue(5);
       mockPrisma.watchProgress.count.mockResolvedValue(1);
@@ -126,6 +128,10 @@ describe('RetentionService (mocked Prisma, no real database)', () => {
       expect(
         report.targets.find((t) => t.target === 'session')?.matchedCount,
       ).toBe(3);
+      expect(
+        report.targets.find((t) => t.target === 'passwordResetToken')
+          ?.matchedCount,
+      ).toBe(4);
     });
   });
 
@@ -145,6 +151,8 @@ describe('RetentionService (mocked Prisma, no real database)', () => {
 
       expect(mockPrisma.session.count).not.toHaveBeenCalled();
       expect(mockPrisma.session.deleteMany).not.toHaveBeenCalled();
+      expect(mockPrisma.passwordResetToken.count).not.toHaveBeenCalled();
+      expect(mockPrisma.passwordResetToken.deleteMany).not.toHaveBeenCalled();
       expect(mockPrisma.authAuditEvent.count).not.toHaveBeenCalled();
       expect(mockPrisma.analyticsEvent.count).not.toHaveBeenCalled();
       expect(mockPrisma.watchProgress.count).not.toHaveBeenCalled();
@@ -185,6 +193,8 @@ describe('RetentionService (mocked Prisma, no real database)', () => {
 
       expect(mockPrisma.session.count).not.toHaveBeenCalled();
       expect(mockPrisma.session.deleteMany).not.toHaveBeenCalled();
+      expect(mockPrisma.passwordResetToken.count).not.toHaveBeenCalled();
+      expect(mockPrisma.passwordResetToken.deleteMany).not.toHaveBeenCalled();
       expect(mockPrisma.authAuditEvent.count).not.toHaveBeenCalled();
       expect(mockPrisma.analyticsEvent.count).not.toHaveBeenCalled();
       expect(mockPrisma.watchProgress.count).not.toHaveBeenCalled();
@@ -212,6 +222,12 @@ describe('RetentionService (mocked Prisma, no real database)', () => {
 
       expect(byTarget.session?.getTime()).toBe(
         dayGranularityCutoff(now, SESSION_RETENTION_DAYS).getTime(),
+      );
+      expect(byTarget.passwordResetToken?.getTime()).toBe(
+        dayGranularityCutoff(
+          now,
+          PASSWORD_RESET_TOKEN_RETENTION_DAYS,
+        ).getTime(),
       );
       expect(byTarget.authAuditEvent?.getTime()).toBe(
         dayGranularityCutoff(now, AUTH_AUDIT_EVENT_RETENTION_DAYS).getTime(),

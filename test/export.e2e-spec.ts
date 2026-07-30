@@ -24,6 +24,14 @@ interface ErrorResponseBody {
  * database for the whole e2e run (see `test/jest-e2e.setup.ts`).
  * `DEV_TOOLS_ENABLED=true` for the whole file, needed only to grant a real
  * entitlement via the existing 10-B5 dev-grant route.
+ *
+ * Work unit 12E-B2 (`DECISIONS.md` decision 2, 2026-07-30) added the
+ * `AnalyticsEvent` coverage below — events are ingested through the real
+ * `POST /analytics/events` route (not inserted directly via `prisma`) for
+ * the populated/ownership-isolation cases, so this file also proves the
+ * full real HTTP round trip (ingest → export) for the new section; the
+ * defence-in-depth read-time-filtering proof uses a direct `prisma` insert
+ * deliberately, to simulate a row that bypassed the write-time scrub.
  */
 describe('User data export (e2e)', () => {
   let app: INestApplication<App>;
@@ -76,6 +84,11 @@ describe('User data export (e2e)', () => {
     await prisma.authAuditEvent.deleteMany({
       where: { user: { email: { contains: emailPrefix } } },
     });
+    // `AnalyticsEvent.userId` is `onDelete: SetNull` (not `Cascade`) — must
+    // run before `user.deleteMany` below, mirroring `export.service.spec.ts`.
+    await prisma.analyticsEvent.deleteMany({
+      where: { user: { email: { contains: emailPrefix } } },
+    });
     await prisma.session.deleteMany({
       where: { user: { email: { contains: emailPrefix } } },
     });
@@ -122,6 +135,7 @@ describe('User data export (e2e)', () => {
     expect(body.interactions).toEqual([]);
     expect(body.watchProgress).toEqual([]);
     expect(body.entitlements).toEqual([]);
+    expect(body.analyticsEvents).toEqual([]);
     expect(typeof body.exportedAt).toBe('string');
   });
 
@@ -145,6 +159,30 @@ describe('User data export (e2e)', () => {
       .post('/dev/entitlements/grant')
       .set('Authorization', `Bearer ${auth.accessToken}`)
       .send({})
+      .expect(HttpStatus.CREATED);
+    await request(app.getHttpServer())
+      .post('/analytics/events')
+      .set('Authorization', `Bearer ${auth.accessToken}`)
+      .send({
+        events: [
+          {
+            eventName: 'video_play',
+            properties: {
+              videoId: seededVideoId,
+              seriesId: seededSeriesId,
+              episodeNumber: 1,
+              // Not in `video_play`'s allowlist — proves the real HTTP
+              // ingestion route's own write-time scrub already strips it,
+              // and the export's independent read-time filter has nothing
+              // to do here (the dedicated bypass test below covers the case
+              // where a row skips the write-time scrub entirely).
+              notAllowlisted: 'should-be-stripped-at-write-time',
+            },
+            clientTimestamp: new Date().toISOString(),
+            platform: 'ios',
+          },
+        ],
+      })
       .expect(HttpStatus.CREATED);
 
     const seededVideo = await prisma.video.findUniqueOrThrow({
@@ -196,6 +234,19 @@ describe('User data export (e2e)', () => {
       revokedAt: null,
     });
 
+    expect(body.analyticsEvents).toHaveLength(1);
+    const { timestamp, ...analyticsRest } = body.analyticsEvents[0];
+    expect(timestamp).toEqual(expect.any(String));
+    expect(analyticsRest).toEqual({
+      eventName: 'video_play',
+      platform: 'ios',
+      properties: {
+        videoId: seededVideoId,
+        seriesId: seededSeriesId,
+        episodeNumber: 1,
+      },
+    });
+
     // Cleanup so this test's rows don't bleed into the isolation test below.
     await request(app.getHttpServer())
       .delete(`/videos/${seededVideoId}/like`)
@@ -231,6 +282,19 @@ describe('User data export (e2e)', () => {
       .set('Authorization', `Bearer ${authB.accessToken}`)
       .send({})
       .expect(HttpStatus.CREATED);
+    await request(app.getHttpServer())
+      .post('/analytics/events')
+      .set('Authorization', `Bearer ${authB.accessToken}`)
+      .send({
+        events: [
+          {
+            eventName: 'feed_view',
+            clientTimestamp: new Date().toISOString(),
+            platform: 'web',
+          },
+        ],
+      })
+      .expect(HttpStatus.CREATED);
 
     const responseA = await request(app.getHttpServer())
       .get('/users/me/export')
@@ -247,10 +311,12 @@ describe('User data export (e2e)', () => {
     expect(bodyA.interactions).toEqual([]);
     expect(bodyA.watchProgress).toEqual([]);
     expect(bodyA.entitlements).toEqual([]);
+    expect(bodyA.analyticsEvents).toEqual([]);
 
     expect(bodyB.interactions).toHaveLength(1);
     expect(bodyB.watchProgress).toHaveLength(1);
     expect(bodyB.entitlements).toHaveLength(1);
+    expect(bodyB.analyticsEvents).toHaveLength(1);
 
     // Also assert at the string level: A's raw response never contains B's
     // account email or any of B's data.
@@ -283,6 +349,20 @@ describe('User data export (e2e)', () => {
       .set('Authorization', `Bearer ${auth.accessToken}`)
       .send({})
       .expect(HttpStatus.CREATED);
+    await request(app.getHttpServer())
+      .post('/analytics/events')
+      .set('Authorization', `Bearer ${auth.accessToken}`)
+      .send({
+        events: [
+          {
+            eventName: 'app_error',
+            properties: { message: 'boom', isFatal: true },
+            clientTimestamp: new Date().toISOString(),
+            platform: 'android',
+          },
+        ],
+      })
+      .expect(HttpStatus.CREATED);
 
     const response = await request(app.getHttpServer())
       .get('/users/me/export')
@@ -305,6 +385,9 @@ describe('User data export (e2e)', () => {
     const entitlement = await prisma.entitlement.findFirstOrThrow({
       where: { userId: user.id },
     });
+    const analyticsEvent = await prisma.analyticsEvent.findFirstOrThrow({
+      where: { userId: user.id },
+    });
     const seededVideo = await prisma.video.findUniqueOrThrow({
       where: { id: seededVideoId },
     });
@@ -316,6 +399,7 @@ describe('User data export (e2e)', () => {
     expect(serialized).not.toContain(interaction.id);
     expect(serialized).not.toContain(progress.id);
     expect(serialized).not.toContain(entitlement.id);
+    expect(serialized).not.toContain(analyticsEvent.id);
     expect(serialized).not.toContain(seededVideo.storageKey);
     for (const session of sessions) {
       expect(serialized).not.toContain(session.refreshTokenHash);
@@ -339,6 +423,52 @@ describe('User data export (e2e)', () => {
       .delete(`/videos/${seededVideoId}/like`)
       .set('Authorization', `Bearer ${auth.accessToken}`)
       .expect(HttpStatus.OK);
+  });
+
+  /**
+   * Phase 12, work unit 12E-B2 (`DECISIONS.md` decision 2, 2026-07-30):
+   * proves the read-time `EVENT_PROPERTY_ALLOWLIST` re-application is real
+   * over the full real HTTP round trip, not just at the service layer
+   * (`export.service.spec.ts` has the equivalent, faster-running coverage).
+   * The row is inserted directly via `prisma`, bypassing
+   * `POST /analytics/events`/`AnalyticsService.sanitizeProperties` entirely,
+   * to simulate a historical row that predates the current allowlist (or
+   * otherwise never passed through the write-time scrub).
+   */
+  it('read-time allowlist filtering: a non-allowlisted property key on a row that bypassed write-time scrubbing never reaches the HTTP response', async () => {
+    const { auth, email } = await registerAccount('read-time-filter');
+    const user = await prisma.user.findUniqueOrThrow({ where: { email } });
+
+    await prisma.analyticsEvent.create({
+      data: {
+        userId: user.id,
+        eventName: 'video_like',
+        // `video_like`'s allowlist is ['videoId', 'value'].
+        properties: {
+          videoId: seededVideoId,
+          value: true,
+          leakedInternalField: 'must-not-reach-the-http-response',
+        },
+        platform: 'ios',
+        clientTimestamp: new Date(),
+      },
+    });
+
+    const response = await request(app.getHttpServer())
+      .get('/users/me/export')
+      .set('Authorization', `Bearer ${auth.accessToken}`)
+      .expect(HttpStatus.OK);
+
+    const body = response.body as UserExportDto;
+    expect(body.analyticsEvents).toHaveLength(1);
+    expect(body.analyticsEvents[0].properties).toEqual({
+      videoId: seededVideoId,
+      value: true,
+    });
+    expect(JSON.stringify(body)).not.toContain('leakedInternalField');
+    expect(JSON.stringify(body)).not.toContain(
+      'must-not-reach-the-http-response',
+    );
   });
 
   it('emits a data_export_success AuthAuditEvent for the caller after a successful export', async () => {

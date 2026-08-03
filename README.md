@@ -61,10 +61,17 @@ mobile app (Expo/React Native)  -->  NestJS backend  -->  local company storage 
 | `JWT_ACCESS_SECRET`   | Secret used to sign/verify short-lived (~15 min) access tokens — added in Phase 8 |
 | `JWT_REFRESH_SECRET`  | Secret used to key the HMAC-SHA256 hash of refresh tokens before they're persisted — added in Phase 8 |
 | `STORAGE_DRIVER`      | Which storage backend is active: `local` (default; unset/empty also resolves to `local`) or `r2` — added in Phase 11, work unit 11G-3. See "Storage driver (`STORAGE_DRIVER`)" below. |
+| `ADS_INTERSTITIAL_ENABLED` | Optional. `true`/`false` toggle for the interstitial-ad system exposed by `GET /config/ads` — added in Phase 15A, slice 15A-S1. See "Ads config API" below. |
+| `ADS_MIN_VIDEOS_BETWEEN_ADS` | Optional. Lower bound of the randomized ad-threshold range — added in Phase 15A, slice 15A-S1. See "Ads config API" below. |
+| `ADS_MAX_VIDEOS_BETWEEN_ADS` | Optional. Upper bound of the randomized ad-threshold range — added in Phase 15A, slice 15A-S1. See "Ads config API" below. |
+| `ADS_MIN_SECONDS_BETWEEN_ADS` | Optional. Cooldown (seconds) between shown ads — added in Phase 15A, slice 15A-S1. See "Ads config API" below. |
+| `ADS_GRACE_VIDEOS`    | Optional. Lifetime video watches exempt from ads — added in Phase 15A, slice 15A-S1. See "Ads config API" below. |
 
 Configuration is validated at startup: the app refuses to start if any
 required variable is missing, or if `STORAGE_ROOT` does not exist / is not a
-directory, with a clear error message.
+directory, with a clear error message. The five `ADS_*` variables above are
+NOT part of that startup validation — every field is optional and falls back
+to its own documented default (see "Ads config API" below).
 
 ### Storage driver (`STORAGE_DRIVER`)
 
@@ -1682,6 +1689,59 @@ unaffected.
 No new environment variables were needed for this work unit — every route
 reads/writes the existing `DATABASE_URL` Postgres connection only.
 
+## Ads config API (Phase 15A, slice 15A-S1)
+
+`GET /config/ads` is a **public, unauthenticated** route that returns the
+current interstitial-ad frequency configuration, consumed by the mobile
+app's ad-gating logic at launch (frozen contract recorded in the control
+workspace's `DECISIONS.md`, "2026-08-03 — Phase 15A slice S1 APPROVED...",
+commit `0f75033`). No `Authorization` header is required or checked, and the
+response is the exact top-level object below — **not** wrapped in this
+project's usual `{ success, data, error }` envelope:
+
+```json
+{
+  "enabled": true,
+  "minVideosBetweenAds": 3,
+  "maxVideosBetweenAds": 6,
+  "minSecondsBetweenAds": 120,
+  "graceVideos": 5
+}
+```
+
+| Field                  | Meaning                                                                |
+| ---------------------- | ------------------------------------------------------------------------ |
+| `enabled`              | Whether the interstitial-ad system is on at all.                       |
+| `minVideosBetweenAds`  | Lower bound of the randomized `[min, max]` watched-video threshold re-rolled after each shown ad. |
+| `maxVideosBetweenAds`  | Upper bound of that same range.                                        |
+| `minSecondsBetweenAds` | Cooldown, in seconds, between shown ads. The cooldown **holds** the watched-video counter — it never resets it. |
+| `graceVideos`          | Number of lifetime video watches, from a fresh install, that never count toward the threshold. |
+
+Backed by five optional environment variables (`AdsConfigService`, read once
+at process start): `ADS_INTERSTITIAL_ENABLED`, `ADS_MIN_VIDEOS_BETWEEN_ADS`,
+`ADS_MAX_VIDEOS_BETWEEN_ADS`, `ADS_MIN_SECONDS_BETWEEN_ADS`,
+`ADS_GRACE_VIDEOS` — see the "Environment variables" table above and
+`.env.example` for the exact defaults (`enabled=true`, `min=3`, `max=6`,
+`seconds=120`, `grace=5`). None of them are required at boot:
+
+- Unset falls back to that field's default silently.
+- A non-numeric or negative value for any of the four integer fields falls
+  back to that field's own default and logs a `warn` naming the variable
+  (never its value).
+- `ADS_INTERSTITIAL_ENABLED` accepts exactly `"true"`/`"false"`; any other
+  value falls back to `true` and logs a `warn`.
+- If, after parsing, `minVideosBetweenAds > maxVideosBetweenAds`, **both**
+  revert to their defaults and a `warn` is logged — never a boot failure and
+  never a half-sanitized range served to a client.
+
+This is a coarse, non-secret tuning surface — a boolean and four small
+integers, no credential, path, or user data — so it is safe to serve to any
+anonymous caller. Like every other route in this app, it inherits the
+global `ThrottlerGuard`'s default rate limit (`DEFAULT_THROTTLE_LIMIT`/
+`DEFAULT_THROTTLE_TTL_MS` in `src/common/rate-limit.constants.ts`, 300
+requests/60s per IP) with no per-route override. No schema change, no
+migration, and no new dependency were introduced for this slice.
+
 ## Testing
 
 ```bash
@@ -1695,6 +1755,8 @@ npm run test:cov   # coverage
 
 ```bash
 curl http://localhost:3000/health
+
+curl http://localhost:3000/config/ads
 
 curl http://localhost:3000/videos/feed
 

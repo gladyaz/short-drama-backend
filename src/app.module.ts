@@ -5,6 +5,7 @@ import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { AdminModule } from './admin/admin.module';
+import { AdsConfigModule } from './ads-config/ads-config.module';
 import { AnalyticsModule } from './analytics/analytics.module';
 import { AuthModule } from './auth/auth.module';
 import { RequestLoggingMiddleware } from './common/logging/request-logging.middleware';
@@ -64,6 +65,7 @@ import { VideosModule } from './videos/videos.module';
     AdminModule,
     MediaModule,
     SeriesModule,
+    AdsConfigModule,
   ],
   controllers: [AppController],
   providers: [AppService, { provide: APP_GUARD, useClass: ThrottlerGuard }],

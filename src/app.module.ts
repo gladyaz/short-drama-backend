@@ -22,6 +22,7 @@ import { InteractionsModule } from './interactions/interactions.module';
 import { MediaModule } from './media/media.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { ProgressModule } from './progress/progress.module';
+import { RetentionModule } from './retention/retention.module';
 import { SeriesModule } from './series/series.module';
 import { StorageModule } from './storage/storage.module';
 import { VideosModule } from './videos/videos.module';
@@ -66,6 +67,11 @@ import { VideosModule } from './videos/videos.module';
     MediaModule,
     SeriesModule,
     AdsConfigModule,
+    // Phase 13, work unit 13A-B2: env-gated (`RETENTION_SCHEDULE_ENABLED`,
+    // default OFF) in-app scheduler for the Phase 12 retention job — see
+    // `RetentionModule`'s own doc comment. Registers no cron job at all
+    // unless explicitly enabled.
+    RetentionModule,
   ],
   controllers: [AppController],
   providers: [AppService, { provide: APP_GUARD, useClass: ThrottlerGuard }],

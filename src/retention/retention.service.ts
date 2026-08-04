@@ -30,14 +30,23 @@ import { dayGranularityCutoff } from './retention.util';
  * file's updated doc comments. `WATCH_PROGRESS_RETENTION_DAYS` and
  * `processWatchProgress` are unchanged by 12E-B3.
  *
- * **This service is deliberately NEVER imported by `AppModule`/`main.ts`.**
- * There is no `RetentionModule`, no `@Cron`, no `OnModuleInit`/startup hook,
- * and no HTTP route anywhere that reaches this class — the only way to
- * invoke it at all is the explicit, opt-in CLI script
- * (`scripts/run-retention.ts`, `npm run retention`), constructed
- * independently of the running server. This is this work unit's strongest
- * possible reading of "nothing runs automatically": the code is not even
- * LOADED when the server boots in any environment, including production.
+ * **Update, Phase 13, work unit 13A-B2:** through Phase 12, this class was
+ * deliberately NEVER imported by `AppModule`/`main.ts` — no `RetentionModule`
+ * existed, and the only way to invoke it was the explicit, opt-in CLI script
+ * below. That is no longer true: `RetentionModule` now exists, IS imported
+ * by `AppModule`, and provides this class so `RetentionSchedulerService`
+ * (`retention-scheduler.service.ts`) can invoke it on a schedule. There is
+ * still no `@Cron` decorator on THIS class and no HTTP route anywhere
+ * reaches it — the only two ways to invoke it remain (1) the explicit,
+ * opt-in CLI script (`scripts/run-retention.ts`, `npm run retention`,
+ * unchanged by this work unit) and (2) `RetentionSchedulerService`'s
+ * cron job, which is itself DISABLED by default
+ * (`RETENTION_SCHEDULE_ENABLED` must be exactly `'true'` for the job to be
+ * registered at all) and, even when enabled, DRY-RUN by default
+ * (`RETENTION_SCHEDULE_COMMIT` must be exactly `'true'` to pass
+ * `commit: true` through) — see that class's own doc comment for the full
+ * design and `retention-schedule.config.ts` for the exact env-var parsing.
+ * The two guarantees below did not change in this work unit.
  *
  * **Dry run is the unconditional default.** `run()`/`buildReport()` with no
  * `commit: true` NEVER calls a single `deleteMany` — see each `process*`

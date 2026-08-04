@@ -993,11 +993,14 @@ data rather than backend bookkeeping (see its row below). `PasswordResetToken`
 is a **new** retention target added by 12E-B3 — it was not covered by
 12D-B1's original five targets at all.
 
-**Nothing here runs automatically.** There is no `@Cron`, no
-`OnModuleInit`/startup hook, and no HTTP route — `RetentionService` is
-deliberately **not** imported by `AppModule`/`main.ts` at all, so the code is
-not even loaded when the server boots, in any environment. The only way to
-invoke it is the explicit CLI script below, run by hand:
+**Nothing here runs automatically by default.** There is no HTTP route, and
+the only two ways to invoke `RetentionService` are (1) the explicit CLI
+script below, run by hand, and (2) the **opt-in, default-OFF** in-app
+scheduler added in Phase 13, work unit 13A-B2 — see "Scheduled retention"
+below for that second path in full. (Through Phase 12, `RetentionService`
+was not imported by `AppModule` at all; 13A-B2 changed that by adding the
+scheduler, but left this section's CLI instructions and both safety gates
+below completely unchanged.)
 
 ```bash
 # Dry run (the default) — reports what WOULD be deleted, deletes nothing,
@@ -1110,6 +1113,50 @@ job's correct, normal outcome is zero matches for all 8 models, always (see
 attempt to create one). It is still implemented as a real scan, not a
 hardcoded zero, so it keeps working as a defensive drift-detector if a
 future migration ever weakens one of these constraints.
+
+### Scheduled retention (Phase 13, work unit 13A-B2)
+
+`RetentionModule` (`src/retention/retention.module.ts`) wires an in-app
+cron scheduler — `RetentionSchedulerService`, built on `@nestjs/schedule` —
+into `AppModule`. This closes the "scheduling is Phase 13's" earmark left by
+Phase 12 (`TASK_QUEUE.md` follow-up item 15). It is a **second**, independent
+way to invoke `RetentionService`, alongside the `npm run retention` CLI
+above, which is completely unchanged by this addition.
+
+**Default OFF, and dry-run by default even when on** — controlled by three
+env vars (see `.env.example`):
+
+| Var | Default | Meaning |
+|---|---|---|
+| `RETENTION_SCHEDULE_ENABLED` | unset → disabled | Must be **exactly** the string `true` to register the cron job at all. Fail-closed: `''`, `'1'`, `'TRUE'`, `'yes'`, or anything else other than the exact lowercase string `true` all mean disabled. When disabled, **zero** retention cron jobs are registered in `@nestjs/schedule`'s `SchedulerRegistry` — not a job that exists but no-ops. |
+| `RETENTION_SCHEDULE_CRON` | `0 3 * * *` (daily, 03:00 local) | Standard cron expression, only relevant once `ENABLED=true`. An **invalid** expression fails the app's boot loudly (`RetentionSchedulerService.onModuleInit` lets the underlying `cron` package's own constructor throw, uncaught) — it is never silently ignored or defaulted. |
+| `RETENTION_SCHEDULE_COMMIT` | unset → dry run | Must be **exactly** the string `true` for a scheduled tick to request a destructive run (`RetentionService.run({ commit: true })`). Any other value — including unset, the default — is a dry run (`commit: false`): a report only, nothing deleted. |
+
+**Commit mode stays double-gated by the existing env guard — this work unit
+does not add a new gate, weaken the old one, or pre-check-and-swallow it.**
+Setting `RETENTION_SCHEDULE_COMMIT=true` only changes what the *scheduler*
+asks `RetentionService.run` for; `run()` still calls
+`assertDestructiveRetentionAllowed()` as its own first action exactly as it
+already did (see "Retention & cleanup jobs" above) — outside
+`NODE_ENV=development`/`test` **and** `DATABASE_URL` matching
+`DATABASE_URL_TEST` by identity, that call still throws. The scheduler does
+not intercept or pre-empt that throw; it only **catches** whatever
+`RetentionService.run` ultimately resolves or rejects with, so a refused
+scheduled commit-mode tick is logged as a structured error and the app stays
+healthy — it never crashes the process or produces an unhandled rejection.
+
+**Every scheduled tick logs a report through this repo's existing
+structured logging/redaction layer** (`redactSensitiveText`,
+`src/common/logging/redact.ts`) — counts only (target name,
+matched/deleted counts), never row contents, whether the tick was a dry run
+or a commit, and whether it succeeded or failed.
+
+In short: leaving all three vars unset (the shipped `.env.example` default)
+reproduces Phase 12's behavior exactly — nothing scheduled, nothing deleted,
+`npm run retention` remains the only way anything runs. Turning scheduling
+on is opt-in at every layer: registering the job at all, requesting
+destructive behavior from it, and the underlying database-identity/
+`NODE_ENV` guard that request must still pass.
 
 ## Interactions & Progress API (Phase 9)
 

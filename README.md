@@ -1037,7 +1037,14 @@ single Prisma call is issued:
    `user:password@` segment of either string), and pipes every refusal
    message through `redactSensitiveText` as defense in depth. Both gates
    are independent — passing one never satisfies the other — and a refusal
-   from either means **zero** database activity for that run.
+   from either means **zero** database activity for that run — literally
+   true as of Phase 13, work unit 13A-B1 (closes `TASK_QUEUE.md` follow-up
+   item 22): `scripts/run-retention.ts`'s CLI entry point (via
+   `src/retention/run-retention-cli.ts`) now runs this gate BEFORE
+   `PrismaService` is even constructed or `$connect()` is called for a
+   `--commit` run, not merely before the first query, so "zero database
+   activity" includes the connection handshake itself, not only the absence
+   of a query on top of an already-open connection.
 
 ### Targets and windows
 

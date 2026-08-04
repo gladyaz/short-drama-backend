@@ -1,7 +1,5 @@
 import 'dotenv/config';
-import { PrismaService } from '../src/prisma/prisma.service';
-import { RetentionService } from '../src/retention/retention.service';
-import { RetentionReport } from '../src/retention/retention.types';
+import { runRetentionCli } from '../src/retention/run-retention-cli';
 
 /**
  * Phase 12, work unit 12D-B1: the ONLY way to invoke `RetentionService` at
@@ -38,64 +36,21 @@ import { RetentionReport } from '../src/retention/retention.types';
  * `short_drama_dev`/real company data regardless of what this script's own
  * guard allows. This CLI is deliberately generic/reusable infrastructure —
  * ITS existence does not itself authorize running it anywhere.
+ *
+ * Phase 13, work unit 13A-B1 (closes `TASK_QUEUE.md` follow-up item 22):
+ * the actual `--commit` implementation now lives in
+ * `../src/retention/run-retention-cli.ts` (`runRetentionCli`), which runs
+ * the safety gate above BEFORE `PrismaService` is constructed or
+ * `$connect()` is called at all — not merely before the first Prisma
+ * *query*, as was true previously. A refusal here now means literally zero
+ * database activity for the run, including the connection handshake itself
+ * — see that file's doc comment for the full before/after and this work
+ * unit's regression test for the mutation-tested proof. This entry point is
+ * deliberately just a thin wrapper (`.env` loading + the `runRetentionCli`
+ * call below) so that file — not this one — is what actually orders the
+ * gate before construction.
  */
-async function main(): Promise<void> {
-  const commit = process.argv.includes('--commit');
-
-  const prisma = new PrismaService();
-  await prisma.onModuleInit();
-
-  try {
-    const service = new RetentionService(prisma);
-    const report = await service.run({ commit });
-    printReport(report);
-  } finally {
-    await prisma.onModuleDestroy();
-  }
-}
-
-function printReport(report: RetentionReport): void {
-  const heading = report.commit
-    ? 'RETENTION RUN — DESTRUCTIVE (rows were deleted)'
-    : 'RETENTION DRY RUN — report only, nothing was deleted';
-
-  // eslint-disable-next-line no-console
-  console.log(`${heading}`);
-  // eslint-disable-next-line no-console
-  console.log(`Generated at: ${report.generatedAt.toISOString()}`);
-  // eslint-disable-next-line no-console
-  console.log('');
-
-  for (const target of report.targets) {
-    const cutoffText = target.cutoff
-      ? ` (cutoff: ${target.cutoff.toISOString()})`
-      : '';
-    // eslint-disable-next-line no-console
-    console.log(
-      `${target.target}: matched=${target.matchedCount} deleted=${target.deletedCount}${cutoffText}`,
-    );
-
-    for (const detail of target.residueDetails ?? []) {
-      // eslint-disable-next-line no-console
-      console.log(
-        `  - ${detail.model}: matched=${detail.matchedCount} deleted=${detail.deletedCount}`,
-      );
-    }
-  }
-
-  // eslint-disable-next-line no-console
-  console.log('');
-  if (!report.commit) {
-    // eslint-disable-next-line no-console
-    console.log(
-      'This was a DRY RUN. Pass --commit (with NODE_ENV=development or ' +
-        'test, AND DATABASE_URL pointed at the same database as ' +
-        'DATABASE_URL_TEST) to actually delete the rows listed above.',
-    );
-  }
-}
-
-main().catch((error: unknown) => {
+runRetentionCli(process.argv).catch((error: unknown) => {
   // eslint-disable-next-line no-console
   console.error(error instanceof Error ? error.message : String(error));
   process.exitCode = 1;

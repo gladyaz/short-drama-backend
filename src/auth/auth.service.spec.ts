@@ -428,7 +428,18 @@ describe('AuthService', () => {
         auditEvents.slice(1, 11).every((row) => row.event === 'login_failed'),
       ).toBe(true);
       expect(auditEvents[11].event).toBe('account_locked');
-    });
+      // Deliberately performs 12 REAL bcrypt cost-12 operations end-to-end
+      // (1 `register` hash + 10 wrong-password `login` compares + 1 compare for
+      // the correct-password-while-locked attempt — the login path always
+      // compares, for anti-enumeration). Measured at ~3.3 s of pure bcrypt on
+      // fast dev hardware, i.e. ~66% of Jest's 5000 ms default before a single
+      // database round-trip, so a slower CI runner overruns it deterministically
+      // (observed on GitHub Actions at backend `a7cc07f`). The explicit timeout
+      // buys this test the wall-clock it genuinely needs; it does NOT weaken any
+      // assertion, and `BCRYPT_COST_FACTOR` stays at its production value of 12
+      // so this still exercises real production hashing cost. Same 60000 ms
+      // convention already used by the concurrency tests below.
+    }, 60000);
 
     it('allows login again once the lock window has elapsed (simulated via the stored timestamp)', async () => {
       const email = uniqueEmail('login-lockout-expired');

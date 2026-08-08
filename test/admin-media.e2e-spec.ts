@@ -51,6 +51,10 @@ describe('Admin Media (e2e)', () => {
   const uniqueEmail = (label: string): string =>
     `${emailPrefix}-${label}-${Date.now()}-${Math.random().toString(36).slice(2)}@example.test`;
 
+  // Work unit 11L-B2: `sizeBytes` and `contentType` are REQUIRED on this
+  // route now — they are the server-recorded upload expectation that
+  // `complete-upload` verifies R2's own HeadObject response against.
+  const uploadSizeBytes = 1024;
   const validCreateBody = {
     seriesId: testSeriesId,
     title: 'E2E Admin Media',
@@ -60,6 +64,8 @@ describe('Admin Media (e2e)', () => {
     category: 'drama',
     sourceLanguage: 'zh',
     hasEmbeddedIndonesianSubtitle: true,
+    sizeBytes: uploadSizeBytes,
+    contentType: 'video/mp4',
   };
 
   beforeAll(async () => {
@@ -72,7 +78,14 @@ describe('Admin Media (e2e)', () => {
         expiresAt: new Date(Date.now() + 60_000),
       }),
       createPresignedGetUrl: jest.fn(),
-      headObject: jest.fn(),
+      // Work unit 11L-B3: completion now verifies size and content type
+      // against this, not just existence, so the default must describe an
+      // object that MATCHES `validCreateBody`'s declared expectation.
+      headObject: jest.fn().mockResolvedValue({
+        key: 'admin-media/mock/source',
+        contentLength: uploadSizeBytes,
+        contentType: 'video/mp4',
+      }),
       objectExists: jest.fn().mockResolvedValue(true),
       deleteObject: jest.fn(),
       buildPublicUrl: jest.fn(),
@@ -198,6 +211,260 @@ describe('Admin Media (e2e)', () => {
    * `startsWith(testSeriesId)` sweep) so tests never collide with each
    * other or with the "admin happy path" fixtures above.
    */
+  // Work unit 11L-B2/B3: the upload expectation and its verification. The
+  // point of these is that a caller cannot talk its way to `ready` — the
+  // only thing that advances the lifecycle is R2's own HeadObject response
+  // agreeing with what was recorded at initiate time.
+  describe('11L — upload expectation and hardened completion', () => {
+    let episodeCursor = 500;
+
+    async function createDraft(
+      overrides: Record<string, unknown> = {},
+    ): Promise<string> {
+      episodeCursor += 1;
+      const response = await request(app.getHttpServer())
+        .post('/admin/media')
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({
+          ...validCreateBody,
+          episodeNumber: episodeCursor,
+          ...overrides,
+        })
+        .expect(HttpStatus.CREATED);
+
+      return (response.body as CreateUploadResponseBody).media.id;
+    }
+
+    async function lifecycleStateOf(id: string): Promise<string | undefined> {
+      const row = await prisma.video.findUnique({
+        where: { id },
+        select: { lifecycleState: true },
+      });
+
+      return row?.lifecycleState;
+    }
+
+    it.each([
+      [
+        'a content type outside the one-value allow-list',
+        { contentType: 'video/quicktime' },
+      ],
+      ['a missing sizeBytes', { sizeBytes: undefined }],
+      ['a missing contentType', { contentType: undefined }],
+      ['a zero sizeBytes', { sizeBytes: 0 }],
+      ['a negative sizeBytes', { sizeBytes: -1 }],
+      ['a sizeBytes over the ceiling', { sizeBytes: 2_147_483_648 }],
+    ])('rejects %s with 400 and creates no row', async (_label, overrides) => {
+      episodeCursor += 1;
+      const body: Record<string, unknown> = {
+        ...validCreateBody,
+        episodeNumber: episodeCursor,
+        ...overrides,
+      };
+
+      for (const [key, value] of Object.entries(overrides)) {
+        if (value === undefined) {
+          delete body[key];
+        }
+      }
+
+      await request(app.getHttpServer())
+        .post('/admin/media')
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send(body)
+        .expect(HttpStatus.BAD_REQUEST);
+
+      const rows = await prisma.video.findMany({
+        where: { seriesId: testSeriesId, episodeNumber: episodeCursor },
+      });
+      expect(rows).toHaveLength(0);
+    });
+
+    it('generates the object key server-side and leaks no credential material in the response', async () => {
+      episodeCursor += 1;
+      const response = await request(app.getHttpServer())
+        .post('/admin/media')
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({ ...validCreateBody, episodeNumber: episodeCursor })
+        .expect(HttpStatus.CREATED);
+
+      const body = response.body as CreateUploadResponseBody;
+
+      // The key is derived from the server-generated id alone - nothing the
+      // client sent appears in it, which is why path traversal is not
+      // something this route has to filter for.
+      expect(body.media.objectStorageKey).toBe(
+        `admin-media/${body.media.id}/source`,
+      );
+      expect(body.media.objectStorageKey).not.toContain(validCreateBody.title);
+
+      // What is actually worth asserting here is narrower than it first
+      // looks. A presigned URL legitimately carries `X-Amz-Signature` and an
+      // `X-Amz-Credential` scope string — that is how presigning works, and
+      // asserting their absence would be asserting something FALSE about the
+      // real signer (it passes here only because StorageService is mocked).
+      // The real invariant is that no LONG-LIVED secret ever reaches the
+      // client, and that the signed URL appears in exactly one place: the
+      // `upload.url` field the caller needs.
+      const secretValue = process.env.OBJECT_STORAGE_SECRET_ACCESS_KEY;
+
+      expect(JSON.stringify(body.media)).not.toContain('http');
+      if (secretValue) {
+        expect(JSON.stringify(body)).not.toContain(secretValue);
+      }
+    });
+
+    it('refuses completion when the object is not there, and leaves the row draft', async () => {
+      const id = await createDraft();
+      mockStorageService.headObject.mockResolvedValueOnce(null);
+
+      await request(app.getHttpServer())
+        .post(`/admin/media/${id}/complete-upload`)
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({})
+        .expect(HttpStatus.BAD_REQUEST);
+
+      expect(await lifecycleStateOf(id)).toBe('draft');
+    });
+
+    it('refuses completion on a size mismatch, and leaves the row draft and retryable', async () => {
+      const id = await createDraft();
+      mockStorageService.headObject.mockResolvedValueOnce({
+        key: `admin-media/${id}/source`,
+        contentLength: uploadSizeBytes + 1,
+        contentType: 'video/mp4',
+      });
+
+      const response = await request(app.getHttpServer())
+        .post(`/admin/media/${id}/complete-upload`)
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({})
+        .expect(HttpStatus.CONFLICT);
+
+      expect((response.body as { code: string }).code).toBe(
+        'UPLOAD_SIZE_MISMATCH',
+      );
+      expect(await lifecycleStateOf(id)).toBe('draft');
+
+      // Retryable: the same call succeeds once the object is right.
+      await request(app.getHttpServer())
+        .post(`/admin/media/${id}/complete-upload`)
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({})
+        .expect(HttpStatus.OK);
+      expect(await lifecycleStateOf(id)).toBe('ready');
+    });
+
+    // A truncated or empty upload is the failure mode that matters most in
+    // practice (a dropped connection), and it is the one an inequality-only
+    // check would wave through: with `!==` weakened to `>`, every case below
+    // would reach `ready`. `0` additionally pins the fail-closed behaviour of
+    // StorageService.headObject coalescing a missing ContentLength to 0.
+    it.each([
+      ['a truncated upload', 1],
+      ['an empty object', 0],
+    ])(
+      'refuses completion on %s, and leaves the row draft',
+      async (_label, contentLength) => {
+        const id = await createDraft();
+        mockStorageService.headObject.mockResolvedValueOnce({
+          key: `admin-media/${id}/source`,
+          contentLength,
+          contentType: 'video/mp4',
+        });
+
+        const response = await request(app.getHttpServer())
+          .post(`/admin/media/${id}/complete-upload`)
+          .set('Authorization', `Bearer ${adminAccessToken}`)
+          .send({})
+          .expect(HttpStatus.CONFLICT);
+
+        expect((response.body as { code: string }).code).toBe(
+          'UPLOAD_SIZE_MISMATCH',
+        );
+        expect(await lifecycleStateOf(id)).toBe('draft');
+      },
+    );
+
+    // Fail-closed on a HeadObject response that carries no ContentType at
+    // all: without this, `metadata.contentType !== expected` could be
+    // weakened to skip `undefined` and nothing would notice.
+    it('refuses completion when the object reports no content type', async () => {
+      const id = await createDraft();
+      mockStorageService.headObject.mockResolvedValueOnce({
+        key: `admin-media/${id}/source`,
+        contentLength: uploadSizeBytes,
+        contentType: undefined,
+      });
+
+      await request(app.getHttpServer())
+        .post(`/admin/media/${id}/complete-upload`)
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({})
+        .expect(HttpStatus.CONFLICT);
+
+      expect(await lifecycleStateOf(id)).toBe('draft');
+    });
+
+    // The verification is only as good as what initiate recorded, and
+    // nothing else in the suite reads these columns back.
+    it('records the declared expectation on the row at initiate time', async () => {
+      const id = await createDraft();
+
+      const row = await prisma.video.findUnique({
+        where: { id },
+        select: { expectedSizeBytes: true, expectedContentType: true },
+      });
+
+      expect(row?.expectedSizeBytes).toBe(uploadSizeBytes);
+      expect(row?.expectedContentType).toBe('video/mp4');
+    });
+
+    it('refuses completion on a content-type mismatch, and leaves the row draft', async () => {
+      const id = await createDraft();
+      mockStorageService.headObject.mockResolvedValueOnce({
+        key: `admin-media/${id}/source`,
+        contentLength: uploadSizeBytes,
+        contentType: 'text/plain',
+      });
+
+      const response = await request(app.getHttpServer())
+        .post(`/admin/media/${id}/complete-upload`)
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({})
+        .expect(HttpStatus.CONFLICT);
+
+      expect((response.body as { code: string }).code).toBe(
+        'UPLOAD_CONTENT_TYPE_MISMATCH',
+      );
+      expect(await lifecycleStateOf(id)).toBe('draft');
+    });
+
+    it('refuses to publish a draft that never completed, and publishes once ready', async () => {
+      const id = await createDraft();
+
+      await request(app.getHttpServer())
+        .post(`/admin/media/${id}/publish`)
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({})
+        .expect(HttpStatus.BAD_REQUEST);
+      expect(await lifecycleStateOf(id)).toBe('draft');
+
+      await request(app.getHttpServer())
+        .post(`/admin/media/${id}/complete-upload`)
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({})
+        .expect(HttpStatus.OK);
+
+      await request(app.getHttpServer())
+        .post(`/admin/media/${id}/publish`)
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({})
+        .expect(HttpStatus.OK);
+      expect(await lifecycleStateOf(id)).toBe('published');
+    });
+  });
+
   describe('409 — duplicate episode-number-within-series (create)', () => {
     const dupSeriesId = `${testSeriesId}-11f3-create-dup`;
 

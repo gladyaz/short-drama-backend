@@ -21,6 +21,7 @@ describe('AdminMediaService', () => {
   let storageService: {
     createPresignedPutUrl: jest.Mock;
     objectExists: jest.Mock;
+    headObject: jest.Mock;
   };
 
   const testIdPrefix = 'admin-media-spec-11b3';
@@ -29,6 +30,7 @@ describe('AdminMediaService', () => {
     storageService = {
       createPresignedPutUrl: jest.fn(),
       objectExists: jest.fn(),
+      headObject: jest.fn(),
     };
 
     const module: TestingModule = await Test.createTestingModule({
@@ -52,6 +54,11 @@ describe('AdminMediaService', () => {
     await prisma.onModuleDestroy();
   });
 
+  // Work unit 11L-B2: the declared upload expectation. `createUpload`
+  // persists it, and `completeUpload` verifies R2's HeadObject against it,
+  // so the fixture and the mocked HeadObject response must agree wherever a
+  // test means "the upload was fine".
+  const EXPECTED_UPLOAD_SIZE_BYTES = 2048;
   const baseDto = {
     seriesId: `${testIdPrefix}-series`,
     title: 'Spec Media',
@@ -61,6 +68,8 @@ describe('AdminMediaService', () => {
     category: 'drama',
     sourceLanguage: 'zh',
     hasEmbeddedIndonesianSubtitle: true,
+    sizeBytes: EXPECTED_UPLOAD_SIZE_BYTES,
+    contentType: 'video/mp4' as const,
   };
 
   describe('createUpload', () => {
@@ -212,6 +221,12 @@ describe('AdminMediaService', () => {
     it('transitions draft -> ready when the object exists in storage', async () => {
       const id = await createDraft();
       storageService.objectExists.mockResolvedValue(true);
+      // 11L-B3: completion verifies size + content type, not just presence.
+      storageService.headObject.mockResolvedValue({
+        key: 'admin-media/test/source',
+        contentLength: EXPECTED_UPLOAD_SIZE_BYTES,
+        contentType: 'video/mp4',
+      });
 
       const result = await service.completeUpload(id, {
         durationSeconds: 120,
@@ -223,7 +238,7 @@ describe('AdminMediaService', () => {
       expect(result.durationSeconds).toBe(120);
       expect(result.width).toBe(1080);
       expect(result.height).toBe(1920);
-      expect(storageService.objectExists).toHaveBeenCalledWith(
+      expect(storageService.headObject).toHaveBeenCalledWith(
         `admin-media/${id}/source`,
       );
     });
@@ -231,6 +246,7 @@ describe('AdminMediaService', () => {
     it('rejects with a 400 when the object does not exist in storage', async () => {
       const id = await createDraft();
       storageService.objectExists.mockResolvedValue(false);
+      storageService.headObject.mockResolvedValue(null);
 
       let caught: unknown;
       try {
@@ -257,6 +273,12 @@ describe('AdminMediaService', () => {
     it('rejects with INVALID_MEDIA_LIFECYCLE_TRANSITION when the record is already ready (not a draft)', async () => {
       const id = await createDraft();
       storageService.objectExists.mockResolvedValue(true);
+      // 11L-B3: completion verifies size + content type, not just presence.
+      storageService.headObject.mockResolvedValue({
+        key: 'admin-media/test/source',
+        contentLength: EXPECTED_UPLOAD_SIZE_BYTES,
+        contentType: 'video/mp4',
+      });
       await service.completeUpload(id, {});
 
       await expect(service.completeUpload(id, {})).rejects.toMatchObject({
@@ -274,6 +296,12 @@ describe('AdminMediaService', () => {
       });
       const created = await service.createUpload(baseDto);
       storageService.objectExists.mockResolvedValue(true);
+      // 11L-B3: completion verifies size + content type, not just presence.
+      storageService.headObject.mockResolvedValue({
+        key: 'admin-media/test/source',
+        contentLength: EXPECTED_UPLOAD_SIZE_BYTES,
+        contentType: 'video/mp4',
+      });
       await service.completeUpload(created.media.id, {});
       return created.media.id;
     }
@@ -409,6 +437,12 @@ describe('AdminMediaService', () => {
       }
 
       storageService.objectExists.mockResolvedValue(true);
+      // 11L-B3: completion verifies size + content type, not just presence.
+      storageService.headObject.mockResolvedValue({
+        key: 'admin-media/test/source',
+        contentLength: EXPECTED_UPLOAD_SIZE_BYTES,
+        contentType: 'video/mp4',
+      });
       await service.completeUpload(id, {});
       if (state === 'ready') {
         return id;
@@ -861,6 +895,12 @@ describe('AdminMediaService', () => {
     it('leaves lifecycle/object-storage/derived fields untouched', async () => {
       const id = await createMedia();
       storageService.objectExists.mockResolvedValue(true);
+      // 11L-B3: completion verifies size + content type, not just presence.
+      storageService.headObject.mockResolvedValue({
+        key: 'admin-media/test/source',
+        contentLength: EXPECTED_UPLOAD_SIZE_BYTES,
+        contentType: 'video/mp4',
+      });
       await service.completeUpload(id, {
         durationSeconds: 42,
         width: 100,

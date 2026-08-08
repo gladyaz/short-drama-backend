@@ -10,8 +10,13 @@ import {
   Query,
   UseGuards,
 } from '@nestjs/common';
+import { Throttle } from '@nestjs/throttler';
 import { AdminGuard } from '../admin/guards/admin.guard';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
+import {
+  ADMIN_MEDIA_UPLOAD_INITIATE_RATE_LIMIT,
+  ADMIN_MEDIA_UPLOAD_INITIATE_RATE_TTL_MS,
+} from '../common/rate-limit.constants';
 import { AdminMediaService } from './admin-media.service';
 import { CompleteMediaUploadDto } from './dto/complete-media-upload.dto';
 import { CreateMediaAssetUploadDto } from './dto/create-media-asset-upload.dto';
@@ -40,7 +45,22 @@ import {
 export class AdminMediaController {
   constructor(private readonly adminMediaService: AdminMediaService) {}
 
+  /**
+   * Work unit 11L-B4: a dedicated, tighter-than-default per-route throttle
+   * — see `ADMIN_MEDIA_UPLOAD_INITIATE_RATE_LIMIT`'s doc comment in
+   * `common/rate-limit.constants.ts` for why this authenticated route still
+   * gets one. Overrides (does not add to) the app-wide "default" throttler
+   * from `ThrottlerModule.forRoot` (`app.module.ts`), matching the exact
+   * `@Throttle()` pattern already used by `AuthController`/
+   * `AccountDeletionController`/`ExportController`.
+   */
   @Post()
+  @Throttle({
+    default: {
+      limit: ADMIN_MEDIA_UPLOAD_INITIATE_RATE_LIMIT,
+      ttl: ADMIN_MEDIA_UPLOAD_INITIATE_RATE_TTL_MS,
+    },
+  })
   createUpload(
     @Body() body: CreateMediaUploadDto,
   ): Promise<CreateMediaUploadResponseDto> {

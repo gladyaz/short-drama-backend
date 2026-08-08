@@ -126,3 +126,40 @@ export const ACCOUNT_DELETION_RATE_TTL_MS = minutes(15);
  */
 export const DATA_EXPORT_RATE_LIMIT = 10;
 export const DATA_EXPORT_RATE_TTL_MS = minutes(5);
+
+/**
+ * Phase 11, work unit 11L-B4: `POST /admin/media` (upload-initiate) is
+ * already `JwtAuthGuard + AdminGuard`-protected (unlike every
+ * unauthenticated route above), so it does not need login-attempt-style
+ * strictness. It still gets its own tighter-than-default override rather
+ * than relying on the generous 300/60s default, for two reasons specific to
+ * THIS route: (1) each call mints a real, short-lived presigned R2 `PUT`
+ * URL — a paid/billable, credential-backed operation on the storage
+ * provider side, not a free local computation like most default-throttled
+ * routes; (2) a compromised admin session (stolen access token) could
+ * otherwise be used to mint an unbounded number of presigned URLs and
+ * `draft` rows in a tight loop. The bound is **60 per minute**, not the 10
+ * this work unit first tried: 10 turned out to reject legitimate traffic —
+ * the admin-media e2e suite exceeded it and started 429-ing, and a real
+ * admin ingesting a season one episode at a time would hit the same wall
+ * mid-batch. A limit that blocks the normal workflow is a defect, not
+ * security. 60/minute (one per second sustained) still bounds a stolen-token
+ * abuse loop to a small, fixed number of presigned URLs and `draft` rows per
+ * window — and each URL is short-lived and bound to one server-generated
+ * key, so the ceiling on damage is junk draft rows, never data access —
+ * while leaving batch uploading comfortably unblocked.
+ *
+ * Two honest limits of this control, recorded rather than overstated
+ * (independent review, 2026-08-08): (1) `ThrottlerGuard` here keys on client
+ * IP, not on the admin user id, so an attacker rotating source addresses is
+ * not bounded by it, while admins sharing one office NAT share a single
+ * bucket — a per-user tracker would be the real fix; (2) the presigned PUT
+ * carries no signed `ContentLength`, so each minted URL admits a body of any
+ * size. "Junk draft rows" is therefore the ceiling on *rows*, not on bytes
+ * written into the bucket. Both are follow-ups, not solved here. Same
+ * "authenticated but still gets a dedicated tighter override for a
+ * specific reason" precedent as `ACCOUNT_DELETION_RATE_LIMIT`/
+ * `DATA_EXPORT_RATE_LIMIT` above, not the generic default.
+ */
+export const ADMIN_MEDIA_UPLOAD_INITIATE_RATE_LIMIT = 60;
+export const ADMIN_MEDIA_UPLOAD_INITIATE_RATE_TTL_MS = minutes(1);

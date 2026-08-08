@@ -80,6 +80,8 @@ type VideoRow = {
   width: number | null;
   height: number | null;
   accessTierOverride: string | null;
+  expectedSizeBytes: number | null;
+  expectedContentType: string | null;
 };
 
 /**
@@ -143,6 +145,12 @@ export class AdminMediaService {
         height: dto.height,
         objectStorageKey,
         objectStorageVariant: SOURCE_VARIANT,
+        // Work unit 11L-B2: the server-side upload EXPECTATION — see
+        // `Video.expectedSizeBytes`/`expectedContentType`'s schema doc
+        // comment (11L-B1) for why this must be recorded here, at initiate
+        // time, rather than accepted again at `completeUpload`.
+        expectedSizeBytes: dto.sizeBytes,
+        expectedContentType: dto.contentType,
         lifecycleState: MediaLifecycleState.DRAFT,
         // Work unit 11F-4: every newly created row gets an explicit
         // access tier at creation time, derived from `episodeNumber`
@@ -162,6 +170,37 @@ export class AdminMediaService {
     };
   }
 
+  /**
+   * Work unit 11L-B3: hardened completion. Previously this only asked
+   * `StorageService.objectExists` a yes/no question and trusted it — that
+   * verifies presence, not that the uploaded bytes are actually what was
+   * expected. Now it calls `StorageService.headObject` and verifies THREE
+   * things, in order, before any lifecycle transition or database write
+   * happens: (1) the object exists at all, (2) its real size
+   * (`ContentLength`) matches `Video.expectedSizeBytes`, (3) its real
+   * `Content-Type` matches `Video.expectedContentType` — both recorded by
+   * `createUpload` (11L-B2) from the CLIENT's own declaration at initiate
+   * time, so the completing caller cannot restate either value here to make
+   * the check pass vacuously (see `Video.expectedSizeBytes`'s schema doc
+   * comment for the full rationale). On ANY of the three failures this
+   * throws before `assertTransition`/`prisma.video.update` are ever
+   * reached — the row's `lifecycleState` stays exactly where it was
+   * (`draft`), no partial data is written, and the SAME `completeUpload`
+   * call can simply be retried once the real problem is fixed (re-upload,
+   * or an initiate with a correct declaration). Every thrown message states
+   * only the mismatch itself (expected vs. actual size/type) — never the
+   * bucket, endpoint, object key, or a signed URL.
+   *
+   * Backward compatibility: a row created before this slice has
+   * `expectedSizeBytes`/`expectedContentType` both `null` (the additive
+   * migration backfills no existing row). For those, and ONLY those, steps
+   * (2)/(3) are skipped and this falls back to the pre-11L existence-only
+   * check. This can never be used to bypass verification on a NEW row: since
+   * `CreateMediaUploadDto.sizeBytes`/`contentType` are now required
+   * (11L-B2), every row `createUpload` creates after this slice always has
+   * both fields set, so a `null` expectation is structurally impossible for
+   * a freshly created row.
+   */
   async completeUpload(
     id: string,
     dto: CompleteMediaUploadDto,
@@ -176,15 +215,40 @@ export class AdminMediaService {
       );
     }
 
-    const uploaded = await this.storageService.objectExists(
+    const metadata = await this.storageService.headObject(
       media.objectStorageKey,
     );
 
-    if (!uploaded) {
+    if (metadata === null) {
       throw new AppException(
         AppErrorCode.MEDIA_FILE_NOT_FOUND,
         'No object was found at the presigned upload key',
         HttpStatus.BAD_REQUEST,
+      );
+    }
+
+    if (
+      media.expectedSizeBytes !== null &&
+      metadata.contentLength !== media.expectedSizeBytes
+    ) {
+      throw new AppException(
+        AppErrorCode.UPLOAD_SIZE_MISMATCH,
+        `Uploaded object size does not match the expected size ` +
+          `(expected ${media.expectedSizeBytes} bytes, got ${metadata.contentLength} bytes)`,
+        HttpStatus.CONFLICT,
+      );
+    }
+
+    if (
+      media.expectedContentType !== null &&
+      metadata.contentType !== media.expectedContentType
+    ) {
+      throw new AppException(
+        AppErrorCode.UPLOAD_CONTENT_TYPE_MISMATCH,
+        `Uploaded object content type does not match the expected ` +
+          `content type (expected "${media.expectedContentType}", got ` +
+          `"${metadata.contentType ?? 'unknown'}")`,
+        HttpStatus.CONFLICT,
       );
     }
 

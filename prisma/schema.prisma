@@ -213,6 +213,32 @@ model Video {
   /// null`). Deliberately NOT exposed on the public `VideoResponseDto` — see
   /// `AdminMediaDto` for its only intended external exposure.
   accessTierOverride            String?
+  /// Phase 11, work unit 11L-B1: the server-side upload EXPECTATION recorded
+  /// at `POST /admin/media` (initiate) time — the client's declared
+  /// `sizeBytes`/`contentType` for the object it is about to `PUT` to the
+  /// presigned URL. Both nullable with NO default, so every pre-existing row
+  /// (created before this slice) keeps compiling and backfills to `null` —
+  /// this additive migration changes no existing row's value.
+  ///
+  /// WHY THESE EXIST (and why not just re-check at completion time): the
+  /// whole point of 11L-B3's hardened `complete-upload` verification is that
+  /// the browser is not trusted. If the expected size/type were supplied on
+  /// the COMPLETION call instead, a caller could upload a 10-byte file,
+  /// declare 10 bytes at that same call, and the check would pass
+  /// vacuously — completion would be verifying the client's claim against
+  /// itself. Recording the expectation HERE, at initiate, server-side, means
+  /// `completeUpload` instead compares R2's own `HeadObject` response
+  /// against a value the completing caller cannot restate or influence.
+  ///
+  /// `null` on a row means "created before this slice" — completion falls
+  /// back to an existence-only check for those rows (see
+  /// `AdminMediaService.completeUpload`'s doc comment for the exact
+  /// backward-compatibility rule). Every row `createUpload` creates AFTER
+  /// this slice always sets both fields from the now-required
+  /// `CreateMediaUploadDto.sizeBytes`/`contentType`, so a `null` expectation
+  /// can never be used to bypass verification on a NEWLY created row.
+  expectedSizeBytes             Int?
+  expectedContentType           String?
 
   @@index([seriesId])
   @@index([sortOrder])

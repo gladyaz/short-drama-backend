@@ -188,4 +188,30 @@ export enum AppErrorCode {
    * does not already hold the account's real password.
    */
   ACCOUNT_DELETION_FORBIDDEN = 'ACCOUNT_DELETION_FORBIDDEN',
+  // Phase 11, work unit 11L-B3 (hardened admin-upload completion)
+  /**
+   * Returned by `POST /admin/media/:id/complete-upload` when the uploaded
+   * object's real size (`HeadObject`'s `ContentLength`, from
+   * `StorageService.headObject`) does not exactly equal
+   * `Video.expectedSizeBytes` — the value the client itself declared at
+   * `POST /admin/media` (initiate) time. Distinct from
+   * `MEDIA_FILE_NOT_FOUND` (the object exists, but is not the object that
+   * was expected) and from `UPLOAD_CONTENT_TYPE_MISMATCH` (a different
+   * verification axis) so a caller/operator can tell exactly which
+   * expectation failed. The row's `lifecycleState` stays `draft` and remains
+   * retryable — no partial data is written. The message states only the
+   * mismatch itself (expected vs. actual size), never the bucket, endpoint,
+   * object key, or any signed URL.
+   */
+  UPLOAD_SIZE_MISMATCH = 'UPLOAD_SIZE_MISMATCH',
+  /**
+   * Returned by `POST /admin/media/:id/complete-upload` when the uploaded
+   * object's real `Content-Type` (`HeadObject`'s `ContentType`) does not
+   * exactly equal `Video.expectedContentType` — the value the client itself
+   * declared at initiate time (today always `'video/mp4'`, per
+   * `CreateMediaUploadDto`'s `@IsIn` allow-list). Same retry-safe/no-leak
+   * contract as `UPLOAD_SIZE_MISMATCH` above: the row stays `draft`, and the
+   * message states only expected-vs-actual content type.
+   */
+  UPLOAD_CONTENT_TYPE_MISMATCH = 'UPLOAD_CONTENT_TYPE_MISMATCH',
 }

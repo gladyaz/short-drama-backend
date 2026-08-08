@@ -8,16 +8,21 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { createReadStream } from 'fs';
+import { Throttle } from '@nestjs/throttler';
 import type { Request, Response } from 'express';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import type { AuthenticatedUser } from '../auth/guards/jwt-auth.guard';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { AppErrorCode } from '../common/errors/app-error-code';
 import { AppException } from '../common/errors/app.exception';
+import {
+  VIDEO_PLAYBACK_URL_RATE_LIMIT,
+  VIDEO_PLAYBACK_URL_RATE_TTL_MS,
+} from '../common/rate-limit.constants';
 import { FREE_EPISODE_LIMIT } from '../entitlements/entitlement.constants';
 import { EntitlementsService } from '../entitlements/entitlements.service';
 import { VideosService } from './videos.service';
-import type { VideoResponseDto } from './video.types';
+import type { VideoPlaybackResponseDto, VideoResponseDto } from './video.types';
 import { parseRangeHeader } from './video-range.util';
 
 @Controller('videos')
@@ -58,21 +63,7 @@ export class VideosController {
     @Req() req: Request,
     @Res() res: Response,
   ): Promise<void> {
-    const guardInfo = await this.videosService.getStreamGuardInfo(id);
-
-    if (
-      this.entitlementsService.resolveEpisodePremium(
-        guardInfo,
-        FREE_EPISODE_LIMIT,
-      ) &&
-      !(await this.entitlementsService.isEntitled(user.id))
-    ) {
-      throw new AppException(
-        AppErrorCode.ENTITLEMENT_REQUIRED,
-        'An active entitlement is required to stream this episode',
-        HttpStatus.FORBIDDEN,
-      );
-    }
+    await this.enforceEntitlementGate(id, user);
 
     const { absolutePath, fileSize } =
       await this.videosService.resolveStreamableFile(id);
@@ -98,8 +89,80 @@ export class VideosController {
     stream.pipe(res);
   }
 
+  /**
+   * Phase 11, work unit 11M-B4 (DECISIONS.md "Slice 11M approved..." entry,
+   * Option A). Answers for BOTH storage kinds — R2-backed media gets a
+   * short-lived presigned GET URL (`requiresAuthHeader: false`); local-backed
+   * media gets its existing `/videos/:id/stream` URL (`requiresAuthHeader:
+   * true`, still gated by `JwtAuthGuard` + the entitlement check on every
+   * request there) — so the mobile client keeps ONE code path and learns
+   * nothing about which backend served a given video.
+   *
+   * ⚠️ Applies the EXACT SAME `enforceEntitlementGate` call `streamVideo`
+   * uses above, not a separate/parallel implementation: without this, a
+   * non-entitled user could bypass the premium paywall entirely by asking
+   * for a playback URL instead of a stream (see DECISIONS.md's
+   * "load-bearing discovery" paragraph — this is the single highest-risk
+   * property of this slice).
+   *
+   * `@Throttle()` override (independent review addendum, 2026-08-08): see
+   * `VIDEO_PLAYBACK_URL_RATE_LIMIT`'s doc comment in
+   * `common/rate-limit.constants.ts` for why this route does not rely on
+   * the generous app-wide default — it mints a directly-shareable,
+   * auth-free presigned URL for R2-backed media, the same class of risk
+   * `ADMIN_MEDIA_UPLOAD_INITIATE_RATE_LIMIT` already exists to bound for
+   * the PUT-minting route.
+   */
+  @UseGuards(JwtAuthGuard)
+  @Throttle({
+    default: {
+      limit: VIDEO_PLAYBACK_URL_RATE_LIMIT,
+      ttl: VIDEO_PLAYBACK_URL_RATE_TTL_MS,
+    },
+  })
+  @Get(':id/playback')
+  async getPlaybackUrl(
+    @Param('id') id: string,
+    @CurrentUser() user: AuthenticatedUser,
+  ): Promise<VideoPlaybackResponseDto> {
+    await this.enforceEntitlementGate(id, user);
+    return this.videosService.getPlaybackUrl(id);
+  }
+
   @Get(':id')
   getById(@Param('id') id: string): Promise<VideoResponseDto> {
     return this.videosService.findById(id);
+  }
+
+  /**
+   * Phase 11, work unit 11M-B2: extracted, behavior-preserving, from what
+   * used to be `streamVideo`'s own inline check — now the SINGLE place both
+   * `streamVideo` and `getPlaybackUrl` run the "not found" / "not
+   * published" / "premium episode, not entitled" gate through, so the two
+   * routes can never drift apart on who is allowed to play a given episode.
+   * Throws `VIDEO_NOT_FOUND` (via `getStreamGuardInfo`) for a
+   * nonexistent/non-published id, or `ENTITLEMENT_REQUIRED` for an
+   * authenticated-but-not-entitled caller on a premium episode; returns
+   * normally (void) once the caller is allowed to proceed.
+   */
+  private async enforceEntitlementGate(
+    id: string,
+    user: AuthenticatedUser,
+  ): Promise<void> {
+    const guardInfo = await this.videosService.getStreamGuardInfo(id);
+
+    if (
+      this.entitlementsService.resolveEpisodePremium(
+        guardInfo,
+        FREE_EPISODE_LIMIT,
+      ) &&
+      !(await this.entitlementsService.isEntitled(user.id))
+    ) {
+      throw new AppException(
+        AppErrorCode.ENTITLEMENT_REQUIRED,
+        'An active entitlement is required to stream this episode',
+        HttpStatus.FORBIDDEN,
+      );
+    }
   }
 }

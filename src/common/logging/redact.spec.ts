@@ -203,6 +203,48 @@ describe('redactSensitiveText', () => {
       expect(result).toContain('[REDACTED]');
     });
 
+    // Phase 11, work unit 11M-B3 (independent review addendum, 2026-08-08):
+    // presigned R2/S3 URL query-string signing material — a shape neither
+    // `SENSITIVE_FIELD_PATTERN` (`key: "value"`) nor `BEARER_TOKEN_PATTERN`
+    // (`Bearer <token>`) matches. Nothing logs a presigned URL today; this
+    // is defense in depth for a future code path.
+    it('redacts X-Amz-Signature, X-Amz-Credential, and X-Amz-Security-Token in a presigned URL query string', () => {
+      const presignedUrl =
+        'https://r2.example.test/bucket/videos/abc.mp4' +
+        '?X-Amz-Algorithm=AWS4-HMAC-SHA256' +
+        '&X-Amz-Credential=AKIAEXAMPLE%2F20260808%2Fauto%2Fs3%2Faws4_request' +
+        '&X-Amz-Date=20260808T000000Z' +
+        '&X-Amz-Expires=900' +
+        '&X-Amz-Security-Token=FQoGZXIvYXdzEExampleSecurityToken' +
+        '&X-Amz-SignedHeaders=host' +
+        '&X-Amz-Signature=deadbeefcafefeed1234567890abcdef1234567890abcdef1234567890';
+
+      const result = redactSensitiveText(presignedUrl, undefined);
+
+      expect(result).not.toContain('AKIAEXAMPLE');
+      expect(result).not.toContain('FQoGZXIvYXdzEExampleSecurityToken');
+      expect(result).not.toContain(
+        'deadbeefcafefeed1234567890abcdef1234567890abcdef1234567890',
+      );
+      expect(result).toContain('X-Amz-Credential=[REDACTED]');
+      expect(result).toContain('X-Amz-Security-Token=[REDACTED]');
+      expect(result).toContain('X-Amz-Signature=[REDACTED]');
+      // Non-sensitive query params (algorithm, date, expiry, signed-headers
+      // list) stay visible — useful for debugging, not sensitive.
+      expect(result).toContain('X-Amz-Algorithm=AWS4-HMAC-SHA256');
+      expect(result).toContain('X-Amz-Expires=900');
+    });
+
+    it('redacts a bare X-Amz-Signature value even with no surrounding URL context', () => {
+      const result = redactSensitiveText(
+        'signed request failed: X-Amz-Signature=0123456789abcdef',
+        undefined,
+      );
+
+      expect(result).not.toContain('0123456789abcdef');
+      expect(result).toContain('X-Amz-Signature=[REDACTED]');
+    });
+
     it('does NOT redact ordinary non-sensitive keys that merely sit next to sensitive ones', () => {
       const result = redactSensitiveText(
         JSON.stringify({

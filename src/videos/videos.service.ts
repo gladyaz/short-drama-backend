@@ -6,8 +6,15 @@ import { AppErrorCode } from '../common/errors/app-error-code';
 import { AppException } from '../common/errors/app.exception';
 import { MediaLifecycleState } from '../media/media-lifecycle.types';
 import { PrismaService } from '../prisma/prisma.service';
-import { VideoRecord, VideoResponseDto } from './video.types';
+import { PLAYBACK_URL_EXPIRY_SECONDS } from '../storage/storage.constants';
+import { StorageService } from '../storage/storage.service';
+import {
+  VideoPlaybackResponseDto,
+  VideoRecord,
+  VideoResponseDto,
+} from './video.types';
 import { resolveSafeStoragePath } from './storage-path.util';
+import { resolvePlaybackSource } from './playback-source.util';
 
 export interface StreamableVideo {
   record: VideoRecord;
@@ -22,6 +29,7 @@ export class VideosService {
   constructor(
     private readonly configService: ConfigService<RootConfig>,
     private readonly prisma: PrismaService,
+    private readonly storageService: StorageService,
   ) {
     this.appConfig = this.configService.get('app', { infer: true })!;
   }
@@ -107,6 +115,51 @@ export class VideosService {
     return {
       episodeNumber: record.episodeNumber,
       accessTierOverride: record.accessTierOverride,
+    };
+  }
+
+  /**
+   * Phase 11, work unit 11M-B3/B4: resolves `GET /videos/:id/playback`'s
+   * response body (DECISIONS.md "Slice 11M approved..." entry, Option A).
+   *
+   * Callers MUST apply the same premium-entitlement gate `streamVideo` uses
+   * BEFORE calling this method — this method itself only re-runs the
+   * shared "must exist and be published" check (via `findPublishedRow`,
+   * identical to `findById`/`resolveStreamableFile`), never an entitlement
+   * check on its own. See `VideosController#enforceEntitlementGate`, the
+   * single place both routes now share that check through.
+   *
+   * The storage-kind decision itself is delegated entirely to
+   * `resolvePlaybackSource` (work unit 11M-B1) — this method never inlines
+   * that rule. The object key handed to `createPresignedGetUrl` always
+   * comes from the freshly-loaded `record.objectStorageKey`, never from any
+   * request-supplied value (this method takes only `id`). The resulting
+   * URL/expiry is computed fresh on every call and is never persisted
+   * anywhere, per the DECISIONS.md contract.
+   */
+  async getPlaybackUrl(id: string): Promise<VideoPlaybackResponseDto> {
+    const record = await this.findPublishedRow(id);
+    const source = resolvePlaybackSource(record);
+
+    if (source.kind === 'local') {
+      return {
+        playbackUrl: `${this.appConfig.publicBaseUrl}/videos/${id}/stream`,
+        expiresAt: new Date(
+          Date.now() + PLAYBACK_URL_EXPIRY_SECONDS * 1000,
+        ).toISOString(),
+        requiresAuthHeader: true,
+      };
+    }
+
+    const signed = await this.storageService.createPresignedGetUrl(
+      source.objectStorageKey,
+      { expiresInSeconds: PLAYBACK_URL_EXPIRY_SECONDS },
+    );
+
+    return {
+      playbackUrl: signed.url,
+      expiresAt: signed.expiresAt.toISOString(),
+      requiresAuthHeader: false,
     };
   }
 

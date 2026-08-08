@@ -65,6 +65,25 @@ const BEARER_TOKEN_PATTERN = /(Bearer\s+)[A-Za-z0-9\-._~+/]+=*/g;
 const URI_CREDENTIALS_PATTERN =
   /(\b[A-Za-z][A-Za-z0-9+.-]*:\/\/)[^\s:@/]+:[^\s@/]+@/g;
 
+/**
+ * Phase 11, work unit 11M-B3 (independent review addendum, 2026-08-08):
+ * AWS SigV4 presigned-URL query-string signing material, as it appears in a
+ * presigned R2/S3 URL's query string (e.g.
+ * `...?X-Amz-Signature=abc123&X-Amz-Credential=AKIA...&X-Amz-Security-Token=...`).
+ * This is a THIRD shape, distinct from both `SENSITIVE_FIELD_PATTERN`
+ * (`key: "value"` / `key:'value'`) and `BEARER_TOKEN_PATTERN`
+ * (`Bearer <token>`) above — neither matches a bare `Key=value` query
+ * parameter — so it needs its own pattern rather than relying on either.
+ *
+ * Nothing in this codebase logs a presigned URL today
+ * (`VideosService.getPlaybackUrl`'s R2 branch, work unit 11M-B3, returns it
+ * in an HTTP response body only, never to a logger) — this is defense in
+ * depth for a future code path (e.g. a debug log of an outgoing request,
+ * or an error message that happens to echo a URL), not a live leak.
+ */
+const PRESIGNED_QUERY_PARAM_PATTERN =
+  /((?:X-Amz-Signature|X-Amz-Credential|X-Amz-Security-Token)=)[^&\s"'<>]+/gi;
+
 export function redactSensitiveText(
   text: string,
   storageRoot: string | undefined = process.env.STORAGE_ROOT,
@@ -79,6 +98,7 @@ export function redactSensitiveText(
   result = result.replace(SENSITIVE_FIELD_PATTERN, `$1$2"${REDACTED}"`);
   result = result.replace(URI_CREDENTIALS_PATTERN, `$1${REDACTED}@`);
   result = result.replace(BEARER_TOKEN_PATTERN, `$1${REDACTED}`);
+  result = result.replace(PRESIGNED_QUERY_PARAM_PATTERN, `$1${REDACTED}`);
 
   return result;
 }

@@ -10,3 +10,15 @@ export const DEFAULT_PUT_URL_EXPIRY_SECONDS = 15 * 60;
 
 /** Default presigned GET (download/playback) URL lifetime: 1 hour. */
 export const DEFAULT_GET_URL_EXPIRY_SECONDS = 60 * 60;
+
+/**
+ * Phase 11, work unit 11M-B3: dedicated presigned GET URL lifetime for
+ * `GET /videos/:id/playback`'s R2-backed branch — deliberately its OWN
+ * constant, never `DEFAULT_GET_URL_EXPIRY_SECONDS` (1 hour). 15 minutes is
+ * long enough to outlive a single episode's viewing, including a pause
+ * (short-drama episodes run a few minutes each, matching mobile's existing
+ * `FREE_EPISODE_LIMIT`-gated single-episode playback flow), while keeping a
+ * leaked/shared URL short-lived. `VideosService.getPlaybackUrl` is the only
+ * caller; it never persists the resulting URL anywhere.
+ */
+export const PLAYBACK_URL_EXPIRY_SECONDS = 15 * 60;

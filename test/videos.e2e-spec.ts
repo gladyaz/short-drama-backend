@@ -5,13 +5,17 @@ import { App } from 'supertest/types';
 import { AppModule } from './../src/app.module';
 import { AppExceptionFilter } from './../src/common/filters/app-exception.filter';
 import { PrismaService } from './../src/prisma/prisma.service';
+import { StorageService } from './../src/storage/storage.service';
 import type { AuthResponseDto } from './../src/auth/auth.types';
 import {
   deriveAccessTier,
   FREE_EPISODE_LIMIT,
 } from './../src/entitlements/entitlement.constants';
 import { VIDEOS } from './../src/videos/videos.data';
-import type { VideoResponseDto } from './../src/videos/video.types';
+import type {
+  VideoPlaybackResponseDto,
+  VideoResponseDto,
+} from './../src/videos/video.types';
 
 interface ErrorResponseBody {
   statusCode: number;
@@ -24,6 +28,9 @@ describe('Videos (e2e)', () => {
   let prisma: PrismaService;
   let accessToken: string;
   let userId: string;
+  let mockStorageService: {
+    createPresignedGetUrl: jest.Mock;
+  };
 
   const emailPrefix = 'videos-e2e-spec+10b3';
   const freeEpisodeId = 'video-104-01';
@@ -32,9 +39,20 @@ describe('Videos (e2e)', () => {
     `${emailPrefix}-${label}-${Date.now()}-${Math.random().toString(36).slice(2)}@example.test`;
 
   beforeAll(async () => {
+    // Phase 11, work unit 11M: `StorageService` is mocked for this entire
+    // file (mirroring `admin-media.e2e-spec.ts`'s existing pattern) — no
+    // test here ever makes a real R2/S3 network call, including the new
+    // `GET /videos/:id/playback` R2-backed-media tests below.
+    mockStorageService = {
+      createPresignedGetUrl: jest.fn(),
+    };
+
     const moduleFixture: TestingModule = await Test.createTestingModule({
       imports: [AppModule],
-    }).compile();
+    })
+      .overrideProvider(StorageService)
+      .useValue(mockStorageService)
+      .compile();
 
     app = moduleFixture.createNestApplication();
     app.useGlobalFilters(new AppExceptionFilter());
@@ -57,6 +75,10 @@ describe('Videos (e2e)', () => {
     const body = registerResponse.body as AuthResponseDto;
     accessToken = body.accessToken;
     userId = body.user.id;
+  });
+
+  beforeEach(() => {
+    mockStorageService.createPresignedGetUrl.mockClear();
   });
 
   afterAll(async () => {
@@ -493,6 +515,396 @@ describe('Videos (e2e)', () => {
         .expect(HttpStatus.NOT_FOUND);
       expect((reverted.body as ErrorResponseBody).code).toBe(
         'MEDIA_FILE_NOT_FOUND',
+      );
+    });
+  });
+
+  /**
+   * Phase 11, work unit 11M (DECISIONS.md "Slice 11M approved..." entry,
+   * Option A). `mockStorageService.createPresignedGetUrl` (declared/mocked
+   * for the whole file in `beforeAll` above) is the ONLY thing standing in
+   * for R2 — no test below makes a real network call.
+   */
+  describe('GET /videos/:id/playback (Phase 11, work unit 11M)', () => {
+    const playbackSeriesId = `${emailPrefix}-11m-playback`;
+    let fixtureCounter = 0;
+
+    async function createFixture(overrides: {
+      lifecycleState: string;
+      episodeNumber?: number;
+      storageKey?: string;
+      objectStorageKey?: string | null;
+      accessTierOverride?: string | null;
+    }): Promise<string> {
+      fixtureCounter += 1;
+      const id = `${playbackSeriesId}-${fixtureCounter}`;
+      await prisma.video.create({
+        data: {
+          id,
+          seriesId: playbackSeriesId,
+          title: `Playback fixture ${id}`,
+          episodeNumber: overrides.episodeNumber ?? 1,
+          channelName: 'E2E Channel',
+          caption: 'Playback fixture caption',
+          category: 'drama',
+          storageKey: overrides.storageKey ?? '',
+          sourceLanguage: 'zh',
+          hasEmbeddedIndonesianSubtitle: true,
+          likeCount: 0,
+          lifecycleState: overrides.lifecycleState,
+          objectStorageKey: overrides.objectStorageKey ?? null,
+          accessTierOverride: overrides.accessTierOverride ?? 'free',
+        },
+      });
+      return id;
+    }
+
+    afterAll(async () => {
+      await prisma.video.deleteMany({
+        where: { seriesId: playbackSeriesId },
+      });
+    });
+
+    it('returns 401 for an unauthenticated request', async () => {
+      const id = await createFixture({
+        lifecycleState: 'published',
+        objectStorageKey: 'r2/unauth/source.mp4',
+      });
+
+      const response = await request(app.getHttpServer())
+        .get(`/videos/${id}/playback`)
+        .expect(HttpStatus.UNAUTHORIZED);
+
+      expect((response.body as ErrorResponseBody).code).toBe(
+        'INVALID_ACCESS_TOKEN',
+      );
+      expect(mockStorageService.createPresignedGetUrl).not.toHaveBeenCalled();
+    });
+
+    it('returns 404 for a nonexistent id', async () => {
+      const response = await request(app.getHttpServer())
+        .get('/videos/does-not-exist/playback')
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.NOT_FOUND);
+
+      expect((response.body as ErrorResponseBody).code).toBe('VIDEO_NOT_FOUND');
+    });
+
+    it.each([
+      ['draft', 'draft'],
+      ['ready (not yet published)', 'ready'],
+      ['unpublished', 'unpublished'],
+      ['failed', 'failed'],
+    ])(
+      'denies a %s row exactly like /stream does (404 VIDEO_NOT_FOUND, not playable)',
+      async (_label, lifecycleState) => {
+        const id = await createFixture({
+          lifecycleState,
+          objectStorageKey: 'r2/not-published/source.mp4',
+        });
+
+        const response = await request(app.getHttpServer())
+          .get(`/videos/${id}/playback`)
+          .set('Authorization', `Bearer ${accessToken}`)
+          .expect(HttpStatus.NOT_FOUND);
+
+        expect((response.body as ErrorResponseBody).code).toBe(
+          'VIDEO_NOT_FOUND',
+        );
+        expect(mockStorageService.createPresignedGetUrl).not.toHaveBeenCalled();
+      },
+    );
+
+    it('published R2-backed media: 200, a presigned playbackUrl, requiresAuthHeader false', async () => {
+      const id = await createFixture({
+        lifecycleState: 'published',
+        objectStorageKey: 'r2/free-episode/source.mp4',
+      });
+      const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
+      mockStorageService.createPresignedGetUrl.mockResolvedValueOnce({
+        url: 'https://signed.example.test/r2/free-episode/source.mp4?X-Amz-Signature=deadbeef',
+        key: 'r2/free-episode/source.mp4',
+        expiresAt,
+      });
+
+      const response = await request(app.getHttpServer())
+        .get(`/videos/${id}/playback`)
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.OK);
+
+      const playback = response.body as VideoPlaybackResponseDto;
+      expect(playback).toEqual({
+        playbackUrl:
+          'https://signed.example.test/r2/free-episode/source.mp4?X-Amz-Signature=deadbeef',
+        expiresAt: expiresAt.toISOString(),
+        requiresAuthHeader: false,
+      });
+      // The signer is called with EXACTLY the key from the media row — no
+      // request-supplied value (the request only ever carried the video's
+      // `id`) can influence which key gets signed.
+      expect(mockStorageService.createPresignedGetUrl).toHaveBeenCalledWith(
+        'r2/free-episode/source.mp4',
+        expect.objectContaining({ expiresInSeconds: 15 * 60 }),
+      );
+    });
+
+    it('published LOCAL media: 200, the existing /stream URL, requiresAuthHeader true', async () => {
+      const id = await createFixture({
+        lifecycleState: 'published',
+        storageKey: 'series/local-episode.mp4',
+        objectStorageKey: null,
+      });
+      const before = Date.now();
+
+      const response = await request(app.getHttpServer())
+        .get(`/videos/${id}/playback`)
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.OK);
+      const after = Date.now();
+
+      const playback = response.body as VideoPlaybackResponseDto;
+      expect(playback.playbackUrl).toBe(
+        `${process.env.PUBLIC_BASE_URL}/videos/${id}/stream`,
+      );
+      expect(playback.requiresAuthHeader).toBe(true);
+      // Tightly windowed (not just "is a valid date"): pins the local
+      // branch to the dedicated 15-minute `PLAYBACK_URL_EXPIRY_SECONDS`
+      // constant, not the 1-hour `DEFAULT_GET_URL_EXPIRY_SECONDS` — the
+      // exact literal is unit-tested precisely (via a mocked `Date.now`)
+      // in `videos.service.spec.ts`; this e2e round trip only allows for
+      // real wall-clock elapsed time between `before`/`after` above.
+      const expiresAtMs = new Date(playback.expiresAt).getTime();
+      expect(expiresAtMs).toBeGreaterThanOrEqual(before + 15 * 60 * 1000);
+      expect(expiresAtMs).toBeLessThanOrEqual(after + 15 * 60 * 1000);
+      expect(mockStorageService.createPresignedGetUrl).not.toHaveBeenCalled();
+    });
+
+    it('an R2 row with objectStorageKey empty and no local storageKey either fails closed — no signing attempted', async () => {
+      const id = await createFixture({
+        lifecycleState: 'published',
+        storageKey: '',
+        objectStorageKey: '',
+      });
+
+      const response = await request(app.getHttpServer())
+        .get(`/videos/${id}/playback`)
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.CONFLICT);
+
+      expect((response.body as ErrorResponseBody).code).toBe(
+        'MEDIA_PLAYBACK_SOURCE_UNAVAILABLE',
+      );
+      expect(mockStorageService.createPresignedGetUrl).not.toHaveBeenCalled();
+    });
+
+    /**
+     * LOW-but-cheap negative test (independent review, 2026-08-08): the
+     * "signer is called with exactly the row's key" tests above only prove
+     * this POSITIVELY (no attempt was ever made to override it). This test
+     * actively tries plausible override vectors — a query string, a body
+     * (unusual on a GET, but nothing stops a client from sending one), and
+     * a custom header — and proves none of them reach the signer: the
+     * route binds only `@Param('id')`/`@CurrentUser()`, so nothing in the
+     * request other than `id` is ever read.
+     */
+    it('a request-supplied query param, body field, or custom header cannot influence which key gets signed (object-key trust boundary)', async () => {
+      const id = await createFixture({
+        lifecycleState: 'published',
+        objectStorageKey: 'r2/trust-boundary/source.mp4',
+      });
+      mockStorageService.createPresignedGetUrl.mockResolvedValueOnce({
+        url: 'https://signed.example.test/trust-boundary',
+        key: 'r2/trust-boundary/source.mp4',
+        expiresAt: new Date(Date.now() + 15 * 60 * 1000),
+      });
+      const attackerKey = 'evil/attacker-supplied-key.mp4';
+
+      const response = await request(app.getHttpServer())
+        .get(`/videos/${id}/playback`)
+        .query({ objectStorageKey: attackerKey, key: attackerKey })
+        .set('Authorization', `Bearer ${accessToken}`)
+        .set('x-object-key', attackerKey)
+        .set('x-storage-key', attackerKey)
+        .send({ objectStorageKey: attackerKey, key: attackerKey })
+        .expect(HttpStatus.OK);
+
+      expect(
+        (response.body as VideoPlaybackResponseDto).requiresAuthHeader,
+      ).toBe(false);
+      expect(mockStorageService.createPresignedGetUrl).toHaveBeenCalledTimes(1);
+      expect(mockStorageService.createPresignedGetUrl).toHaveBeenCalledWith(
+        'r2/trust-boundary/source.mp4',
+        expect.any(Object),
+      );
+      expect(mockStorageService.createPresignedGetUrl).not.toHaveBeenCalledWith(
+        attackerKey,
+        expect.anything(),
+      );
+    });
+
+    /**
+     * ⚠️ The paywall-bypass test — this is the highest-risk property of the
+     * whole slice (DECISIONS.md "load-bearing discovery" paragraph): a
+     * non-entitled caller must NOT be able to obtain a playable URL (of
+     * either storage kind) for a premium episode just by calling
+     * `/playback` instead of `/stream`.
+     */
+    describe('premium entitlement gate (the paywall-bypass risk)', () => {
+      it('denies an R2-backed premium episode for a non-entitled caller — 403 ENTITLEMENT_REQUIRED, no signing attempted', async () => {
+        const id = await createFixture({
+          lifecycleState: 'published',
+          episodeNumber: 6,
+          objectStorageKey: 'r2/premium-episode/source.mp4',
+          accessTierOverride: 'premium',
+        });
+
+        const response = await request(app.getHttpServer())
+          .get(`/videos/${id}/playback`)
+          .set('Authorization', `Bearer ${accessToken}`)
+          .expect(HttpStatus.FORBIDDEN);
+
+        expect((response.body as ErrorResponseBody).code).toBe(
+          'ENTITLEMENT_REQUIRED',
+        );
+        expect(mockStorageService.createPresignedGetUrl).not.toHaveBeenCalled();
+      });
+
+      it('allows an R2-backed premium episode once the caller holds an active entitlement', async () => {
+        const id = await createFixture({
+          lifecycleState: 'published',
+          episodeNumber: 6,
+          objectStorageKey: 'r2/premium-episode-entitled/source.mp4',
+          accessTierOverride: 'premium',
+        });
+        await prisma.entitlement.create({
+          data: { userId, tier: 'premium', source: 'dev-grant' },
+        });
+        mockStorageService.createPresignedGetUrl.mockResolvedValueOnce({
+          url: 'https://signed.example.test/premium-entitled',
+          key: 'r2/premium-episode-entitled/source.mp4',
+          expiresAt: new Date(Date.now() + 15 * 60 * 1000),
+        });
+
+        const response = await request(app.getHttpServer())
+          .get(`/videos/${id}/playback`)
+          .set('Authorization', `Bearer ${accessToken}`)
+          .expect(HttpStatus.OK);
+
+        expect(
+          (response.body as VideoPlaybackResponseDto).requiresAuthHeader,
+        ).toBe(false);
+        expect(mockStorageService.createPresignedGetUrl).toHaveBeenCalledWith(
+          'r2/premium-episode-entitled/source.mp4',
+          expect.any(Object),
+        );
+
+        await prisma.entitlement.deleteMany({ where: { userId } });
+      });
+
+      it('the existing local premium episode (video-104-06) is still denied without an entitlement and allowed with one — unchanged /stream behavior', async () => {
+        const denied = await request(app.getHttpServer())
+          .get(`/videos/${premiumEpisodeId}/playback`)
+          .set('Authorization', `Bearer ${accessToken}`)
+          .expect(HttpStatus.FORBIDDEN);
+        expect((denied.body as ErrorResponseBody).code).toBe(
+          'ENTITLEMENT_REQUIRED',
+        );
+
+        await prisma.entitlement.create({
+          data: { userId, tier: 'premium', source: 'dev-grant' },
+        });
+
+        const allowed = await request(app.getHttpServer())
+          .get(`/videos/${premiumEpisodeId}/playback`)
+          .set('Authorization', `Bearer ${accessToken}`)
+          .expect(HttpStatus.OK);
+        const playback = allowed.body as VideoPlaybackResponseDto;
+        expect(playback.requiresAuthHeader).toBe(true);
+        expect(playback.playbackUrl).toBe(
+          `${process.env.PUBLIC_BASE_URL}/videos/${premiumEpisodeId}/stream`,
+        );
+
+        await prisma.entitlement.deleteMany({ where: { userId } });
+      });
+
+      /**
+       * Independent review (2026-08-08): every premium-gate fixture above
+       * sets `episodeNumber: 6` AND `accessTierOverride: 'premium'`
+       * together, so the two signals never disagree — a regression that
+       * silently swapped `resolveEpisodePremium` for the raw
+       * `isEpisodePremium(episodeNumber, FREE_EPISODE_LIMIT)` rule would
+       * pass every test above unnoticed. These two tests mirror the
+       * `/stream` "override" describe block's existing forced-premium/
+       * forced-free coverage, but against `/playback`, so drift between
+       * the two routes' entitlement resolution is caught here too — this
+       * is exactly the drift the shared `enforceEntitlementGate` helper
+       * exists to prevent, so it gets its own pin on the new route.
+       */
+      it('override "premium" on an otherwise-FREE episode still denies a non-entitled caller via /playback (accessTierOverride, not raw episodeNumber, decides)', async () => {
+        const id = await createFixture({
+          lifecycleState: 'published',
+          episodeNumber: 1, // otherwise free per the raw episodeNumber rule
+          objectStorageKey: 'r2/override-forced-premium/source.mp4',
+          accessTierOverride: 'premium',
+        });
+
+        const response = await request(app.getHttpServer())
+          .get(`/videos/${id}/playback`)
+          .set('Authorization', `Bearer ${accessToken}`)
+          .expect(HttpStatus.FORBIDDEN);
+
+        expect((response.body as ErrorResponseBody).code).toBe(
+          'ENTITLEMENT_REQUIRED',
+        );
+        expect(mockStorageService.createPresignedGetUrl).not.toHaveBeenCalled();
+      });
+
+      it('override "free" on an otherwise-PREMIUM episode is playable via /playback without an entitlement (accessTierOverride, not raw episodeNumber, decides)', async () => {
+        const id = await createFixture({
+          lifecycleState: 'published',
+          episodeNumber: 6, // otherwise premium per the raw episodeNumber rule
+          objectStorageKey: 'r2/override-forced-free/source.mp4',
+          accessTierOverride: 'free',
+        });
+        mockStorageService.createPresignedGetUrl.mockResolvedValueOnce({
+          url: 'https://signed.example.test/override-forced-free',
+          key: 'r2/override-forced-free/source.mp4',
+          expiresAt: new Date(Date.now() + 15 * 60 * 1000),
+        });
+
+        const response = await request(app.getHttpServer())
+          .get(`/videos/${id}/playback`)
+          .set('Authorization', `Bearer ${accessToken}`)
+          .expect(HttpStatus.OK);
+
+        expect(
+          (response.body as VideoPlaybackResponseDto).requiresAuthHeader,
+        ).toBe(false);
+        expect(mockStorageService.createPresignedGetUrl).toHaveBeenCalledWith(
+          'r2/override-forced-free/source.mp4',
+          expect.any(Object),
+        );
+      });
+    });
+
+    it('the response body contains exactly the three contracted keys — no bucket, endpoint host, account id, or credential/configuration field ever leaks', async () => {
+      const id = await createFixture({
+        lifecycleState: 'published',
+        objectStorageKey: 'r2/shape-check/source.mp4',
+      });
+      mockStorageService.createPresignedGetUrl.mockResolvedValueOnce({
+        url: 'https://signed.example.test/shape-check?X-Amz-Signature=deadbeef',
+        key: 'r2/shape-check/source.mp4',
+        expiresAt: new Date(Date.now() + 15 * 60 * 1000),
+      });
+
+      const response = await request(app.getHttpServer())
+        .get(`/videos/${id}/playback`)
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.OK);
+
+      expect(Object.keys(response.body as object).sort()).toEqual(
+        ['expiresAt', 'playbackUrl', 'requiresAuthHeader'].sort(),
       );
     });
   });

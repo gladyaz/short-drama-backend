@@ -163,3 +163,39 @@ export const DATA_EXPORT_RATE_TTL_MS = minutes(5);
  */
 export const ADMIN_MEDIA_UPLOAD_INITIATE_RATE_LIMIT = 60;
 export const ADMIN_MEDIA_UPLOAD_INITIATE_RATE_TTL_MS = minutes(1);
+
+/**
+ * Phase 11, work unit 11M-B3 (independent review addendum, 2026-08-08):
+ * `GET /videos/:id/playback` mints, for R2-backed media, a presigned GET URL
+ * that is (a) directly shareable — no `Authorization` header is checked
+ * against it, that is the whole point of the presign — and (b) live for
+ * `PLAYBACK_URL_EXPIRY_SECONDS` (15 minutes) once minted, regardless of
+ * whether the caller keeps using it. Left on the generous app-wide
+ * `DEFAULT_THROTTLE_LIMIT` (300/60s), one authenticated free-tier account
+ * could mint ~300 of these per minute, each independently valid for 15
+ * minutes — roughly 4,500 concurrently-live, auth-free, directly-shareable
+ * URLs per caller at steady state. That is the exact `ADMIN_MEDIA_UPLOAD_
+ * INITIATE_RATE_LIMIT` rationale (a route that mints real, credential-backed
+ * presigned URLs must not inherit the "cheap local computation" default)
+ * applied to a GET-minting route instead of a PUT-minting one, so this gets
+ * the same treatment rather than a bespoke one.
+ *
+ * Set to the SAME 60/minute as `ADMIN_MEDIA_UPLOAD_INITIATE_RATE_LIMIT`, not
+ * a stricter number: this route is reachable by every authenticated user
+ * (not just admins) and legitimate short-episode-feed usage can call it
+ * fairly often — starting an episode, resuming after a pause/backgrounding,
+ * or swiping through several short (a few minutes each) episodes in one
+ * session. 60/minute (one per second sustained) comfortably covers that
+ * while bounding a stolen-token harvesting loop to at most ~900
+ * concurrently-live URLs per caller at steady state (60 × 15 min) instead of
+ * ~4,500 — an order of magnitude tighter, not a complete fix.
+ *
+ * Same honest limit as `ADMIN_MEDIA_UPLOAD_INITIATE_RATE_LIMIT`, recorded
+ * rather than overstated: `ThrottlerGuard` keys on client IP, not on the
+ * authenticated user id, so an attacker rotating source addresses is not
+ * bounded by this, and legitimate users sharing one IP (office/campus NAT,
+ * carrier-grade NAT on mobile networks) share a single bucket. A per-user
+ * tracker would be the real fix and is not built here.
+ */
+export const VIDEO_PLAYBACK_URL_RATE_LIMIT = 60;
+export const VIDEO_PLAYBACK_URL_RATE_TTL_MS = minutes(1);

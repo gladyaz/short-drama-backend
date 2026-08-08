@@ -214,4 +214,19 @@ export enum AppErrorCode {
    * message states only expected-vs-actual content type.
    */
   UPLOAD_CONTENT_TYPE_MISMATCH = 'UPLOAD_CONTENT_TYPE_MISMATCH',
+  // Phase 11, work unit 11M-B1/B2 (GET /videos/:id/playback)
+  /**
+   * Returned by `GET /videos/:id/playback` when a `published` row (it
+   * already passed the `VIDEO_NOT_FOUND`/entitlement gates) has neither a
+   * non-empty `objectStorageKey` nor a non-empty `storageKey` —
+   * `resolvePlaybackSource` (`playback-source.util.ts`) fails CLOSED rather
+   * than returning a bogus/empty playback source. Deliberately distinct
+   * from `MEDIA_FILE_NOT_FOUND` (that code means "a local file's storageKey
+   * resolved, but nothing exists on disk at that path"; this one means "the
+   * row itself declares no storage identity at all") and from a bare 500 —
+   * this is a data-integrity condition the server can identify and refuse
+   * cleanly, not an unexpected crash. The message never includes any
+   * bucket, endpoint, or key value.
+   */
+  MEDIA_PLAYBACK_SOURCE_UNAVAILABLE = 'MEDIA_PLAYBACK_SOURCE_UNAVAILABLE',
 }

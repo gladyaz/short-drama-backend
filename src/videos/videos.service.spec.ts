@@ -4,6 +4,8 @@ import * as fs from 'fs';
 import { AppErrorCode } from '../common/errors/app-error-code';
 import { AppException } from '../common/errors/app.exception';
 import { PrismaService } from '../prisma/prisma.service';
+import { PLAYBACK_URL_EXPIRY_SECONDS } from '../storage/storage.constants';
+import { StorageService } from '../storage/storage.service';
 import { VideosService } from './videos.service';
 import { VIDEOS } from './videos.data';
 
@@ -43,6 +45,7 @@ const TEST_APP_CONFIG = {
 describe('VideosService', () => {
   let service: VideosService;
   let prisma: PrismaService;
+  let storageService: { createPresignedGetUrl: jest.Mock };
   const mockedFs = fs as jest.Mocked<typeof fs>;
 
   const testVideoIdPrefix = 'videos-service-spec';
@@ -101,6 +104,8 @@ describe('VideosService', () => {
     mockedFs.existsSync.mockImplementation(actualFs.existsSync);
     mockedFs.statSync.mockImplementation(actualFs.statSync);
 
+    storageService = { createPresignedGetUrl: jest.fn() };
+
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         VideosService,
@@ -109,6 +114,7 @@ describe('VideosService', () => {
           provide: ConfigService,
           useValue: { get: jest.fn().mockReturnValue(TEST_APP_CONFIG) },
         },
+        { provide: StorageService, useValue: storageService },
       ],
     }).compile();
 
@@ -313,6 +319,181 @@ describe('VideosService', () => {
       await expect(
         service.getStreamGuardInfo(testVideos[0].id),
       ).rejects.toMatchObject({ code: AppErrorCode.VIDEO_NOT_FOUND });
+    });
+  });
+
+  describe('getPlaybackUrl (Phase 11, work unit 11M-B3/B4)', () => {
+    it('returns the existing stream URL with requiresAuthHeader: true for a local-backed row', async () => {
+      // testVideos[0] has a non-empty storageKey and no objectStorageKey
+      // from the beforeEach fixture (the baseline local-media shape).
+      const result = await service.getPlaybackUrl(testVideos[0].id);
+
+      expect(result.playbackUrl).toBe(
+        `http://localhost:3000/videos/${testVideos[0].id}/stream`,
+      );
+      expect(result.requiresAuthHeader).toBe(true);
+      expect(storageService.createPresignedGetUrl).not.toHaveBeenCalled();
+    });
+
+    /**
+     * Independent review (2026-08-08): the previous version of this
+     * assertion only lower-bounded the local branch's `expiresAt`
+     * (`toBeGreaterThanOrEqual`), which a mutation that swapped in the
+     * 1-hour `DEFAULT_GET_URL_EXPIRY_SECONDS` would still satisfy — the
+     * bug would never be caught. `Date.now` is mocked to a fixed instant
+     * for the duration of the call so the EXACT expected ISO string can be
+     * computed and compared, pinning the local branch to precisely
+     * `PLAYBACK_URL_EXPIRY_SECONDS`, matching the rigour the R2 branch's
+     * assertions already had (they compare against the literal signer
+     * mock's `expiresAt`).
+     */
+    it('pins the local branch expiresAt to EXACTLY PLAYBACK_URL_EXPIRY_SECONDS from now — not merely a lower bound', async () => {
+      const fixedNowMs = Date.now();
+      const nowSpy = jest.spyOn(Date, 'now').mockReturnValue(fixedNowMs);
+
+      try {
+        const result = await service.getPlaybackUrl(testVideos[0].id);
+
+        expect(result.expiresAt).toBe(
+          new Date(
+            fixedNowMs + PLAYBACK_URL_EXPIRY_SECONDS * 1000,
+          ).toISOString(),
+        );
+      } finally {
+        nowSpy.mockRestore();
+      }
+    });
+
+    it('returns a presigned R2 URL with requiresAuthHeader: false for an R2-backed row', async () => {
+      await prisma.video.update({
+        where: { id: testVideos[0].id },
+        data: {
+          storageKey: '',
+          objectStorageKey: 'r2/spec-video-one/source.mp4',
+        },
+      });
+      const signedExpiresAt = new Date(
+        Date.now() + PLAYBACK_URL_EXPIRY_SECONDS * 1000,
+      );
+      storageService.createPresignedGetUrl.mockResolvedValueOnce({
+        url: 'https://signed.example.test/r2/spec-video-one/source.mp4?X-Amz-Signature=abc',
+        key: 'r2/spec-video-one/source.mp4',
+        expiresAt: signedExpiresAt,
+      });
+
+      const result = await service.getPlaybackUrl(testVideos[0].id);
+
+      expect(result).toEqual({
+        playbackUrl:
+          'https://signed.example.test/r2/spec-video-one/source.mp4?X-Amz-Signature=abc',
+        expiresAt: signedExpiresAt.toISOString(),
+        requiresAuthHeader: false,
+      });
+    });
+
+    it('calls the signer with EXACTLY the objectStorageKey stored on the row and the dedicated 15-minute expiry, never a request-supplied value', async () => {
+      await prisma.video.update({
+        where: { id: testVideos[0].id },
+        data: {
+          storageKey: '',
+          objectStorageKey: 'r2/exact-key-check/source.mp4',
+        },
+      });
+      storageService.createPresignedGetUrl.mockResolvedValueOnce({
+        url: 'https://signed.example.test/exact-key-check',
+        key: 'r2/exact-key-check/source.mp4',
+        expiresAt: new Date(),
+      });
+
+      await service.getPlaybackUrl(testVideos[0].id);
+
+      expect(storageService.createPresignedGetUrl).toHaveBeenCalledTimes(1);
+      expect(storageService.createPresignedGetUrl).toHaveBeenCalledWith(
+        'r2/exact-key-check/source.mp4',
+        { expiresInSeconds: PLAYBACK_URL_EXPIRY_SECONDS },
+      );
+    });
+
+    it('prefers R2 over local when BOTH storageKey and objectStorageKey are set (work unit 11M-B1)', async () => {
+      // testVideos[0]'s beforeEach fixture already carries a non-empty
+      // storageKey; add an objectStorageKey alongside it without clearing
+      // storageKey, unlike the tests above.
+      await prisma.video.update({
+        where: { id: testVideos[0].id },
+        data: { objectStorageKey: 'r2/both-set/source.mp4' },
+      });
+      storageService.createPresignedGetUrl.mockResolvedValueOnce({
+        url: 'https://signed.example.test/both-set',
+        key: 'r2/both-set/source.mp4',
+        expiresAt: new Date(),
+      });
+
+      const result = await service.getPlaybackUrl(testVideos[0].id);
+
+      expect(result.requiresAuthHeader).toBe(false);
+      expect(storageService.createPresignedGetUrl).toHaveBeenCalledWith(
+        'r2/both-set/source.mp4',
+        expect.any(Object),
+      );
+    });
+
+    it('fails closed with MEDIA_PLAYBACK_SOURCE_UNAVAILABLE and never signs when neither storageKey nor objectStorageKey is set', async () => {
+      await prisma.video.update({
+        where: { id: testVideos[0].id },
+        data: { storageKey: '', objectStorageKey: null },
+      });
+
+      let caught: unknown;
+      try {
+        await service.getPlaybackUrl(testVideos[0].id);
+      } catch (error) {
+        caught = error;
+      }
+
+      expect(caught).toBeInstanceOf(AppException);
+      expect((caught as AppException).code).toBe(
+        AppErrorCode.MEDIA_PLAYBACK_SOURCE_UNAVAILABLE,
+      );
+      expect(storageService.createPresignedGetUrl).not.toHaveBeenCalled();
+    });
+
+    it('throws VIDEO_NOT_FOUND for an unknown id, never attempting to sign anything', async () => {
+      await expect(
+        service.getPlaybackUrl('does-not-exist'),
+      ).rejects.toMatchObject({ code: AppErrorCode.VIDEO_NOT_FOUND });
+      expect(storageService.createPresignedGetUrl).not.toHaveBeenCalled();
+    });
+
+    it('throws VIDEO_NOT_FOUND for a video that exists but is not "published"', async () => {
+      await prisma.video.update({
+        where: { id: testVideos[0].id },
+        data: { lifecycleState: 'draft' },
+      });
+
+      await expect(
+        service.getPlaybackUrl(testVideos[0].id),
+      ).rejects.toMatchObject({ code: AppErrorCode.VIDEO_NOT_FOUND });
+    });
+
+    it('returns a response with exactly the three contracted keys — no key/bucket/config leak', async () => {
+      await prisma.video.update({
+        where: { id: testVideos[0].id },
+        data: {
+          storageKey: '',
+          objectStorageKey: 'r2/shape-check/source.mp4',
+        },
+      });
+      storageService.createPresignedGetUrl.mockResolvedValueOnce({
+        url: 'https://signed.example.test/shape-check',
+        key: 'r2/shape-check/source.mp4',
+        expiresAt: new Date(),
+      });
+
+      const result = await service.getPlaybackUrl(testVideos[0].id);
+
+      expect(Object.keys(result).sort()).toEqual(
+        ['expiresAt', 'playbackUrl', 'requiresAuthHeader'].sort(),
+      );
     });
   });
 

@@ -75,3 +75,14 @@ report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
 # Never real company media; never committed.
 /.ci-storage/
 /ci-logs/
+
+# Slice 11Q — workers/hls-gateway is its OWN, fully independent npm package
+# (own package.json/package-lock.json, deliberately not an npm workspace of
+# the root package.json) — its node_modules/build output never belong in
+# the root package's dependency tree and must never be committed. There is
+# also no real `wrangler.toml` (only the committed `wrangler.toml.example`
+# template) — see that file's own header comment for why a real one must
+# never be created/committed in this slice.
+/workers/*/node_modules/
+/workers/*/dist/
+/workers/*/wrangler.toml

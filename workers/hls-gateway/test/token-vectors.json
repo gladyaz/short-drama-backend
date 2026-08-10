@@ -1,0 +1,19 @@
+{
+  "_comment": "Slice 11Q backend<->Worker HLS token v1 CONTRACT fixture. Every value here is SYNTHETIC (a fixed test-only secret, a fixed reference clock 'now', and made-up media ids/prefixes) — never a real secret or a real media identity. Backend jest (src/transcode/hls/hls-token-contract.spec.ts) asserts mintHlsToken(...) reproduces every 'valid*' token below byte-for-byte given the same (mediaId, prefix, exp, secret) inputs and the fixed 'now'. Worker vitest (test/token.spec.ts) asserts verify(token, secret, now) accepts every valid* vector and rejects every tampered/expired/wrongSecret vector. 'now' is a fixed unix-seconds reference clock, not real wall-clock time, so this fixture is fully deterministic regardless of when the tests actually run.",
+  "secret": "test-only-synthetic-hls-secret-do-not-use-v1",
+  "wrongSecret": "a-completely-different-secret-value",
+  "mediaId": "video-hlsq-fixture-01",
+  "prefix": "admin-media/video-hlsq-fixture-01/hls/v1-a1-11111111-1111-1111-1111-111111111111/",
+  "otherMediaId": "video-hlsq-fixture-02",
+  "otherPrefix": "admin-media/video-hlsq-fixture-02/hls/v1-a1-22222222-2222-2222-2222-222222222222/",
+  "genNextPrefix": "admin-media/video-hlsq-fixture-01/hls/v2-a1-33333333-3333-3333-3333-333333333333/",
+  "now": 1800000000,
+  "validExp": 1800003600,
+  "expiredExp": 1799999940,
+  "valid": "eyJ2IjoxLCJtIjoidmlkZW8taGxzcS1maXh0dXJlLTAxIiwicCI6ImFkbWluLW1lZGlhL3ZpZGVvLWhsc3EtZml4dHVyZS0wMS9obHMvdjEtYTEtMTExMTExMTEtMTExMS0xMTExLTExMTEtMTExMTExMTExMTExLyIsImUiOjE4MDAwMDM2MDB9.u7njsMBsU2rfFh26KZ7f6s8PJueUpnjn_n7wtrw5VaI",
+  "expired": "eyJ2IjoxLCJtIjoidmlkZW8taGxzcS1maXh0dXJlLTAxIiwicCI6ImFkbWluLW1lZGlhL3ZpZGVvLWhsc3EtZml4dHVyZS0wMS9obHMvdjEtYTEtMTExMTExMTEtMTExMS0xMTExLTExMTEtMTExMTExMTExMTExLyIsImUiOjE3OTk5OTk5NDB9.WBeY_3heLruS9tcrSHLV43FD_yvhMpzLOXBmJ3-5w3o",
+  "validDifferentPrefix": "eyJ2IjoxLCJtIjoidmlkZW8taGxzcS1maXh0dXJlLTAyIiwicCI6ImFkbWluLW1lZGlhL3ZpZGVvLWhsc3EtZml4dHVyZS0wMi9obHMvdjEtYTEtMjIyMjIyMjItMjIyMi0yMjIyLTIyMjItMjIyMjIyMjIyMjIyLyIsImUiOjE4MDAwMDM2MDB9.fXzdd9yleZTcZKZGCRlBhWaoK-oYlVJyQyy-etmf-1M",
+  "validNextGeneration": "eyJ2IjoxLCJtIjoidmlkZW8taGxzcS1maXh0dXJlLTAxIiwicCI6ImFkbWluLW1lZGlhL3ZpZGVvLWhsc3EtZml4dHVyZS0wMS9obHMvdjItYTEtMzMzMzMzMzMtMzMzMy0zMzMzLTMzMzMtMzMzMzMzMzMzMzMzLyIsImUiOjE4MDAwMDM2MDB9.Vd7YuykIn72gcITToMC4wKdfud6zXDWmxC8A0giCUuw",
+  "tamperedSignature": "eyJ2IjoxLCJtIjoidmlkZW8taGxzcS1maXh0dXJlLTAxIiwicCI6ImFkbWluLW1lZGlhL3ZpZGVvLWhsc3EtZml4dHVyZS0wMS9obHMvdjEtYTEtMTExMTExMTEtMTExMS0xMTExLTExMTEtMTExMTExMTExMTExLyIsImUiOjE4MDAwMDM2MDB9.u7njsMBsU2rfFh26KZ7f6s8PJueUpnjn_n7wtrw5VaA",
+  "wrongSecretToken": "eyJ2IjoxLCJtIjoidmlkZW8taGxzcS1maXh0dXJlLTAxIiwicCI6ImFkbWluLW1lZGlhL3ZpZGVvLWhsc3EtZml4dHVyZS0wMS9obHMvdjEtYTEtMTExMTExMTEtMTExMS0xMTExLTExMTEtMTExMTExMTExMTExLyIsImUiOjE4MDAwMDM2MDB9.7fTl4ilZKcQQmIlSAoQrGwwFFxGogOMWyihsOZ6mUtk"
+}

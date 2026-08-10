@@ -1,0 +1,17 @@
+{
+  "name": "hls-gateway",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Slice 11Q — Private HLS Delivery Gateway. Cloudflare Worker source only; NOT deployed by this slice (control-workspace DECISIONS.md, '2026-08-10 — Slice 11Q APPROVED...' entry). Self-contained npm package, independent of the parent short-drama-backend package — no shared node_modules, no shared build/lint/test pipeline.",
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.0.0",
+    "typescript": "^5.6.0",
+    "vitest": "^4.0.0"
+  }
+}

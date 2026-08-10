@@ -1,0 +1,49 @@
+# wrangler.toml.example — Slice 11Q (Private HLS Delivery Gateway)
+#
+# THIS IS A TEMPLATE ONLY. There is NO real `wrangler.toml` in this
+# repository, and this slice never runs `wrangler login`/`wrangler deploy`/
+# `wrangler publish` against Cloudflare — see control-workspace
+# DECISIONS.md "2026-08-10 — Slice 11Q APPROVED..." entry, binding
+# constraint 2: "NOT deployed in this slice unless separately permitted —
+# if deployment needs a new human action, STOP and ask." Copy this file to
+# `wrangler.toml` and fill in real values ONLY once a separate, explicitly
+# approved deployment step authorizes it.
+#
+# `account_id` is DELIBERATELY OMITTED below — never place a real
+# Cloudflare account id in a committed file. Supply it via `wrangler login`
+# or the `CLOUDFLARE_ACCOUNT_ID` environment variable at actual deploy
+# time, never hardcoded here.
+
+name = "hls-gateway"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+# Private R2 bucket binding. The gateway reads media objects through this
+# binding only — it never receives an R2 access key, secret key, endpoint
+# URL, or a presigned URL of any kind (see src/index.ts: authorization is
+# entirely the HLS playback token, verified before any bucket read).
+# Replace "your-private-media-bucket-name" with the real (already-private,
+# non-public, r2.dev-disabled) bucket name at actual deploy time.
+[[r2_buckets]]
+binding = "MEDIA_BUCKET"
+bucket_name = "your-private-media-bucket-name"
+
+# HLS_TOKEN_SECRET is a SECRET, never a [vars] entry and never written into
+# this (or any committed) file. Set it at real deploy time via:
+#   wrangler secret put HLS_TOKEN_SECRET
+# It MUST be the exact same value as the backend's HLS_TOKEN_SECRET env var
+# (see short-drama-backend/.env.example) — this is the shared HMAC key the
+# backend signs tokens with and this Worker verifies them with. A dedicated
+# secret, never JWT_ACCESS_SECRET/JWT_REFRESH_SECRET/AUTH_AUDIT_IP_HASH_SECRET
+# reused from the backend.
+
+[vars]
+# Slice 11Q §9a — CACHE AMENDMENT (control-workspace DECISIONS.md, binding
+# on this slice): ships DISABLED. Must stay the exact string "false" (or be
+# entirely absent — src/cache.ts treats anything other than the literal
+# string "true" as disabled) in every real deployment until a SEPARATE,
+# independently-reviewed decision turns it on. "true" activates the
+# canonical-object-identity cache layer described in src/cache.ts's doc
+# comment — it is never keyed by the raw playback token/URL.
+CACHE_ENABLED = "false"

@@ -1,7 +1,11 @@
 import { Injectable, HttpStatus } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { existsSync, statSync } from 'fs';
-import { AppConfig, RootConfig } from '../config/configuration';
+import {
+  AppConfig,
+  HlsGatewayConfig,
+  RootConfig,
+} from '../config/configuration';
 import { AppErrorCode } from '../common/errors/app-error-code';
 import { AppException } from '../common/errors/app.exception';
 import { MediaLifecycleState } from '../media/media-lifecycle.types';
@@ -9,6 +13,17 @@ import { PrismaService } from '../prisma/prisma.service';
 import { PLAYBACK_URL_EXPIRY_SECONDS } from '../storage/storage.constants';
 import { StorageService } from '../storage/storage.service';
 import {
+  derivePrefixFromMasterKey,
+  mintHlsToken,
+} from '../transcode/hls/hls-playback-token.util';
+import {
+  HLS_MASTER_PLAYLIST_FILENAME,
+  HLS_VARIANT_PLAYLIST_FILENAME,
+} from '../transcode/hls/hls.constants';
+import { HlsRenditionSummary } from '../transcode/transcode.types';
+import {
+  HlsPlaybackResponseDto,
+  HlsRenditionPlaybackDto,
   VideoPlaybackResponseDto,
   VideoRecord,
   VideoResponseDto,
@@ -25,6 +40,7 @@ export interface StreamableVideo {
 @Injectable()
 export class VideosService {
   private readonly appConfig: AppConfig;
+  private readonly hlsGatewayConfig: HlsGatewayConfig;
 
   constructor(
     private readonly configService: ConfigService<RootConfig>,
@@ -32,6 +48,9 @@ export class VideosService {
     private readonly storageService: StorageService,
   ) {
     this.appConfig = this.configService.get('app', { infer: true })!;
+    this.hlsGatewayConfig = this.configService.get('hlsGateway', {
+      infer: true,
+    })!;
   }
 
   async findAll(): Promise<VideoResponseDto[]> {
@@ -137,8 +156,16 @@ export class VideosService {
    * URL/expiry is computed fresh on every call and is never persisted
    * anywhere, per the DECISIONS.md contract.
    */
-  async getPlaybackUrl(id: string): Promise<VideoPlaybackResponseDto> {
+  async getPlaybackUrl(
+    id: string,
+  ): Promise<VideoPlaybackResponseDto | HlsPlaybackResponseDto> {
     const record = await this.findPublishedRow(id);
+
+    const hlsResponse = this.tryBuildHlsPlaybackResponse(record);
+    if (hlsResponse) {
+      return hlsResponse;
+    }
+
     const source = resolvePlaybackSource(record);
 
     if (source.kind === 'local') {
@@ -160,6 +187,87 @@ export class VideosService {
       playbackUrl: signed.url,
       expiresAt: signed.expiresAt.toISOString(),
       requiresAuthHeader: false,
+    };
+  }
+
+  /**
+   * Slice 11Q: builds the HLS branch of `getPlaybackUrl`'s response, or
+   * returns `null` when the row does not cleanly qualify — in which case
+   * the caller falls through to the EXISTING (unchanged) R2/local
+   * resolution below, exactly as it did before this slice. Deliberately
+   * checked BEFORE `resolvePlaybackSource` runs at all: an HLS-ready row
+   * still carries a `storageKey`/`objectStorageKey` from its original
+   * upload (11B/11L), but once its HLS generation is `ready` that is the
+   * canonical playback source, not the raw MP4.
+   *
+   * "Cleanly qualifies" requires ALL of:
+   *  - `processingState === 'ready'` (Slice 11N/11P's own `ProcessingState`
+   *    union — the double-guard the 2026-08-10 approval calls for: an
+   *    unpublished/not-yet-processed row can never reach here at all
+   *    because `findPublishedRow` already required `lifecycleState ===
+   *    'published'`, and THIS check additionally requires the processing
+   *    axis to be fully done);
+   *  - a non-empty `hlsMasterKey`;
+   *  - a prefix that `derivePrefixFromMasterKey` can cleanly derive AND
+   *    that verifiably belongs to this row's own `id` (see that
+   *    function's doc comment) — a malformed/mismatched key (which should
+   *    be unreachable given 11P's own write-path guarantees) falls
+   *    through to the legacy branch rather than throwing, since it is a
+   *    data-integrity anomaly, not a configuration error.
+   *
+   * Only once a row cleanly qualifies does a MISSING gateway config
+   * (`HLS_GATEWAY_BASE_URL`/`HLS_TOKEN_SECRET`) become a real, reportable
+   * error (`HLS_GATEWAY_NOT_CONFIGURED`) rather than a silent fallback —
+   * see this method's own doc comment above for why that state should be
+   * unreachable in the real shipped default in the first place.
+   */
+  private tryBuildHlsPlaybackResponse(record: {
+    id: string;
+    processingState: string | null;
+    hlsMasterKey: string | null;
+    hlsRenditions: unknown;
+  }): HlsPlaybackResponseDto | null {
+    if (record.processingState !== 'ready' || !record.hlsMasterKey) {
+      return null;
+    }
+
+    const prefix = derivePrefixFromMasterKey(record.id, record.hlsMasterKey);
+    if (!prefix) {
+      return null;
+    }
+
+    if (!this.hlsGatewayConfig.baseUrl || !this.hlsGatewayConfig.tokenSecret) {
+      throw new AppException(
+        AppErrorCode.HLS_GATEWAY_NOT_CONFIGURED,
+        'The HLS delivery gateway is not configured (HLS_GATEWAY_BASE_URL/HLS_TOKEN_SECRET)',
+        HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+
+    const minted = mintHlsToken({
+      mediaId: record.id,
+      prefix,
+      ttlSeconds: this.hlsGatewayConfig.ttlSeconds,
+      secret: this.hlsGatewayConfig.tokenSecret,
+    });
+
+    const baseUrl = this.hlsGatewayConfig.baseUrl;
+    const tokenPathPrefix = `${baseUrl}/t/${minted.token}`;
+
+    const renditions: HlsRenditionPlaybackDto[] = parseHlsRenditions(
+      record.hlsRenditions,
+    ).map((rendition) => ({
+      quality: rendition.name,
+      width: rendition.width,
+      height: rendition.height,
+      url: `${tokenPathPrefix}/${rendition.name}/${HLS_VARIANT_PLAYLIST_FILENAME}`,
+    }));
+
+    return {
+      type: 'hls',
+      masterUrl: `${tokenPathPrefix}/${HLS_MASTER_PLAYLIST_FILENAME}`,
+      renditions,
+      expiresAt: minted.expiresAt,
     };
   }
 
@@ -244,4 +352,40 @@ export class VideosService {
       height: record.height,
     };
   }
+}
+
+/**
+ * Slice 11Q: `Video.hlsRenditions` is a Prisma `Json?` column — at the type
+ * level it comes back as `Prisma.JsonValue` (effectively `unknown` for our
+ * purposes), which could in principle be `null`, a non-array value, or an
+ * array containing malformed entries if ever hand-edited. This is a
+ * defensive, non-throwing parser: anything that is not EXACTLY an array of
+ * well-formed `HlsRenditionSummary`-shaped objects is filtered out (an
+ * entirely malformed value yields an empty array, never a thrown error and
+ * never a partially-trusted entry) — `VideosService` never trusts this
+ * column's shape implicitly, even though the ONLY writer today
+ * (`TranscodeIntentService.promoteIfCurrent`, Slice 11P) always writes a
+ * well-formed array.
+ */
+function parseHlsRenditions(value: unknown): HlsRenditionSummary[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.filter(isHlsRenditionSummary);
+}
+
+function isHlsRenditionSummary(value: unknown): value is HlsRenditionSummary {
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
+
+  const candidate = value as Record<string, unknown>;
+  return (
+    typeof candidate.name === 'string' &&
+    candidate.name.length > 0 &&
+    typeof candidate.width === 'number' &&
+    typeof candidate.height === 'number' &&
+    typeof candidate.bandwidth === 'number'
+  );
 }

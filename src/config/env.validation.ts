@@ -84,6 +84,8 @@ export function validateEnv(
 
   validateTranscodeConfig(config);
 
+  validateHlsGatewayConfig(config);
+
   return config;
 }
 
@@ -290,4 +292,87 @@ function isValidRedisUrl(value: string): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * Slice 11Q: `HLS_GATEWAY_BASE_URL`/`HLS_TOKEN_SECRET` are validated only
+ * when `TRANSCODE_ENABLED === 'true'` — mirroring `validateTranscodeConfig`'s
+ * REDIS_URL-conditional shape exactly (2026-08-10 DECISIONS.md approval:
+ * "Config (11G-3 conditional pattern): HLS_GATEWAY_BASE_URL, HLS_TOKEN_SECRET
+ * ... validated as present + distinct-from-JWT-secrets when
+ * TRANSCODE_ENABLED=true"). While the flag is `false` (this repo's only
+ * shipped state), neither variable is required to be set at all — and even
+ * if `TRANSCODE_ENABLED` is somehow `true` in some future environment,
+ * `VideosService`'s own runtime check (`HLS_GATEWAY_NOT_CONFIGURED`) is a
+ * SECOND, independent fail-closed guard at the point of use, not a
+ * substitute for this boot-time check.
+ *
+ * `HLS_TOKEN_SECRET` must also be DISTINCT from every other signing secret
+ * this app already uses (`JWT_ACCESS_SECRET`, `JWT_REFRESH_SECRET`,
+ * `AUTH_AUDIT_IP_HASH_SECRET`) — reusing one would mean a Worker-side
+ * (or leaked) HLS token secret could be used to forge the value another
+ * secret protects, or vice versa. Never logs any of the compared values —
+ * only ever names which two variables collided.
+ */
+function validateHlsGatewayConfig(config: Record<string, unknown>): void {
+  if (config.TRANSCODE_ENABLED !== 'true') {
+    return;
+  }
+
+  // Captured BEFORE the presence checks below narrow each `config.X`
+  // property-access expression itself — see `validateTranscodeConfig`'s
+  // `rawRedisUrl` comment above for why this avoids tripping
+  // `no-base-to-string` at the `String()` calls further down.
+  const rawHlsTokenSecret = config.HLS_TOKEN_SECRET;
+  const rawBaseUrl = config.HLS_GATEWAY_BASE_URL;
+
+  if (!config.HLS_TOKEN_SECRET) {
+    throw new Error(
+      'Missing required environment variable: HLS_TOKEN_SECRET. TRANSCODE_ENABLED=true requires HLS_TOKEN_SECRET to be set (see .env.example). Values are never logged.',
+    );
+  }
+
+  const hlsTokenSecret = String(rawHlsTokenSecret);
+  const otherSecretKeys = [
+    'JWT_ACCESS_SECRET',
+    'JWT_REFRESH_SECRET',
+    'AUTH_AUDIT_IP_HASH_SECRET',
+  ] as const;
+
+  for (const otherKey of otherSecretKeys) {
+    // `rawOtherSecret` is deliberately never used inside the `if` guard's
+    // own condition below (only `config[otherKey]` is) — using the SAME
+    // variable in both the truthy check and the `String()` call would let
+    // TS narrow it to `{}` for the check, which is what trips
+    // `no-base-to-string` (see the `rawHlsTokenSecret`/`rawBaseUrl`
+    // comment above for the same pattern).
+    const rawOtherSecret = config[otherKey];
+    if (!config[otherKey]) {
+      continue;
+    }
+    if (String(rawOtherSecret) === hlsTokenSecret) {
+      throw new Error(
+        `Invalid HLS_TOKEN_SECRET: must be DISTINCT from ${otherKey} (see .env.example). Values are never logged — only variable names are compared.`,
+      );
+    }
+  }
+
+  if (!config.HLS_GATEWAY_BASE_URL) {
+    throw new Error(
+      'Missing required environment variable: HLS_GATEWAY_BASE_URL. TRANSCODE_ENABLED=true requires HLS_GATEWAY_BASE_URL to be set (see .env.example). Values are never logged.',
+    );
+  }
+
+  const baseUrl = String(rawBaseUrl);
+  if (!isValidObjectStorageEndpoint(baseUrl)) {
+    throw new Error(
+      'HLS_GATEWAY_BASE_URL must be a valid absolute http(s) URL when TRANSCODE_ENABLED=true (shape check only — no network request is made).',
+    );
+  }
+
+  // HLS_TOKEN_TTL_SECONDS is OPTIONAL even when TRANSCODE_ENABLED=true (it
+  // has a documented default, DEFAULT_HLS_TOKEN_TTL_SECONDS) — mirroring
+  // the TRANSCODE_MAX_ATTEMPTS/etc. "optional, but must be a positive
+  // integer if present" pattern immediately above.
+  assertPositiveIntEnvIfPresent(config, 'HLS_TOKEN_TTL_SECONDS');
 }

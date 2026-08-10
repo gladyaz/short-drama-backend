@@ -13,15 +13,35 @@ import {
 } from './../src/entitlements/entitlement.constants';
 import { VIDEOS } from './../src/videos/videos.data';
 import type {
+  HlsPlaybackResponseDto,
   VideoPlaybackResponseDto,
   VideoResponseDto,
 } from './../src/videos/video.types';
+import * as hlsPlaybackTokenUtil from './../src/transcode/hls/hls-playback-token.util';
 
 interface ErrorResponseBody {
   statusCode: number;
   code: string;
   message: string;
 }
+
+/**
+ * Slice 11Q — this file's `beforeAll` compiles ONE shared `AppModule`
+ * instance for every test below, so the HLS gateway config (only consulted
+ * by the dedicated HLS describe block further down; every other test below
+ * is a non-HLS row and never touches it) must be set BEFORE that
+ * compilation happens — i.e. at module-evaluation time, before Jest even
+ * registers `describe`/`beforeAll`. This is a SYNTHETIC, test-only value —
+ * the real `.env` file deliberately has NEITHER of these set (see
+ * `.env.example`'s Slice 11Q section: "do not generate/store any real
+ * secret; local .env gets nothing this slice — the flag is off; nothing
+ * mints"). `TRANSCODE_ENABLED` stays whatever the real environment has it
+ * as (`false`) — this does not turn transcoding on; it only lets THIS
+ * file's HLS-ready test fixtures (created directly via `prisma.video.create`,
+ * never through the real transcode pipeline) exercise a configured gateway.
+ */
+process.env.HLS_GATEWAY_BASE_URL = 'https://hls-gateway.e2e-test.internal';
+process.env.HLS_TOKEN_SECRET = 'videos-e2e-spec-synthetic-hls-token-secret';
 
 describe('Videos (e2e)', () => {
   let app: INestApplication<App>;
@@ -906,6 +926,229 @@ describe('Videos (e2e)', () => {
       expect(Object.keys(response.body as object).sort()).toEqual(
         ['expiresAt', 'playbackUrl', 'requiresAuthHeader'].sort(),
       );
+    });
+  });
+
+  /**
+   * Slice 11Q — Private HLS Delivery Gateway (control-workspace
+   * DECISIONS.md "2026-08-10 — Slice 11Q APPROVED..." entry). Same route
+   * (`GET /videos/:id/playback`), same `app`/auth/entitlement machinery as
+   * the 11M describe block above — these fixtures are created directly via
+   * `prisma.video.create` with `processingState`/`hlsMasterKey`/
+   * `hlsRenditions` set, never through the real (still-disabled)
+   * TRANSCODE_ENABLED pipeline.
+   */
+  describe('GET /videos/:id/playback — HLS gateway (Slice 11Q)', () => {
+    const hlsSeriesId = `${emailPrefix}-11q-hls-playback`;
+    let hlsFixtureCounter = 0;
+
+    async function createHlsFixture(overrides: {
+      episodeNumber?: number;
+      accessTierOverride?: string | null;
+      processingState?: string | null;
+      hlsMasterKey?: string | null;
+      hlsRenditions?: unknown;
+    }): Promise<{ id: string; prefix: string }> {
+      hlsFixtureCounter += 1;
+      const id = `${hlsSeriesId}-${hlsFixtureCounter}`;
+      const prefix = `admin-media/${id}/hls/v1-a1-11111111-1111-1111-1111-11111111111${hlsFixtureCounter}/`;
+      await prisma.video.create({
+        data: {
+          id,
+          seriesId: hlsSeriesId,
+          title: `HLS playback fixture ${id}`,
+          episodeNumber: overrides.episodeNumber ?? 1,
+          channelName: 'E2E Channel',
+          caption: 'HLS playback fixture caption',
+          category: 'drama',
+          storageKey: '',
+          objectStorageKey: 'r2/hls-fixture-fallback/source.mp4',
+          sourceLanguage: 'zh',
+          hasEmbeddedIndonesianSubtitle: true,
+          likeCount: 0,
+          lifecycleState: 'published',
+          accessTierOverride: overrides.accessTierOverride ?? 'free',
+          processingState:
+            overrides.processingState === undefined
+              ? 'ready'
+              : overrides.processingState,
+          hlsMasterKey:
+            overrides.hlsMasterKey === undefined
+              ? `${prefix}master.m3u8`
+              : overrides.hlsMasterKey,
+          hlsRenditions:
+            overrides.hlsRenditions === undefined
+              ? [
+                  { name: '360p', width: 360, height: 640, bandwidth: 900_000 },
+                  {
+                    name: '540p',
+                    width: 540,
+                    height: 960,
+                    bandwidth: 1_800_000,
+                  },
+                ]
+              : (overrides.hlsRenditions as never),
+        },
+      });
+      return { id, prefix };
+    }
+
+    afterAll(async () => {
+      await prisma.video.deleteMany({ where: { seriesId: hlsSeriesId } });
+    });
+
+    it('[TEST 1/9/11] a cleanly-qualifying row returns {type:"hls", masterUrl, renditions, expiresAt} — never the legacy 3-key shape', async () => {
+      const { id } = await createHlsFixture({});
+
+      const response = await request(app.getHttpServer())
+        .get(`/videos/${id}/playback`)
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.OK);
+
+      const body = response.body as HlsPlaybackResponseDto;
+      expect(Object.keys(body).sort()).toEqual(
+        ['expiresAt', 'masterUrl', 'renditions', 'type'].sort(),
+      );
+      expect(body.type).toBe('hls');
+      // Structural shape: <base>/t/<payload>.<sig>/master.m3u8 — the token
+      // itself (<payload>.<sig>) is asserted as a genuine base64url pair,
+      // not merely "some non-empty string", so a regression that emitted a
+      // malformed/empty token would fail this.
+      expect(body.masterUrl).toMatch(
+        /^https:\/\/hls-gateway\.e2e-test\.internal\/t\/[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\/master\.m3u8$/,
+      );
+      expect(mockStorageService.createPresignedGetUrl).not.toHaveBeenCalled();
+    });
+
+    it('[TEST 13] returns ONLY the actually-produced renditions (360p/540p fixture never yields a 720p or 1080p entry)', async () => {
+      const { id } = await createHlsFixture({});
+
+      const response = await request(app.getHttpServer())
+        .get(`/videos/${id}/playback`)
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.OK);
+
+      const body = response.body as HlsPlaybackResponseDto;
+      expect(body.renditions.map((r) => r.quality).sort()).toEqual([
+        '360p',
+        '540p',
+      ]);
+      for (const rendition of body.renditions) {
+        expect(Object.keys(rendition).sort()).toEqual(
+          ['height', 'quality', 'url', 'width'].sort(),
+        );
+        expect(rendition.url).toContain(`/${rendition.quality}/index.m3u8`);
+      }
+    });
+
+    it('one token authorizes both the master playlist and every rendition (same token embedded in every url)', async () => {
+      const { id } = await createHlsFixture({});
+
+      const response = await request(app.getHttpServer())
+        .get(`/videos/${id}/playback`)
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.OK);
+
+      const body = response.body as HlsPlaybackResponseDto;
+      const masterToken = body.masterUrl.split('/t/')[1].split('/')[0];
+      for (const rendition of body.renditions) {
+        const renditionToken = rendition.url.split('/t/')[1].split('/')[0];
+        expect(renditionToken).toBe(masterToken);
+      }
+    });
+
+    it('[TEST 12] a row with processingState "running" (not yet ready) falls through to the existing R2/local playback response, never an HLS shape', async () => {
+      const { id } = await createHlsFixture({ processingState: 'running' });
+      mockStorageService.createPresignedGetUrl.mockResolvedValueOnce({
+        url: 'https://signed.example.test/hls-fixture-fallback',
+        key: 'r2/hls-fixture-fallback/source.mp4',
+        expiresAt: new Date(Date.now() + 15 * 60 * 1000),
+      });
+
+      const response = await request(app.getHttpServer())
+        .get(`/videos/${id}/playback`)
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.OK);
+
+      expect('type' in (response.body as object)).toBe(false);
+      expect(Object.keys(response.body as object).sort()).toEqual(
+        ['expiresAt', 'playbackUrl', 'requiresAuthHeader'].sort(),
+      );
+    });
+
+    it('[TEST 10] the premium entitlement gate blocks a non-entitled caller with 403 BEFORE any HLS token is minted (mintHlsToken spy proves zero calls)', async () => {
+      const mintSpy = jest.spyOn(hlsPlaybackTokenUtil, 'mintHlsToken');
+      const { id } = await createHlsFixture({
+        episodeNumber: 6,
+        accessTierOverride: 'premium',
+      });
+
+      const response = await request(app.getHttpServer())
+        .get(`/videos/${id}/playback`)
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.FORBIDDEN);
+
+      expect((response.body as ErrorResponseBody).code).toBe(
+        'ENTITLEMENT_REQUIRED',
+      );
+      expect(mintSpy).not.toHaveBeenCalled();
+      mintSpy.mockRestore();
+    });
+
+    it('an entitled caller CAN reach the HLS branch for a premium HLS-ready episode', async () => {
+      const { id } = await createHlsFixture({
+        episodeNumber: 6,
+        accessTierOverride: 'premium',
+      });
+      await prisma.entitlement.create({
+        data: { userId, tier: 'premium', source: 'dev-grant' },
+      });
+
+      const response = await request(app.getHttpServer())
+        .get(`/videos/${id}/playback`)
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.OK);
+
+      expect((response.body as HlsPlaybackResponseDto).type).toBe('hls');
+
+      await prisma.entitlement.deleteMany({ where: { userId } });
+    });
+
+    it('[TEST 14] the HLS_TOKEN_SECRET value never appears anywhere in the response body', async () => {
+      const { id } = await createHlsFixture({});
+
+      const response = await request(app.getHttpServer())
+        .get(`/videos/${id}/playback`)
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.OK);
+
+      expect(JSON.stringify(response.body)).not.toContain(
+        process.env.HLS_TOKEN_SECRET,
+      );
+    });
+
+    it('[TEST 18] mints without ever making a network call — masterUrl/rendition urls only ever combine the configured HLS_GATEWAY_BASE_URL with locally-computed strings (no fetch/StorageService call for the HLS branch)', async () => {
+      const { id } = await createHlsFixture({});
+
+      const response = await request(app.getHttpServer())
+        .get(`/videos/${id}/playback`)
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.OK);
+
+      const body = response.body as HlsPlaybackResponseDto;
+      expect(body.masterUrl.startsWith(process.env.HLS_GATEWAY_BASE_URL!)).toBe(
+        true,
+      );
+      expect(mockStorageService.createPresignedGetUrl).not.toHaveBeenCalled();
+    });
+
+    it('returns 404 VIDEO_NOT_FOUND for a nonexistent id, exactly like the legacy branch (no HLS-specific behavior change to that guard)', async () => {
+      const response = await request(app.getHttpServer())
+        .get('/videos/does-not-exist-hls/playback')
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.NOT_FOUND);
+
+      expect((response.body as ErrorResponseBody).code).toBe('VIDEO_NOT_FOUND');
     });
   });
 });

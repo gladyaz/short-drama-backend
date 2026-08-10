@@ -22,7 +22,11 @@ import {
 import { FREE_EPISODE_LIMIT } from '../entitlements/entitlement.constants';
 import { EntitlementsService } from '../entitlements/entitlements.service';
 import { VideosService } from './videos.service';
-import type { VideoPlaybackResponseDto, VideoResponseDto } from './video.types';
+import type {
+  HlsPlaybackResponseDto,
+  VideoPlaybackResponseDto,
+  VideoResponseDto,
+} from './video.types';
 import { parseRangeHeader } from './video-range.util';
 
 @Controller('videos')
@@ -112,6 +116,17 @@ export class VideosController {
    * auth-free presigned URL for R2-backed media, the same class of risk
    * `ADMIN_MEDIA_UPLOAD_INITIATE_RATE_LIMIT` already exists to bound for
    * the PUT-minting route.
+   *
+   * Slice 11Q (control-workspace DECISIONS.md "2026-08-10 — Slice 11Q
+   * APPROVED..." entry): SAME route, SAME auth/entitlement gate above — no
+   * parallel auth system. `VideosService.getPlaybackUrl` now ALSO checks,
+   * before its existing R2/local resolution, whether the row is a fully
+   * `processingState: 'ready'` HLS-pipeline row; if so it returns the
+   * separate `HlsPlaybackResponseDto` shape (`{type:'hls', masterUrl,
+   * renditions, expiresAt}`, one short-lived gateway token covering the
+   * master playlist and every actually-produced rendition) instead of the
+   * legacy `VideoPlaybackResponseDto` shape. Every non-HLS row's response
+   * is byte-identical to before this slice.
    */
   @UseGuards(JwtAuthGuard)
   @Throttle({
@@ -124,7 +139,7 @@ export class VideosController {
   async getPlaybackUrl(
     @Param('id') id: string,
     @CurrentUser() user: AuthenticatedUser,
-  ): Promise<VideoPlaybackResponseDto> {
+  ): Promise<VideoPlaybackResponseDto | HlsPlaybackResponseDto> {
     await this.enforceEntitlementGate(id, user);
     return this.videosService.getPlaybackUrl(id);
   }

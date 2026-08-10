@@ -6,6 +6,7 @@ import { AppException } from '../common/errors/app.exception';
 import { PrismaService } from '../prisma/prisma.service';
 import { PLAYBACK_URL_EXPIRY_SECONDS } from '../storage/storage.constants';
 import { StorageService } from '../storage/storage.service';
+import * as hlsPlaybackTokenUtil from '../transcode/hls/hls-playback-token.util';
 import { VideosService } from './videos.service';
 import { VIDEOS } from './videos.data';
 
@@ -32,6 +33,24 @@ const TEST_APP_CONFIG = {
   publicBaseUrl: 'http://localhost:3000',
   storageRoot: '/company/storage',
   corsOrigins: ['http://localhost:8081'],
+};
+
+/**
+ * Slice 11Q: `VideosService`'s constructor now ALSO reads
+ * `configService.get('hlsGateway', ...)`, so the shared `ConfigService`
+ * mock below must route by key rather than returning the same object for
+ * every call (as it did before this slice, when `VideosService` only ever
+ * read the `'app'` key). Every EXISTING test in this file is unaffected —
+ * none of them ever reach the HLS branch (`tryBuildHlsPlaybackResponse`
+ * returns `null` immediately for a row whose `processingState !== 'ready'`,
+ * which is every fixture row this file creates outside the dedicated HLS
+ * describe block below) — this default value exists only so THOSE new
+ * tests have a working gateway config without a per-test override.
+ */
+const TEST_HLS_GATEWAY_CONFIG = {
+  baseUrl: 'https://hls-gateway.example.test',
+  tokenSecret: 'videos-service-spec-hls-token-secret',
+  ttlSeconds: 3600,
 };
 
 /**
@@ -112,7 +131,11 @@ describe('VideosService', () => {
         PrismaService,
         {
           provide: ConfigService,
-          useValue: { get: jest.fn().mockReturnValue(TEST_APP_CONFIG) },
+          useValue: {
+            get: jest.fn((key: string) =>
+              key === 'hlsGateway' ? TEST_HLS_GATEWAY_CONFIG : TEST_APP_CONFIG,
+            ),
+          },
         },
         { provide: StorageService, useValue: storageService },
       ],
@@ -493,6 +516,228 @@ describe('VideosService', () => {
 
       expect(Object.keys(result).sort()).toEqual(
         ['expiresAt', 'playbackUrl', 'requiresAuthHeader'].sort(),
+      );
+    });
+  });
+
+  describe('getPlaybackUrl — HLS gateway branch (Slice 11Q)', () => {
+    const HLS_PREFIX = `admin-media/${testVideos[0].id}/hls/v1-a1-11111111-1111-1111-1111-111111111111/`;
+    const HLS_MASTER_KEY = `${HLS_PREFIX}master.m3u8`;
+    const HLS_RENDITIONS = [
+      { name: '360p', width: 360, height: 640, bandwidth: 900_000 },
+      { name: '540p', width: 540, height: 960, bandwidth: 1_800_000 },
+      { name: '720p', width: 720, height: 1280, bandwidth: 3_300_000 },
+    ];
+
+    it('[TEST 12a] a row with processingState "ready" but no hlsMasterKey falls through to the existing legacy/R2 branch unchanged', async () => {
+      await prisma.video.update({
+        where: { id: testVideos[0].id },
+        data: { processingState: 'ready', hlsMasterKey: null },
+      });
+
+      const result = await service.getPlaybackUrl(testVideos[0].id);
+
+      expect('type' in result).toBe(false);
+      expect(result.playbackUrl).toBe(
+        `http://localhost:3000/videos/${testVideos[0].id}/stream`,
+      );
+    });
+
+    it.each(['queued', 'running', 'failed', null])(
+      '[TEST 12b] a row with hlsMasterKey set but processingState=%s never yields an HLS URL',
+      async (processingState) => {
+        await prisma.video.update({
+          where: { id: testVideos[0].id },
+          data: { processingState, hlsMasterKey: HLS_MASTER_KEY },
+        });
+
+        const result = await service.getPlaybackUrl(testVideos[0].id);
+
+        expect('type' in result).toBe(false);
+        expect(result.playbackUrl).toBe(
+          `http://localhost:3000/videos/${testVideos[0].id}/stream`,
+        );
+      },
+    );
+
+    it('a row that cleanly qualifies (ready + hlsMasterKey) returns the {type:"hls", masterUrl, renditions, expiresAt} shape', async () => {
+      await prisma.video.update({
+        where: { id: testVideos[0].id },
+        data: {
+          processingState: 'ready',
+          hlsMasterKey: HLS_MASTER_KEY,
+          hlsRenditions: HLS_RENDITIONS,
+        },
+      });
+
+      const result = await service.getPlaybackUrl(testVideos[0].id);
+
+      expect(Object.keys(result).sort()).toEqual(
+        ['expiresAt', 'masterUrl', 'renditions', 'type'].sort(),
+      );
+      const hlsResult =
+        result as import('./video.types').HlsPlaybackResponseDto;
+      expect(hlsResult.type).toBe('hls');
+      expect(hlsResult.masterUrl).toMatch(
+        new RegExp(
+          `^${TEST_HLS_GATEWAY_CONFIG.baseUrl}/t/[^/]+\\.[^/]+/master\\.m3u8$`,
+        ),
+      );
+    });
+
+    it('[TEST 13] returns ONLY the renditions actually produced — a 720p-max source (no 1080p entry persisted) never yields a 1080p rendition', async () => {
+      await prisma.video.update({
+        where: { id: testVideos[0].id },
+        data: {
+          processingState: 'ready',
+          hlsMasterKey: HLS_MASTER_KEY,
+          hlsRenditions: HLS_RENDITIONS, // 360p/540p/720p only — no 1080p
+        },
+      });
+
+      const result = (await service.getPlaybackUrl(
+        testVideos[0].id,
+      )) as import('./video.types').HlsPlaybackResponseDto;
+
+      expect(result.renditions).toHaveLength(3);
+      expect(result.renditions.map((r) => r.quality).sort()).toEqual([
+        '360p',
+        '540p',
+        '720p',
+      ]);
+      expect(result.renditions.some((r) => r.quality === '1080p')).toBe(false);
+      for (const rendition of result.renditions) {
+        expect(rendition.url).toMatch(
+          new RegExp(
+            `^${TEST_HLS_GATEWAY_CONFIG.baseUrl}/t/[^/]+\\.[^/]+/${rendition.quality}/index\\.m3u8$`,
+          ),
+        );
+      }
+    });
+
+    it('mints via mintHlsToken with the exact derived prefix, mediaId, and configured ttl/secret — proving the token is content/version-bound to THIS row', async () => {
+      const mintSpy = jest.spyOn(hlsPlaybackTokenUtil, 'mintHlsToken');
+
+      await prisma.video.update({
+        where: { id: testVideos[0].id },
+        data: {
+          processingState: 'ready',
+          hlsMasterKey: HLS_MASTER_KEY,
+          hlsRenditions: HLS_RENDITIONS,
+        },
+      });
+
+      await service.getPlaybackUrl(testVideos[0].id);
+
+      expect(mintSpy).toHaveBeenCalledWith({
+        mediaId: testVideos[0].id,
+        prefix: HLS_PREFIX,
+        ttlSeconds: TEST_HLS_GATEWAY_CONFIG.ttlSeconds,
+        secret: TEST_HLS_GATEWAY_CONFIG.tokenSecret,
+      });
+
+      mintSpy.mockRestore();
+    });
+
+    it('[TEST 10] mintHlsToken is never called for a row that does not reach the HLS branch (defense-in-depth alongside the controller-level entitlement gate, which runs BEFORE getPlaybackUrl is ever invoked)', async () => {
+      const mintSpy = jest.spyOn(hlsPlaybackTokenUtil, 'mintHlsToken');
+
+      // testVideos[0] is a plain local-backed row — never reaches the HLS
+      // branch at all (processingState is null by default).
+      await service.getPlaybackUrl(testVideos[0].id);
+
+      expect(mintSpy).not.toHaveBeenCalled();
+      mintSpy.mockRestore();
+    });
+
+    it("a malformed/mismatched hlsMasterKey (does not belong to this row's own id) falls back to the legacy branch instead of throwing", async () => {
+      await prisma.video.update({
+        where: { id: testVideos[0].id },
+        data: {
+          processingState: 'ready',
+          hlsMasterKey:
+            'admin-media/some-other-video-id/hls/v1-a1-uuid/master.m3u8',
+        },
+      });
+
+      const result = await service.getPlaybackUrl(testVideos[0].id);
+
+      expect('type' in result).toBe(false);
+      expect(result.playbackUrl).toBe(
+        `http://localhost:3000/videos/${testVideos[0].id}/stream`,
+      );
+    });
+
+    it('fails CLOSED with HLS_GATEWAY_NOT_CONFIGURED (never mints, never assembles a URL) when a row cleanly qualifies but HLS_GATEWAY_BASE_URL/HLS_TOKEN_SECRET are not configured', async () => {
+      const unconfiguredModule: TestingModule = await Test.createTestingModule({
+        providers: [
+          VideosService,
+          PrismaService,
+          {
+            provide: ConfigService,
+            useValue: {
+              get: jest.fn((key: string) =>
+                key === 'hlsGateway'
+                  ? {
+                      baseUrl: undefined,
+                      tokenSecret: undefined,
+                      ttlSeconds: 3600,
+                    }
+                  : TEST_APP_CONFIG,
+              ),
+            },
+          },
+          { provide: StorageService, useValue: storageService },
+        ],
+      }).compile();
+      const unconfiguredService =
+        unconfiguredModule.get<VideosService>(VideosService);
+      const unconfiguredPrisma =
+        unconfiguredModule.get<PrismaService>(PrismaService);
+      await unconfiguredPrisma.onModuleInit();
+
+      await prisma.video.update({
+        where: { id: testVideos[0].id },
+        data: {
+          processingState: 'ready',
+          hlsMasterKey: HLS_MASTER_KEY,
+          hlsRenditions: HLS_RENDITIONS,
+        },
+      });
+
+      let caught: unknown;
+      try {
+        await unconfiguredService.getPlaybackUrl(testVideos[0].id);
+      } catch (error) {
+        caught = error;
+      }
+
+      expect(caught).toBeInstanceOf(AppException);
+      expect((caught as AppException).code).toBe(
+        AppErrorCode.HLS_GATEWAY_NOT_CONFIGURED,
+      );
+      // [TEST 14] the error never leaks the (absent) secret or any config value.
+      expect((caught as AppException).message).not.toContain(
+        TEST_HLS_GATEWAY_CONFIG.tokenSecret,
+      );
+
+      await unconfiguredPrisma.onModuleDestroy();
+    });
+
+    it('[TEST 14] never includes the configured HLS_TOKEN_SECRET anywhere in a successful HLS response body', async () => {
+      await prisma.video.update({
+        where: { id: testVideos[0].id },
+        data: {
+          processingState: 'ready',
+          hlsMasterKey: HLS_MASTER_KEY,
+          hlsRenditions: HLS_RENDITIONS,
+        },
+      });
+
+      const result = await service.getPlaybackUrl(testVideos[0].id);
+
+      expect(JSON.stringify(result)).not.toContain(
+        TEST_HLS_GATEWAY_CONFIG.tokenSecret,
       );
     });
   });

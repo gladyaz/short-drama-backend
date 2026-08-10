@@ -383,6 +383,13 @@ describe('validateEnv — TRANSCODE_ENABLED / REDIS_URL (Slice 11N)', () => {
         ...VALID_CONFIG,
         TRANSCODE_ENABLED: 'true',
         REDIS_URL: 'redis://localhost:6379',
+        // Slice 11Q: HLS_TOKEN_SECRET/HLS_GATEWAY_BASE_URL are ALSO
+        // required once TRANSCODE_ENABLED=true (see the dedicated Slice
+        // 11Q describe block below) — included here so this Slice 11N
+        // test keeps proving what IT is about (REDIS_URL) without
+        // incidentally tripping the newer, independent HLS gateway check.
+        HLS_TOKEN_SECRET: 'test-hls-token-secret',
+        HLS_GATEWAY_BASE_URL: 'https://hls-gateway.example.test',
       }),
     ).not.toThrow();
   });
@@ -393,6 +400,8 @@ describe('validateEnv — TRANSCODE_ENABLED / REDIS_URL (Slice 11N)', () => {
         ...VALID_CONFIG,
         TRANSCODE_ENABLED: 'true',
         REDIS_URL: 'rediss://localhost:6380',
+        HLS_TOKEN_SECRET: 'test-hls-token-secret',
+        HLS_GATEWAY_BASE_URL: 'https://hls-gateway.example.test',
       }),
     ).not.toThrow();
   });
@@ -455,6 +464,10 @@ describe('validateEnv — TRANSCODE_MAX_ATTEMPTS / TRANSCODE_STALLED_AFTER_MINUT
     ...VALID_CONFIG,
     TRANSCODE_ENABLED: 'true',
     REDIS_URL: 'redis://localhost:6379',
+    // Slice 11Q: required once TRANSCODE_ENABLED=true — see the dedicated
+    // Slice 11Q describe block below for that check's own coverage.
+    HLS_TOKEN_SECRET: 'test-hls-token-secret',
+    HLS_GATEWAY_BASE_URL: 'https://hls-gateway.example.test',
   };
 
   it('boots with TRANSCODE_ENABLED=true and none of the three set (all fall back to their defaults)', () => {

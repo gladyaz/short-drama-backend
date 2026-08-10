@@ -152,11 +152,47 @@ export const DEFAULT_TRANSCODE_STALLED_AFTER_MINUTES = 30;
  */
 export const DEFAULT_TRANSCODE_CLEANUP_GRACE_MINUTES = 120;
 
+/**
+ * Slice 11Q — Private HLS Delivery Gateway (control workspace DECISIONS.md
+ * "2026-08-10 — Slice 11Q APPROVED..." entry; architecture:
+ * proposals/phase-11-hls-pipeline-proposal.md §9/§9a). Mirrors
+ * `TranscodeConfig`'s "read unconditionally here, `env.validation.ts`
+ * decides what's required" split exactly.
+ *
+ * `baseUrl`/`tokenSecret` are both `string | undefined` (never defaulted
+ * to `''`) — an empty string is a worse failure mode than a genuinely
+ * missing value (same rationale as `StorageConfig.publicBaseUrl`, 11H-B1):
+ * `VideosService`'s HLS branch treats either as "not configured" and fails
+ * CLOSED with `HLS_GATEWAY_NOT_CONFIGURED` rather than ever minting a
+ * token against an empty secret or assembling a URL against an empty base.
+ *
+ * `ttlSeconds` DOES have a sane default (`DEFAULT_HLS_TOKEN_TTL_SECONDS`)
+ * since it is not itself a secret/endpoint value — proposal §9/decision 8:
+ * "design target 30-60 minutes; the final TTL must be validated by real
+ * playback QA" — 3600s (60 min, the upper end of that target range) is
+ * used as the shipped default pending that QA; `HLS_TOKEN_TTL_SECONDS`
+ * lets it be tuned without a code change once QA has an answer.
+ */
+export interface HlsGatewayConfig {
+  baseUrl: string | undefined;
+  tokenSecret: string | undefined;
+  ttlSeconds: number;
+}
+
+/**
+ * Slice 11Q default for `HlsGatewayConfig.ttlSeconds` — see that field's
+ * doc comment. NOT FROZEN (explicitly, per the 2026-08-10 approval,
+ * binding constraint 3: "TTL design target 30-60 min, NOT frozen (physical
+ * QA decides)").
+ */
+export const DEFAULT_HLS_TOKEN_TTL_SECONDS = 3600;
+
 export interface RootConfig {
   app: AppConfig;
   auth: AuthConfig;
   storage: StorageConfig;
   transcode: TranscodeConfig;
+  hlsGateway: HlsGatewayConfig;
 }
 
 export default (): RootConfig => ({
@@ -198,6 +234,14 @@ export default (): RootConfig => ({
     cleanupGraceMinutes: parsePositiveIntEnv(
       process.env.TRANSCODE_CLEANUP_GRACE_MINUTES,
       DEFAULT_TRANSCODE_CLEANUP_GRACE_MINUTES,
+    ),
+  },
+  hlsGateway: {
+    baseUrl: process.env.HLS_GATEWAY_BASE_URL,
+    tokenSecret: process.env.HLS_TOKEN_SECRET,
+    ttlSeconds: parsePositiveIntEnv(
+      process.env.HLS_TOKEN_TTL_SECONDS,
+      DEFAULT_HLS_TOKEN_TTL_SECONDS,
     ),
   },
 });

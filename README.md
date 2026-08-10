@@ -2127,6 +2127,134 @@ reaches the database — never a raw, unredacted exception message or stack
 trace (see `transcode-job-processor.service.spec.ts`'s dedicated sentinel
 test).
 
+## Private HLS Delivery Gateway (Slice 11Q)
+
+Control-workspace DECISIONS.md "2026-08-10 — Slice 11Q APPROVED..." entry;
+architecture: `proposals/phase-11-hls-pipeline-proposal.md` §9/§9a. A small
+Cloudflare Worker (`workers/hls-gateway/`, a fully independent npm package —
+own `package.json`/`node_modules`, not an npm workspace of this repo) serves
+private R2-backed HLS media via one short-lived, content/version-bound
+playback token, so the backend never proxies media bytes and R2 credentials
+are never exposed to a client. **Not deployed anywhere by this slice** — only
+`workers/hls-gateway/wrangler.toml.example` exists (a template); there is no
+real `wrangler.toml`, and this slice never runs `wrangler login`/`deploy`.
+
+### Token v1 (shared backend↔Worker contract)
+
+```
+payload = base64url(JSON.stringify({ v: 1, m: mediaId, p: authorizedPrefix, e: unixExpirySeconds }))
+sig     = base64url(HMAC-SHA256(secret, payload))
+token   = `${payload}.${sig}`
+```
+
+Minted by `src/transcode/hls/hls-playback-token.util.ts#mintHlsToken` (Node
+`crypto.createHmac`), verified by `workers/hls-gateway/src/token.ts#verify`
+(WebCrypto `crypto.subtle`, constant-time via `subtle.verify`). Deliberately
+**no `userId` claim** — the token is content/version-bound, not
+identity-bound; the backend's own `GET /videos/:id/playback` request (already
+authenticated + entitlement-checked before a token is ever minted) is the
+audit trail for "who played what, when". `authorizedPrefix` is the exact
+immutable HLS generation prefix derived from `Video.hlsMasterKey` (everything
+up to and including the final `/` before `master.m3u8`, e.g.
+`admin-media/<id>/hls/v3-a1-<uuid>/`) via `deriveActiveGenerationPrefix`
+(reused from Slice 11P's `hls-staging-key.util.ts`), cross-checked against
+the row's own `mediaId` so a malformed/mismatched key can never mint a token
+for the wrong media. TTL default 60 min (`HLS_TOKEN_TTL_SECONDS`, NOT frozen —
+2026-08-10 approval: "design target 30-60 min; the final TTL must be
+validated by real playback QA"). The shared regression fixture
+`workers/hls-gateway/test/token-vectors.json` (synthetic secret/media
+ids/fixed reference clock) is asserted against by BOTH
+`src/transcode/hls/hls-token-contract.spec.ts` (backend mint reproduces every
+vector byte-for-byte) and `workers/hls-gateway/test/token.spec.ts` (Worker
+verify accepts/rejects the same vectors) — proving genuine Node-crypto↔
+WebCrypto HMAC-SHA256 interop, not a mocked stand-in for either side.
+
+### Backend: `GET /videos/:id/playback` extension
+
+Same route, same `JwtAuthGuard` + `enforceEntitlementGate` (no parallel auth
+system). A row with `processingState === 'ready'` and a non-null
+`hlsMasterKey` now returns a SEPARATE response shape instead of the existing
+one:
+
+```jsonc
+{ "type": "hls", "masterUrl": "<base>/t/<token>/master.m3u8",
+  "renditions": [{ "quality": "360p", "width": 360, "height": 640, "url": "<base>/t/<token>/360p/index.m3u8" }, "..."],
+  "expiresAt": "2026-08-10T21:00:00.000Z" }
+```
+
+Only the renditions actually persisted in `Video.hlsRenditions` are ever
+listed (never a speculative full ladder). Every OTHER row's response stays
+byte-identical to before this slice — the existing `VideoPlaybackResponseDto`
+shape is untouched, and the HLS branch is checked (and falls through safely
+to it on ANY mismatch, including a malformed `hlsMasterKey`) before the
+existing R2/local resolution runs. If a row cleanly qualifies but
+`HLS_GATEWAY_BASE_URL`/`HLS_TOKEN_SECRET` are unset, the request fails CLOSED
+with `HLS_GATEWAY_NOT_CONFIGURED` (500) rather than minting against an empty
+secret — unreachable in the real shipped default, since `TRANSCODE_ENABLED`
+being `false` means no row can ever reach `processingState: 'ready'` with a
+real `hlsMasterKey` in the first place.
+
+### Config
+
+`HLS_GATEWAY_BASE_URL`/`HLS_TOKEN_SECRET` follow the 11G-3 conditional
+pattern: read unconditionally by `configuration.ts`, but required by
+`env.validation.ts` ONLY when `TRANSCODE_ENABLED=true` (this repo's only
+shipped state is `false`, so neither is set in this machine's local `.env` —
+see `.env.example`'s placeholders). `HLS_TOKEN_SECRET` must also be DISTINCT
+from `JWT_ACCESS_SECRET`/`JWT_REFRESH_SECRET`/`AUTH_AUDIT_IP_HASH_SECRET` —
+boot fails loudly (naming which variable collided, never a value) if it
+matches any of them. `HLS_TOKEN_TTL_SECONDS` is optional even when enabled
+(default 3600s).
+
+### Worker (`workers/hls-gateway/`)
+
+Route `GET /t/<token>/<relativePath>`. Fixed request order (binding):
+verify token → normalize + validate the relative path
+(`src/path.ts#normalizeRelativePath` — percent-decode once, reject
+traversal/backslash/control-chars/leading-slash/residual `%2e`/`%2f`/`%5c`,
+NFC-normalize and re-check, allowlist `[A-Za-z0-9._-]` per segment) → build
+the object key from the TOKEN's own prefix + the normalized path
+(`src/path.ts#buildObjectKey`, plain string concatenation — never
+`path.join`, which collapses `..` instead of rejecting it) → **only now** may
+the cache be consulted → read from R2 (`env.MEDIA_BUCKET.get`, honoring
+`Range` requests, 206 + `Content-Range` when ranged). ANY failure before the
+R2 read (malformed route, invalid/expired token, traversal, prefix escape)
+returns a uniform, detail-free 403; a missing object after successful auth
+returns a generic 404 — neither ever echoes the token, secret, or requested
+key. Content-Type resolved by extension only
+(`.m3u8`→`application/vnd.apple.mpegurl`, `.mp4`→`video/mp4`,
+`.m4s`→`video/iso.segment`, `.jpg`→`image/jpeg`, else
+`application/octet-stream`). No CORS by default (native HLS players don't
+need it) — a commented design note in `src/index.ts` covers a future,
+narrow-origin-only web-playback allow-list, not implemented here.
+
+**Cache (§9a amendment) — ships DISABLED.** `CACHE_ENABLED` must be the
+EXACT string `"true"` to activate anything; every real deployment example
+(`wrangler.toml.example`) ships `"false"`. When enabled, the cache key is the
+CANONICAL object key (mediaId + immutable generation prefix + relative path)
+— never the tokenized URL — and is only ever consulted AFTER authorization
+already succeeded (`src/cache.ts`'s doc comment has the full ordering proof).
+Purge/invalidation is never explicit: a re-transcode produces an entirely new
+canonical key (immutable versioned prefixes), so a stale entry for a
+superseded generation simply becomes unreachable, never "stale but still
+served" — and the backend's existing `TRANSCODE_CLEANUP_GRACE_MINUTES`
+(120 min) being longer than the max token TTL (30-60 min) means a cached
+generation's R2 objects are never janitor-deleted while a live token for them
+could still exist.
+
+Self-contained npm package (own `package.json`: `vitest` +
+`@cloudflare/workers-types` + `typescript` only) — `npm test` (vitest, no
+miniflare, fake `Env`/`MediaBucket`/`CacheLike`) and `npm run typecheck`
+(`tsc --noEmit`) both run independently of this repo's own `npm test`/
+`npm run build`.
+
+### Real deployment (explicitly out of scope for this slice)
+
+No Cloudflare account/bucket/Worker was created or touched. Deploying
+requires a separate, explicitly-permitted step (per the 2026-08-10 approval:
+"NOT deployed in this slice unless separately permitted — if deployment
+needs a new human action, STOP and ask").
+
 ## Testing
 
 ```bash

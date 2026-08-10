@@ -86,3 +86,31 @@ export interface VideoPlaybackResponseDto {
    */
   requiresAuthHeader: boolean;
 }
+
+/**
+ * Slice 11Q — Private HLS Delivery Gateway (control-workspace DECISIONS.md
+ * "2026-08-10 — Slice 11Q APPROVED..." entry). `GET /videos/:id/playback`'s
+ * response for an HLS-ready row (`processingState === 'ready'` and
+ * `hlsMasterKey` set) — a SEPARATE, additive response shape from
+ * `VideoPlaybackResponseDto` above, never merged into it: every non-HLS
+ * row's response stays byte-identical to before this slice (no `type`
+ * field was retrofitted onto the existing shape).
+ */
+export interface HlsRenditionPlaybackDto {
+  /** Rung name, e.g. "360p"/"540p"/"720p"/"1080p" (`HlsRenditionSummary.name`). */
+  quality: string;
+  width: number;
+  height: number;
+  /** Gateway-relative URL: `<HLS_GATEWAY_BASE_URL>/t/<token>/<quality>/index.m3u8`. */
+  url: string;
+}
+
+export interface HlsPlaybackResponseDto {
+  type: 'hls';
+  /** Gateway-relative URL: `<HLS_GATEWAY_BASE_URL>/t/<token>/master.m3u8`. */
+  masterUrl: string;
+  /** ONLY the renditions actually produced for this generation (`Video.hlsRenditions`) — never a speculative full ladder. */
+  renditions: HlsRenditionPlaybackDto[];
+  /** ISO-8601 — when the single token covering both masterUrl and every rendition url expires. */
+  expiresAt: string;
+}

@@ -298,4 +298,22 @@ export enum AppErrorCode {
    * before this slice.
    */
   HLS_NOT_READY_FOR_PUBLISH = 'HLS_NOT_READY_FOR_PUBLISH',
+  // Slice 11Q (private HLS delivery gateway)
+  /**
+   * Returned by `GET /videos/:id/playback` when a row cleanly qualifies for
+   * the HLS branch (`processingState === 'ready'` and `hlsMasterKey` set,
+   * with a well-formed derivable prefix) but `HLS_GATEWAY_BASE_URL` and/or
+   * `HLS_TOKEN_SECRET` are not configured — i.e. `TRANSCODE_ENABLED` is
+   * somehow `true` (the only way a row could ever reach this state) while
+   * the SEPARATE HLS gateway config is missing. This should be
+   * unreachable in the real shipped default (`TRANSCODE_ENABLED=false`
+   * means no row can ever reach `processingState: 'ready'` with a real
+   * `hlsMasterKey`), but `VideosService` checks for it explicitly anyway
+   * rather than letting `mintHlsToken` be called with an empty secret or
+   * assembling a URL against an empty base — fails CLOSED with a message
+   * that names only which two variables are missing, never their values
+   * (there is nothing secret to leak either way: absence, not a wrong
+   * value, is what's being reported).
+   */
+  HLS_GATEWAY_NOT_CONFIGURED = 'HLS_GATEWAY_NOT_CONFIGURED',
 }

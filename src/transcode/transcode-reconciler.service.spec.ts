@@ -72,6 +72,9 @@ describe('TranscodeReconcilerService', () => {
     const transcodeConfig: TranscodeConfig = {
       enabled,
       redisUrl: enabled ? 'redis://localhost:6379' : undefined,
+      maxAttempts: 3,
+      stalledAfterMinutes: 30,
+      cleanupGraceMinutes: 120,
     };
 
     const module: TestingModule = await Test.createTestingModule({

@@ -5,8 +5,15 @@ import { HLS_AUDIO_CODEC_STRING } from './hls-profile.constants';
 import { HLS_MASTER_PLAYLIST_FILENAME } from './hls.constants';
 import { HlsRungArtifact, RenditionLadderResult } from './hls.types';
 
-/** Container/segmenting overhead margin applied on top of the declared peak bitrate. */
-const CONTAINER_OVERHEAD_MULTIPLIER = 1.05;
+/**
+ * Container/segmenting overhead margin applied on top of the declared peak
+ * bitrate. Exported (Slice 11P) so `TranscodeJobProcessor` can compute the
+ * SAME peak-BANDWIDTH value for `Video.hlsRenditions` (persisted DB
+ * telemetry) without duplicating this magic number — one source of truth for
+ * "what BANDWIDTH means" between the master playlist text and the DB
+ * column.
+ */
+export const CONTAINER_OVERHEAD_MULTIPLIER = 1.05;
 
 export interface MasterPlaylistBuildResult {
   path: string;
@@ -79,7 +86,8 @@ export class MasterPlaylistService {
   }
 }
 
-function audioBitrateBps(includeAudio: boolean): number {
+/** Exported (Slice 11P) for the same "one source of truth" reason as `CONTAINER_OVERHEAD_MULTIPLIER` above. */
+export function audioBitrateBps(includeAudio: boolean): number {
   return includeAudio ? 96_000 : 0;
 }
 

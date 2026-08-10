@@ -94,3 +94,56 @@ describe('configuration — transcode.enabled (Slice 11N)', () => {
     );
   });
 });
+
+/**
+ * Slice 11P — the three optional numeric tunables added to `TranscodeConfig`.
+ * Entirely in-memory, mirroring the spec above.
+ */
+describe('configuration — transcode.maxAttempts / stalledAfterMinutes / cleanupGraceMinutes (Slice 11P)', () => {
+  const KEYS = [
+    'TRANSCODE_MAX_ATTEMPTS',
+    'TRANSCODE_STALLED_AFTER_MINUTES',
+    'TRANSCODE_CLEANUP_GRACE_MINUTES',
+  ] as const;
+  const originalValues = KEYS.map((key) => process.env[key]);
+
+  afterEach(() => {
+    KEYS.forEach((key, index) => {
+      const original = originalValues[index];
+      if (original === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = original;
+      }
+    });
+  });
+
+  it('resolves every default when all three are unset', () => {
+    KEYS.forEach((key) => delete process.env[key]);
+
+    const transcode = configuration().transcode;
+    expect(transcode.maxAttempts).toBe(3);
+    expect(transcode.stalledAfterMinutes).toBe(30);
+    expect(transcode.cleanupGraceMinutes).toBe(120);
+  });
+
+  it('reflects a valid positive-integer override for each field', () => {
+    process.env.TRANSCODE_MAX_ATTEMPTS = '5';
+    process.env.TRANSCODE_STALLED_AFTER_MINUTES = '45';
+    process.env.TRANSCODE_CLEANUP_GRACE_MINUTES = '240';
+
+    const transcode = configuration().transcode;
+    expect(transcode.maxAttempts).toBe(5);
+    expect(transcode.stalledAfterMinutes).toBe(45);
+    expect(transcode.cleanupGraceMinutes).toBe(240);
+  });
+
+  it.each(['0', '-1', 'garbage', '2.5', ''])(
+    'falls back to the default for an invalid value (%s) rather than throwing',
+    (value) => {
+      process.env.TRANSCODE_MAX_ATTEMPTS = value;
+
+      expect(configuration().transcode.maxAttempts).toBe(3);
+    },
+  );
+});

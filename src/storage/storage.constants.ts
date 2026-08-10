@@ -22,3 +22,12 @@ export const DEFAULT_GET_URL_EXPIRY_SECONDS = 60 * 60;
  * caller; it never persists the resulting URL anywhere.
  */
 export const PLAYBACK_URL_EXPIRY_SECONDS = 15 * 60;
+
+/**
+ * Slice 11P: default `maxKeys` bound for
+ * `StorageService.listObjectKeysByPrefix` — one HLS generation produces on
+ * the order of tens of objects (4 rungs × a handful of segments each + one
+ * master playlist), so 1000 comfortably covers a single generation's full
+ * listing in one page while still being a real bound, not "unlimited".
+ */
+export const DEFAULT_LIST_MAX_KEYS = 1000;

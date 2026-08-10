@@ -34,3 +34,14 @@ export interface StorageObjectMetadata {
   lastModified?: Date;
   etag?: string;
 }
+
+/**
+ * Slice 11P: one entry returned by `StorageService.listObjectKeysByPrefix` —
+ * `lastModified` is whatever `ListObjectsV2` itself reports (absent only in
+ * a degenerate/mocked response), never independently fetched via a second
+ * HEAD call.
+ */
+export interface ObjectListEntry {
+  key: string;
+  lastModified?: Date;
+}

@@ -1,11 +1,29 @@
 import { ConfigModule } from '@nestjs/config';
 import { Test, TestingModule } from '@nestjs/testing';
-import { TranscodeConfig } from '../config/configuration';
+import { RootConfig, TranscodeConfig } from '../config/configuration';
 import { PrismaModule } from '../prisma/prisma.module';
 import { NoopTranscodeQueueClient } from './noop-transcode-queue.client';
 import { TranscodeModule } from './transcode.module';
 import { TRANSCODE_QUEUE } from './transcode.types';
 import type { TranscodeQueue } from './transcode.types';
+
+/**
+ * Slice 11P: `TranscodeModule` now additionally imports `StorageModule`
+ * (for `TranscodeJobProcessor`) — `StorageModule`'s `S3_CLIENT` factory
+ * reads `storage` config unconditionally at construction time (it never
+ * makes a network call, but it DOES dereference the config object), so this
+ * fixture must provide a complete, harmless dummy `storage` block alongside
+ * `transcode` or module compilation itself throws before any test body runs.
+ */
+const DUMMY_STORAGE_CONFIG: RootConfig['storage'] = {
+  driver: 'local',
+  endpoint: 'https://mock.example.test',
+  region: 'auto',
+  bucket: 'mock-bucket',
+  accessKeyId: 'mock-access-key-id',
+  secretAccessKey: 'mock-secret-access-key',
+  publicBaseUrl: undefined,
+};
 
 /**
  * Slice 11N. Proves the `TRANSCODE_QUEUE` provider's flag gate using
@@ -24,14 +42,23 @@ import type { TranscodeQueue } from './transcode.types';
  */
 describe('TranscodeModule — TRANSCODE_QUEUE provider flag gate', () => {
   async function buildModule(
-    transcodeConfig: TranscodeConfig,
+    transcodeConfig: Pick<TranscodeConfig, 'enabled' | 'redisUrl'>,
   ): Promise<TestingModule> {
+    const fullConfig: TranscodeConfig = {
+      maxAttempts: 3,
+      stalledAfterMinutes: 30,
+      cleanupGraceMinutes: 120,
+      ...transcodeConfig,
+    };
+
     return Test.createTestingModule({
       imports: [
         ConfigModule.forRoot({
           isGlobal: true,
           ignoreEnvFile: true,
-          load: [() => ({ transcode: transcodeConfig })],
+          load: [
+            () => ({ transcode: fullConfig, storage: DUMMY_STORAGE_CONFIG }),
+          ],
         }),
         // TranscodeIntentService/TranscodeReconcilerService (both providers
         // of TranscodeModule) depend on PrismaService, which the real app

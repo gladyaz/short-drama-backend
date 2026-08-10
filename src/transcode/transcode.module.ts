@@ -1,9 +1,14 @@
 import { Module } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { RootConfig } from '../config/configuration';
+import { StorageModule } from '../storage/storage.module';
+import { ThumbnailsModule } from '../thumbnails/thumbnails.module';
 import { BullmqTranscodeQueueClient } from './bullmq-transcode-queue.client';
+import { HlsModule } from './hls/hls.module';
 import { NoopTranscodeQueueClient } from './noop-transcode-queue.client';
 import { TranscodeIntentService } from './transcode-intent.service';
+import { TranscodeJanitorService } from './transcode-janitor.service';
+import { TranscodeJobProcessor } from './transcode-job-processor.service';
 import { TranscodeReconcilerService } from './transcode-reconciler.service';
 import { TRANSCODE_QUEUE, TranscodeQueue } from './transcode.types';
 
@@ -36,11 +41,28 @@ import { TRANSCODE_QUEUE, TranscodeQueue } from './transcode.types';
  * this factory entirely — the real `BullmqTranscodeQueueClient` branch is
  * therefore NEVER exercised by any test in this repository, satisfying "no
  * real Redis connection in any test" even for the flag-on test cases.
+ *
+ * Slice 11P additionally imports `StorageModule` (for `StorageService`),
+ * `HlsModule` (the Slice 11O FFmpeg/HLS pipeline primitives —
+ * `HLS_PROBE_CLIENT`, `HlsTranscodeService`, `MasterPlaylistService`,
+ * `HlsPackageValidator`), and `ThumbnailsModule` (for the raw
+ * `THUMBNAIL_CLIENT` — see `TranscodeJobProcessor`'s doc comment for why the
+ * raw client, not `ThumbnailService`, is what the poster step uses), and
+ * registers `TranscodeJobProcessor`/`TranscodeJanitorService`. These new
+ * providers are constructed wherever `TranscodeModule` is imported
+ * (currently `MediaModule`, for the HTTP app, and `WorkerModule` — see that
+ * module's doc comment) — registering a provider costs nothing until a
+ * caller actually invokes it, and NOTHING in the HTTP app's request path
+ * ever calls `TranscodeJobProcessor.process`/`TranscodeJanitorService`'s
+ * methods; only the worker entry's flag-gated persistent mode does.
  */
 @Module({
+  imports: [StorageModule, HlsModule, ThumbnailsModule],
   providers: [
     TranscodeIntentService,
     TranscodeReconcilerService,
+    TranscodeJobProcessor,
+    TranscodeJanitorService,
     {
       provide: TRANSCODE_QUEUE,
       useFactory: (
@@ -51,7 +73,10 @@ import { TRANSCODE_QUEUE, TranscodeQueue } from './transcode.types';
         })!;
 
         return transcodeConfig.enabled
-          ? new BullmqTranscodeQueueClient(transcodeConfig.redisUrl!)
+          ? new BullmqTranscodeQueueClient(
+              transcodeConfig.redisUrl!,
+              transcodeConfig.maxAttempts,
+            )
           : new NoopTranscodeQueueClient();
       },
       inject: [ConfigService],
@@ -60,6 +85,8 @@ import { TRANSCODE_QUEUE, TranscodeQueue } from './transcode.types';
   exports: [
     TranscodeIntentService,
     TranscodeReconcilerService,
+    TranscodeJobProcessor,
+    TranscodeJanitorService,
     TRANSCODE_QUEUE,
   ],
 })

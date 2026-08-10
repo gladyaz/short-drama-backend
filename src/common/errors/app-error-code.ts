@@ -267,4 +267,35 @@ export enum AppErrorCode {
    * "unprovable cleanup ⇒ STOP + prominent report" requirement.
    */
   HLS_CLEANUP_VERIFICATION_FAILED = 'HLS_CLEANUP_VERIFICATION_FAILED',
+  // Slice 11P (production transcoding lifecycle)
+  /**
+   * Returned by `POST /admin/media/:id/complete-upload` when
+   * `TRANSCODE_ENABLED=true` and the durable DB-intent write
+   * (`TranscodeIntentService.recordIntent`, run inside the SAME
+   * `prisma.$transaction` as the upload-completion ready-transition) fails
+   * for any reason — the whole transaction rolls back, so the row's
+   * `lifecycleState` stays exactly where it was (`draft`), never silently
+   * treated as "scheduled". This RESOLVES the carried 11N/11O REQUIRED
+   * concern (control workspace DECISIONS.md, "2026-08-10 — Slice 11P
+   * APPROVED..." entry, binding constraint 5): a durable-intent failure is
+   * loud and explicit, not swallowed — the caller may safely retry
+   * `complete-upload` once the underlying issue (e.g. a database outage) is
+   * resolved. Deliberately distinct from a queue/Redis-enqueue failure
+   * (which stays best-effort and non-fatal, per `TranscodeIntentService
+   * .enqueueBestEffort`'s doc comment) — this code is ONLY ever used for the
+   * durable DB write itself failing.
+   */
+  MEDIA_PROCESSING_INTENT_FAILED = 'MEDIA_PROCESSING_INTENT_FAILED',
+  /**
+   * Returned by `POST /admin/media/:id/publish` when the row is an
+   * HLS-pipeline row (`Video.processingState IS NOT NULL`) whose processing
+   * has not yet reached a verified-ready generation
+   * (`processingState !== "ready"` OR `hlsMasterKey` is still `null`) — the
+   * 2026-08-10 Slice 11P approval, binding constraint 10. Rows with
+   * `processingState === null` (every legacy/local row, and the pre-HLS
+   * published R2 fixture row) are completely unaffected by this check and
+   * never receive this code — their publish behavior is byte-identical to
+   * before this slice.
+   */
+  HLS_NOT_READY_FOR_PUBLISH = 'HLS_NOT_READY_FOR_PUBLISH',
 }

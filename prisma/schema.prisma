@@ -146,7 +146,7 @@ model Session {
 // flat feed response), and introducing one is out of scope for this work
 // unit.
 model Video {
-  id                            String  @id
+  id                            String    @id
   seriesId                      String
   title                         String
   episodeNumber                 Int
@@ -168,7 +168,7 @@ model Video {
   /// callers (e.g. `seed.ts`, `videos.service.spec.ts`) that create/update
   /// `Video` rows without specifying it keep compiling; the additive
   /// migration backfills the correct value for the 40 pre-existing rows.
-  sortOrder                     Int     @default(0)
+  sortOrder                     Int       @default(0)
   /// Phase 11, work unit 11A-2: object-storage fields for the upcoming
   /// R2/S3-compatible media pipeline (11B/11D), added alongside the existing
   /// `storageKey` (local `STORAGE_ROOT`-relative path — untouched, still the
@@ -195,7 +195,7 @@ model Video {
   /// instead, set explicitly by that endpoint rather than relying on this
   /// column default (which exists for backfill safety, not as the intended
   /// state for freshly created rows).
-  lifecycleState                String  @default("published")
+  lifecycleState                String    @default("published")
   /// Phase 11, work unit 11E-3: per-episode admin access-tier override.
   /// Nullable with NO default, so every one of the 40 pre-existing rows (and
   /// every caller that creates/updates a `Video` without specifying it, e.g.
@@ -278,7 +278,7 @@ model Video {
   /// .transitionIfVersion` is the generic CAS primitive a future worker MUST
   /// use to write them safely (see `processingVersion` below), but nothing
   /// calls it with any of those three values yet.
-  processingState                String?
+  processingState               String?
   /// Slice 11N: monotonic PER-ROW processing-generation counter — the
   /// compare-and-swap (CAS) token every current and future processing write
   /// must present unchanged before it is allowed to mutate `processingState`
@@ -301,7 +301,126 @@ model Video {
   /// before every re-enqueue attempt (never a version it cached earlier) —
   /// a duplicate/late worker attempt against a superseded generation can
   /// never silently overwrite a newer one.
-  processingVersion              Int     @default(0)
+  processingVersion             Int       @default(0)
+  /// Slice 11P — Production Transcoding Lifecycle (control workspace
+  /// DECISIONS.md "2026-08-10 — Slice 11P APPROVED..." entry; architecture:
+  /// `proposals/phase-11-hls-pipeline-proposal.md` §6-§8). Every column added
+  /// by this slice is additive/nullable/defaulted so no pre-existing row
+  /// (including every legacy/local row and the 11N/11O-era rows that only
+  /// ever wrote `processingState`/`processingVersion`) changes meaning —
+  /// verified post-migration on both `short_drama_dev` and `short_drama_test`
+  /// (11N row-safety precedent). Every field below is written EXCLUSIVELY by
+  /// 11P code (`TranscodeIntentService`'s new CAS methods and
+  /// `TranscodeJobProcessor`) — nothing in 11N/11O ever touched any of these.
+  ///
+  /// `hlsMasterKey`: the CONSUMER-VISIBLE pointer to the current, fully
+  /// verified live HLS generation's master playlist object key (e.g.
+  /// `"admin-media/<id>/hls/v3-a1-<uuid>/master.m3u8"`). Written ONLY by the
+  /// single version-guarded promotion CAS
+  /// (`TranscodeIntentService.promoteIfCurrent`) once every rendition exists,
+  /// every playlist validates, and every artifact is HEAD-verified in R2 — a
+  /// partial/failed generation can never reach this column (proposal §7,
+  /// approval binding constraint 2/3). Never overwritten in place: a
+  /// re-transcode writes a brand-new immutable prefix and only flips this
+  /// pointer once THAT generation is fully verified, so a reader observing
+  /// this column mid-flip always sees either the old, fully-intact
+  /// generation or the new one — never a mix. `null` means "no HLS output has
+  /// ever been promoted for this row" (every legacy row, and any HLS-pipeline
+  /// row that has not yet completed its first successful transcode).
+  hlsMasterKey                  String?
+  /// `processingStep`: DISPLAY-ONLY operational progress detail within the
+  /// `running` state (`"probing"`, a rung name like `"360p"`, `"packaging"`,
+  /// `"uploading"`, `"verifying"`, `"poster"` — see
+  /// `TranscodeJobProcessor`'s doc comment for the exact sequence). Never a
+  /// distinct lifecycle state (proposal §6: "their transition rules would be
+  /// identical, so as states they'd be aesthetic" — reaffirmed for 11P).
+  /// Always `null` outside `running` — every CAS transition OUT of `running`
+  /// (to `ready`, `failed`, or back to `queued` on retry) clears it in the
+  /// SAME write, and `TranscodeIntentService.recordIntent` (completeUpload's
+  /// new intent write) also explicitly nulls it, so a stale step from a
+  /// prior attempt can never be read as if it were current.
+  processingStep                String?
+  /// `processingErrorCode`: a short, bounded, machine-stable, SECRET-FREE
+  /// code for the most recent failure (e.g. `"SOURCE_MISSING"`,
+  /// `"PROBE_FAILED"`, `"TRANSCODE_FAILED"`, `"HLS_PACKAGE_VALIDATION_FAILED"`,
+  /// `"UPLOAD_VERIFICATION_FAILED"`, `"POSTER_GENERATION_FAILED"`,
+  /// `"MAX_ATTEMPTS_EXCEEDED"`, `"STALE"` (janitor-detected stalled run)) —
+  /// see `TranscodeJobProcessor`/`TranscodeJanitorService` for the full,
+  /// closed set. Written only alongside a CAS transition to `failed`; cleared
+  /// (`null`) by `recordIntent` on the next processing request, so a retried
+  /// row never carries a stale error forward once it starts running again.
+  /// Never a raw exception message/stack (that could embed an absolute
+  /// filesystem path or another secret) — always one of the closed set above.
+  processingErrorCode           String?
+  /// `processingErrorMessage`: a short, bounded (never a raw stack trace or
+  /// unredacted exception string — see `redactSensitiveText`), human-readable
+  /// companion to `processingErrorCode`, surfaced by a future admin UI
+  /// (11U). Same null/clear lifecycle as `processingErrorCode` above.
+  processingErrorMessage        String?
+  /// `processingAttempts`: monotonic per-GENERATION (i.e. reset to `0` by
+  /// `recordIntent` on every new `requestProcessing` call, since a new
+  /// `processingVersion` is a brand-new generation, not a retry of the old
+  /// one) attempt counter, incremented by the SAME CAS write that claims
+  /// `queued -> running`. Bounds retries at `TRANSCODE_MAX_ATTEMPTS`
+  /// (default 3, `src/config/configuration.ts`) — `TranscodeJobProcessor`
+  /// refuses to run FFmpeg at all once this would exceed the cap, CAS-failing
+  /// the row immediately instead (`MAX_ATTEMPTS_EXCEEDED`). Defaults to `0`
+  /// so every pre-existing row backfills to `0` — this additive migration
+  /// changes no existing row's value.
+  processingAttempts            Int       @default(0)
+  /// `processingStartedAt`: set by the SAME CAS write that claims
+  /// `queued -> running` for the CURRENT attempt — the basis for
+  /// `TranscodeJanitorService`'s stale-running detection
+  /// (`now() - processingStartedAt > TRANSCODE_STALLED_AFTER_MINUTES`) and
+  /// for a future "queue wait" / "processing duration" observability metric
+  /// (`processingCompletedAt - processingStartedAt`). Left in place (not
+  /// cleared) once a row leaves `running`, so it always reflects "when the
+  /// MOST RECENT attempt started" even after that attempt finishes — the
+  /// next `recordIntent` (a brand-new generation) does not reset it either;
+  /// only the next successful `queued -> running` claim overwrites it.
+  processingStartedAt           DateTime?
+  /// `processingCompletedAt`: set by BOTH terminal CAS transitions —
+  /// `promoteIfCurrent` (success) and `failWithError`/the janitor's stale-run
+  /// CAS (failure) — the paired telemetry timestamp for
+  /// `processingStartedAt` above. `null` while a row has never reached a
+  /// terminal outcome for its current attempt.
+  processingCompletedAt         DateTime?
+  /// `sourceWidth`/`sourceHeight`/`sourceDurationSeconds`/`sourceFps`:
+  /// persisted `ffprobe` results for the CURRENT source object
+  /// (`TranscodeJobProcessor`'s probing step, via the existing
+  /// `HlsProbeClient`/`computeRenditionLadder` primitives from Slice 11O) —
+  /// informational/telemetry only; nothing in this slice re-derives the
+  /// rendition ladder from these persisted values on a later run (each run
+  /// re-probes the source fresh, since the source object itself could
+  /// theoretically change between attempts). `sourceFps` is `Float` (not
+  /// `Int`) because real frame rates are frequently non-integer (e.g.
+  /// `29.97`), matching `HlsSourceProbe.fps`'s existing shape
+  /// (`src/transcode/hls/hls.types.ts`).
+  sourceWidth                   Int?
+  sourceHeight                  Int?
+  sourceDurationSeconds         Int?
+  sourceFps                     Float?
+  /// `hlsRenditions`: the ACTUALLY-PRODUCED rendition summary for the
+  /// CURRENT `hlsMasterKey` generation only — `[{name, width, height,
+  /// bandwidth}]` (see `HlsRenditionSummary`,
+  /// `src/transcode/transcode.types.ts`), written in the SAME promotion CAS
+  /// as `hlsMasterKey` so the two always describe the same generation and can
+  /// never disagree. `Json?` (not a separate table): this is a small,
+  /// read-mostly, always-replaced-as-a-whole array with no independent query
+  /// need of its own — matches this schema's existing `Json?` precedent
+  /// (`AnalyticsEvent.properties`, `AuthAuditEvent.metadata`) rather than
+  /// introducing a `Rendition` join table for a value that is only ever
+  /// read/written as a single unit.
+  hlsRenditions                 Json?
+  /// `transcodeProfileVersion`: a plain string tag (e.g. `"ladder-v1"`,
+  /// matching `Video.category`/`processingState`'s existing plain-string —
+  /// NOT Postgres-enum — precedent) identifying which rendition-ladder
+  /// profile (`src/transcode/hls/hls-profile.constants.ts`'s `RUNG_PROFILES`)
+  /// produced the CURRENT `hlsMasterKey` generation, written in the SAME
+  /// promotion CAS. Lets a future ladder-table revision (e.g. `"ladder-v2"`)
+  /// distinguish already-transcoded generations from ones that predate it,
+  /// without needing to re-probe or guess.
+  transcodeProfileVersion       String?
 
   @@index([seriesId])
   @@index([sortOrder])

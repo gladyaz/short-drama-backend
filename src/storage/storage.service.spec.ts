@@ -1,8 +1,13 @@
+import { mkdtemp, readFile, rm } from 'fs/promises';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { Readable } from 'stream';
 import { ConfigService } from '@nestjs/config';
 import {
   DeleteObjectCommand,
   GetObjectCommand,
   HeadObjectCommand,
+  ListObjectsV2Command,
   PutObjectCommand,
   S3Client,
 } from '@aws-sdk/client-s3';
@@ -10,6 +15,7 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { RootConfig } from '../config/configuration';
 import {
   DEFAULT_GET_URL_EXPIRY_SECONDS,
+  DEFAULT_LIST_MAX_KEYS,
   DEFAULT_PUT_URL_EXPIRY_SECONDS,
 } from './storage.constants';
 import { StorageService } from './storage.service';
@@ -292,6 +298,128 @@ describe('StorageService', () => {
         Body: body,
         ContentType: undefined,
       });
+    });
+  });
+
+  describe('downloadObjectToFile (Slice 11P)', () => {
+    let tempDir: string;
+
+    beforeEach(async () => {
+      tempDir = await mkdtemp(join(tmpdir(), 'storage-service-spec-'));
+    });
+
+    afterEach(async () => {
+      await rm(tempDir, { recursive: true, force: true });
+    });
+
+    it('streams the mocked GetObject Body to the destination file', async () => {
+      const destPath = join(tempDir, 'source.mp4');
+      mockClient.send.mockResolvedValue({
+        Body: Readable.from([Buffer.from('fake-video-bytes')]),
+      });
+
+      await service.downloadObjectToFile('admin-media/x/source', destPath);
+
+      expect(mockClient.send).toHaveBeenCalledTimes(1);
+      const command = mockClient.send.mock.calls[0][0] as GetObjectCommand;
+      expect(command).toBeInstanceOf(GetObjectCommand);
+      expect(command.input).toEqual({
+        Bucket: 'mock-bucket',
+        Key: 'admin-media/x/source',
+      });
+      const written = await readFile(destPath);
+      expect(written.toString()).toBe('fake-video-bytes');
+    });
+
+    it('throws (and writes nothing usable) when the response has no Body', async () => {
+      const destPath = join(tempDir, 'source.mp4');
+      mockClient.send.mockResolvedValue({});
+
+      await expect(
+        service.downloadObjectToFile('admin-media/x/source', destPath),
+      ).rejects.toThrow(/no body/i);
+    });
+
+    it('propagates a stream error instead of silently leaving a partial file', async () => {
+      const destPath = join(tempDir, 'source.mp4');
+      const failingStream = new Readable({
+        read() {
+          this.destroy(new Error('simulated network interruption'));
+        },
+      });
+      mockClient.send.mockResolvedValue({ Body: failingStream });
+
+      await expect(
+        service.downloadObjectToFile('admin-media/x/source', destPath),
+      ).rejects.toThrow('simulated network interruption');
+    });
+  });
+
+  describe('listObjectKeysByPrefix (Slice 11P)', () => {
+    it('returns key + lastModified pairs for every entry in the mocked response', async () => {
+      const lastModified = new Date('2026-01-01T00:00:00.000Z');
+      mockClient.send.mockResolvedValue({
+        Contents: [
+          {
+            Key: 'admin-media/x/hls/v1-a1-uuid/master.m3u8',
+            LastModified: lastModified,
+          },
+          {
+            Key: 'admin-media/x/hls/v1-a1-uuid/360p/index.m3u8',
+            LastModified: lastModified,
+          },
+        ],
+      });
+
+      const result = await service.listObjectKeysByPrefix('admin-media/x/hls/');
+
+      expect(result).toEqual([
+        { key: 'admin-media/x/hls/v1-a1-uuid/master.m3u8', lastModified },
+        {
+          key: 'admin-media/x/hls/v1-a1-uuid/360p/index.m3u8',
+          lastModified,
+        },
+      ]);
+      expect(mockClient.send).toHaveBeenCalledTimes(1);
+      const command = mockClient.send.mock.calls[0][0] as ListObjectsV2Command;
+      expect(command).toBeInstanceOf(ListObjectsV2Command);
+      expect(command.input).toEqual({
+        Bucket: 'mock-bucket',
+        Prefix: 'admin-media/x/hls/',
+        MaxKeys: DEFAULT_LIST_MAX_KEYS,
+      });
+    });
+
+    it('honors a caller-supplied maxKeys override', async () => {
+      mockClient.send.mockResolvedValue({ Contents: [] });
+
+      await service.listObjectKeysByPrefix('admin-media/x/hls/', 25);
+
+      const command = mockClient.send.mock.calls[0][0] as ListObjectsV2Command;
+      expect(command.input).toMatchObject({ MaxKeys: 25 });
+    });
+
+    it('returns an empty array when Contents is absent', async () => {
+      mockClient.send.mockResolvedValue({});
+
+      expect(
+        await service.listObjectKeysByPrefix('admin-media/x/hls/'),
+      ).toEqual([]);
+    });
+
+    it('filters out entries with no Key', async () => {
+      mockClient.send.mockResolvedValue({
+        Contents: [
+          { LastModified: new Date() },
+          { Key: 'admin-media/x/hls/v1/master.m3u8' },
+        ],
+      });
+
+      const result = await service.listObjectKeysByPrefix('admin-media/x/hls/');
+
+      expect(result).toEqual([
+        { key: 'admin-media/x/hls/v1/master.m3u8', lastModified: undefined },
+      ]);
     });
   });
 

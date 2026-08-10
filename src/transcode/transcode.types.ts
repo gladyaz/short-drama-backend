@@ -50,3 +50,78 @@ export interface TranscodeQueue {
 
 /** DI token for the injected `TranscodeQueue`. */
 export const TRANSCODE_QUEUE = 'TRANSCODE_TRANSCODE_QUEUE';
+
+/**
+ * Slice 11P — Production Transcoding Lifecycle. The shape persisted to
+ * `Video.hlsRenditions` (a `Json?` column — see its schema doc comment) by
+ * the promotion CAS (`TranscodeIntentService.promoteIfCurrent`), describing
+ * ONLY the renditions actually produced for the CURRENT `hlsMasterKey`
+ * generation. `bandwidth` mirrors the master playlist's `BANDWIDTH` value
+ * (`MasterPlaylistService`, Slice 11O) — the peak, VBV-enforced bitrate in
+ * bits/second, not a measured average.
+ */
+export interface HlsRenditionSummary {
+  name: string;
+  width: number;
+  height: number;
+  bandwidth: number;
+}
+
+/**
+ * Slice 11P: the closed set of machine-stable codes
+ * `Video.processingErrorCode` may hold, written exclusively by
+ * `TranscodeJobProcessor` (a job-level failure) or `TranscodeJanitorService`
+ * (`STALE`, a stalled-run detection). Never a raw exception message/stack —
+ * see that column's schema doc comment.
+ */
+export type TranscodeErrorCode =
+  | 'SOURCE_MISSING'
+  | 'PROBE_FAILED'
+  | 'TRANSCODE_FAILED'
+  | 'UPLOAD_FAILED'
+  | 'HLS_PACKAGE_VALIDATION_FAILED'
+  | 'UPLOAD_VERIFICATION_FAILED'
+  | 'POSTER_GENERATION_FAILED'
+  | 'MAX_ATTEMPTS_EXCEEDED'
+  | 'STALE'
+  | 'UNKNOWN_ERROR';
+
+/**
+ * Slice 11P: the outcome `TranscodeJobProcessor.process` resolves with —
+ * never throws for an expected/handled failure (matching this repo's
+ * existing "structured result over exception for expected outcomes"
+ * precedent, e.g. `HlsPackageValidationResult`) so a real BullMQ `Worker`
+ * (or a test) can distinguish "ran to a terminal DB state" from "an
+ * unexpected bug" without parsing error messages. A genuinely unexpected
+ * throw (a bug, not a modeled failure) still propagates normally — BullMQ's
+ * own retry/backoff handles that case at the queue layer.
+ */
+export type TranscodeJobOutcome =
+  | { outcome: 'promoted'; hlsMasterKey: string }
+  | {
+      outcome: 'failed';
+      errorCode: TranscodeErrorCode;
+      /**
+       * `true` when this was the FINAL allowed attempt (the row's DB state
+       * is now the TERMINAL `"failed"` — a fresh `requestProcessing` call is
+       * required to try again). `false` when the row was returned to
+       * `"queued"` (`TranscodeIntentService.requeueForRetry`) so a future
+       * claim (BullMQ's own backoff-driven redelivery of the SAME job, or a
+       * `TranscodeReconcilerService.reconcile` sweep if that redelivery was
+       * itself lost) can retry the SAME generation — see
+       * `src/worker/transcode-worker.ts`'s doc comment for how this field
+       * decides whether the BullMQ processor function re-throws (to
+       * trigger BullMQ's own backoff) or resolves normally.
+       */
+      terminal: boolean;
+    }
+  | {
+      outcome: 'superseded';
+      reason:
+        | 'ROW_NOT_FOUND'
+        | 'VERSION_MISMATCH'
+        | 'NOT_QUEUED'
+        | 'CLAIM_RACE_LOST'
+        | 'SUPERSEDED_MID_RUN'
+        | 'PROMOTION_RACE_LOST';
+    };

@@ -23,3 +23,51 @@ export function buildTranscodeJobId(
 ): string {
   return `${videoId}:${processingVersion}`;
 }
+
+/**
+ * Slice 11P: default bound for both `TranscodeJanitorService` sweep methods
+ * — mirrors `DEFAULT_RECONCILE_LIMIT`'s existing "small, safe, bounded per
+ * call" rationale exactly.
+ */
+export const DEFAULT_JANITOR_SWEEP_LIMIT = 25;
+
+/** `fs.mkdtemp` prefix for `TranscodeJobProcessor`'s own temp working directory. */
+export const TRANSCODE_WORKER_TEMP_DIR_PREFIX = '11p-transcode-worker-';
+
+/**
+ * Slice 11P: base delay (ms) for BullMQ's `type: 'exponential'` job backoff
+ * (`BullmqTranscodeQueueClient.add`) — proposal §8: "3 attempts, exponential
+ * backoff (≈1 m → 5 m → 25 m)". See that class's doc comment for the exact
+ * computed sequence.
+ */
+export const TRANSCODE_BACKOFF_BASE_DELAY_MS = 60_000;
+
+/**
+ * Slice 11P: BullMQ `Worker` concurrency for the transcode worker
+ * (`src/worker/transcode-worker.ts`) — proposal §1/§13: "Concurrency 1 ...
+ * so transcoding never starves the API" (this repo's prod v1 topology runs
+ * API/Redis/worker as separate processes on one machine).
+ */
+export const TRANSCODE_WORKER_CONCURRENCY = 1;
+
+/**
+ * Slice 11P: how often (ms) BullMQ itself checks for stalled jobs
+ * (`Worker`'s own `stalledInterval` option) — a complementary,
+ * queue-level mechanism to `TranscodeJanitorService.sweepStaleRunning`'s
+ * DB-level stale-row detection (that one recovers a row even if the
+ * BullMQ-level stalled-job reclaim itself never fires, e.g. total Redis data
+ * loss).
+ */
+export const TRANSCODE_WORKER_STALLED_INTERVAL_MS = 30_000;
+
+/**
+ * Slice 11P: how often (ms) `src/worker/main.ts`'s persistent-worker mode
+ * calls `TranscodeJanitorService.sweepStaleRunning`/`cleanupOrphanStaging`.
+ * Follows the Phase 13 (13A-B2) `RetentionSchedulerService` "env-gated
+ * schedule OFF by default, injectable manual method is the real foundation"
+ * precedent — see `TranscodeJanitorService`'s own doc comment for why this
+ * slice reuses `TRANSCODE_ENABLED` itself as the single schedule gate
+ * instead of introducing a second env var purely to control "does the
+ * interval exist".
+ */
+export const TRANSCODE_JANITOR_INTERVAL_MS = 5 * 60_000;

@@ -441,3 +441,82 @@ describe('validateEnv — TRANSCODE_ENABLED / REDIS_URL (Slice 11N)', () => {
     expect(caught?.message).not.toContain(sentinel);
   });
 });
+
+/**
+ * Slice 11P — the three optional numeric tunables
+ * (TRANSCODE_MAX_ATTEMPTS/TRANSCODE_STALLED_AFTER_MINUTES/
+ * TRANSCODE_CLEANUP_GRACE_MINUTES), validated only when TRANSCODE_ENABLED is
+ * exactly "true", mirroring the REDIS_URL conditional shape above — but
+ * unlike REDIS_URL, none of these three is REQUIRED to be present; only a
+ * PRESENT-but-invalid value fails boot.
+ */
+describe('validateEnv — TRANSCODE_MAX_ATTEMPTS / TRANSCODE_STALLED_AFTER_MINUTES / TRANSCODE_CLEANUP_GRACE_MINUTES (Slice 11P)', () => {
+  const ENABLED_BASE: Record<string, unknown> = {
+    ...VALID_CONFIG,
+    TRANSCODE_ENABLED: 'true',
+    REDIS_URL: 'redis://localhost:6379',
+  };
+
+  it('boots with TRANSCODE_ENABLED=true and none of the three set (all fall back to their defaults)', () => {
+    expect(() => validateEnv({ ...ENABLED_BASE })).not.toThrow();
+  });
+
+  it('ignores all three entirely when TRANSCODE_ENABLED is not "true", even if malformed', () => {
+    expect(() =>
+      validateEnv({
+        ...VALID_CONFIG,
+        TRANSCODE_MAX_ATTEMPTS: 'not-a-number',
+        TRANSCODE_STALLED_AFTER_MINUTES: '-5',
+        TRANSCODE_CLEANUP_GRACE_MINUTES: '0',
+      }),
+    ).not.toThrow();
+  });
+
+  it.each([
+    'TRANSCODE_MAX_ATTEMPTS',
+    'TRANSCODE_STALLED_AFTER_MINUTES',
+    'TRANSCODE_CLEANUP_GRACE_MINUTES',
+  ])('boots when %s is a valid positive integer', (key) => {
+    expect(() => validateEnv({ ...ENABLED_BASE, [key]: '5' })).not.toThrow();
+  });
+
+  it.each([
+    'TRANSCODE_MAX_ATTEMPTS',
+    'TRANSCODE_STALLED_AFTER_MINUTES',
+    'TRANSCODE_CLEANUP_GRACE_MINUTES',
+  ])('rejects %s=0 (must be strictly positive)', (key) => {
+    expect(() => validateEnv({ ...ENABLED_BASE, [key]: '0' })).toThrow(
+      new RegExp(`Invalid ${key}: must be a positive integer`),
+    );
+  });
+
+  it.each([
+    'TRANSCODE_MAX_ATTEMPTS',
+    'TRANSCODE_STALLED_AFTER_MINUTES',
+    'TRANSCODE_CLEANUP_GRACE_MINUTES',
+  ])('rejects a negative %s', (key) => {
+    expect(() => validateEnv({ ...ENABLED_BASE, [key]: '-3' })).toThrow(
+      new RegExp(`Invalid ${key}: must be a positive integer`),
+    );
+  });
+
+  it.each([
+    'TRANSCODE_MAX_ATTEMPTS',
+    'TRANSCODE_STALLED_AFTER_MINUTES',
+    'TRANSCODE_CLEANUP_GRACE_MINUTES',
+  ])('rejects a non-numeric %s', (key) => {
+    expect(() => validateEnv({ ...ENABLED_BASE, [key]: 'garbage' })).toThrow(
+      new RegExp(`Invalid ${key}: must be a positive integer`),
+    );
+  });
+
+  it.each([
+    'TRANSCODE_MAX_ATTEMPTS',
+    'TRANSCODE_STALLED_AFTER_MINUTES',
+    'TRANSCODE_CLEANUP_GRACE_MINUTES',
+  ])('rejects a non-integer (float) %s', (key) => {
+    expect(() => validateEnv({ ...ENABLED_BASE, [key]: '2.5' })).toThrow(
+      new RegExp(`Invalid ${key}: must be a positive integer`),
+    );
+  });
+});

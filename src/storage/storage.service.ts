@@ -1,9 +1,12 @@
+import { createWriteStream } from 'fs';
+import { pipeline } from 'stream/promises';
 import { Inject, Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
   DeleteObjectCommand,
   GetObjectCommand,
   HeadObjectCommand,
+  ListObjectsV2Command,
   PutObjectCommand,
   S3Client,
 } from '@aws-sdk/client-s3';
@@ -11,12 +14,14 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { RootConfig, StorageConfig } from '../config/configuration';
 import {
   DEFAULT_GET_URL_EXPIRY_SECONDS,
+  DEFAULT_LIST_MAX_KEYS,
   DEFAULT_PUT_URL_EXPIRY_SECONDS,
   S3_CLIENT,
 } from './storage.constants';
 import {
   CreatePresignedGetUrlOptions,
   CreatePresignedPutUrlOptions,
+  ObjectListEntry,
   PresignedUrlResult,
   StorageObjectMetadata,
 } from './storage.types';
@@ -167,6 +172,77 @@ export class StorageService {
         ContentType: contentType,
       }),
     );
+  }
+
+  /**
+   * Slice 11P — Production Transcoding Lifecycle: downloads an object
+   * directly to a local file path (unlike every other method here, which
+   * either returns a presigned URL for a CLIENT to use, or reads/writes a
+   * small in-memory buffer). Used ONLY by `TranscodeJobProcessor` to fetch
+   * `admin-media/<id>/source` into a fresh `fs.mkdtemp` temp directory
+   * before probing/transcoding — never `STORAGE_ROOT` (this method has no
+   * awareness of that path at all; it only ever writes to a caller-supplied
+   * `destPath`, exactly like `ThumbnailService`'s existing temp-directory
+   * discipline).
+   *
+   * The AWS SDK v3 `GetObjectCommand` response's `Body` is a Node.js
+   * `Readable` in this runtime (never buffered fully into memory here) —
+   * `stream/promises`' `pipeline` streams it directly to `destPath` and
+   * rejects if either side errors, so a failed/interrupted download never
+   * leaves a corrupt-but-present file silently treated as complete (the
+   * caller's own `finally`-block temp cleanup still removes whatever partial
+   * bytes did land). Every test that exercises this method injects a mocked
+   * `client.send` resolving `{ Body: Readable.from([...]) }` — no real
+   * network call.
+   */
+  async downloadObjectToFile(key: string, destPath: string): Promise<void> {
+    const response = (await this.client.send(
+      new GetObjectCommand({
+        Bucket: this.storageConfig.bucket,
+        Key: key,
+      }),
+    )) as { Body?: NodeJS.ReadableStream };
+
+    if (!response.Body) {
+      throw new Error(`GetObject for key "${key}" returned no body`);
+    }
+
+    await pipeline(response.Body, createWriteStream(destPath));
+  }
+
+  /**
+   * Slice 11P: a narrow, BOUNDED (`maxKeys`, default
+   * `DEFAULT_LIST_MAX_KEYS`) `ListObjectsV2` wrapper — a single page, never
+   * paginated further (a deliberate simplicity/boundedness tradeoff:
+   * `TranscodeJanitorService`'s sweep is itself bounded per run and re-runs
+   * repeatedly, so a prefix with more than `maxKeys` objects is simply
+   * handled across multiple sweeps rather than this method ever looping
+   * unboundedly on a single call). Returns `{ key, lastModified }` pairs —
+   * `ListObjectsV2` already reports `LastModified` per entry at zero extra
+   * cost, which is exactly what the janitor's grace-window "how old is this
+   * generation's newest object" check needs without N additional `HeadObject`
+   * calls per candidate prefix.
+   */
+  async listObjectKeysByPrefix(
+    prefix: string,
+    maxKeys: number = DEFAULT_LIST_MAX_KEYS,
+  ): Promise<ObjectListEntry[]> {
+    const result = (await this.client.send(
+      new ListObjectsV2Command({
+        Bucket: this.storageConfig.bucket,
+        Prefix: prefix,
+        MaxKeys: maxKeys,
+      }),
+    )) as {
+      Contents?: { Key?: string; LastModified?: Date }[];
+    };
+
+    return (result.Contents ?? [])
+      .filter(
+        (entry): entry is { Key: string; LastModified?: Date } =>
+          typeof entry.Key === 'string',
+      )
+      .map((entry) => ({ key: entry.Key, lastModified: entry.LastModified }));
   }
 
   /**

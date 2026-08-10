@@ -48,7 +48,7 @@ describe('BullmqTranscodeQueueClient', () => {
   });
 
   it('constructs an IORedis client with lazyConnect + maxRetriesPerRequest: null, and a Queue named "media-transcode"', () => {
-    new BullmqTranscodeQueueClient('redis://example.invalid:6379');
+    new BullmqTranscodeQueueClient('redis://example.invalid:6379', 3);
 
     expect(mockIORedisConstructor).toHaveBeenCalledWith(
       'redis://example.invalid:6379',
@@ -69,6 +69,7 @@ describe('BullmqTranscodeQueueClient', () => {
   it('add() calls the underlying Queue.add with the exact jobId and payload', async () => {
     const client = new BullmqTranscodeQueueClient(
       'redis://example.invalid:6379',
+      3,
     );
     const payload: TranscodeJobPayload = {
       videoId: 'media-abc',
@@ -81,6 +82,30 @@ describe('BullmqTranscodeQueueClient', () => {
       TRANSCODE_QUEUE_NAME,
       payload,
       expect.objectContaining({ jobId: 'media-abc:1' }),
+    );
+  });
+
+  // Slice 11P: bounded retry with exponential backoff, sourced from
+  // `TranscodeConfig.maxAttempts` at construction time.
+  it('add() passes the constructor-supplied maxAttempts as BullMQ attempts, with exponential backoff', async () => {
+    const client = new BullmqTranscodeQueueClient(
+      'redis://example.invalid:6379',
+      5,
+    );
+    const payload: TranscodeJobPayload = {
+      videoId: 'media-abc',
+      processingVersion: 1,
+    };
+
+    await client.add('media-abc:1', payload);
+
+    expect(mockQueueAdd).toHaveBeenCalledWith(
+      TRANSCODE_QUEUE_NAME,
+      payload,
+      expect.objectContaining({
+        attempts: 5,
+        backoff: { type: 'exponential', delay: 60_000 },
+      }),
     );
   });
 });

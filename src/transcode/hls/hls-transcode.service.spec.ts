@@ -154,4 +154,46 @@ describe('HlsTranscodeService', () => {
       service.transcodeAll('/src.mp4', tempDir, ladder),
     ).rejects.toBeInstanceOf(AppException);
   });
+
+  // Slice 11P: the optional per-rung step-update hook.
+  describe('onRungStart hook (Slice 11P)', () => {
+    it('invokes onRungStart with each rung name, in order, before that rung encodes', async () => {
+      const { client: encoder } = fakeSuccessfulEncoder();
+      const service = new HlsTranscodeService(encoder);
+      const ladder: RenditionLadderResult = {
+        rungs: [
+          rung('360p'),
+          rung('540p', { name: '540p', width: 540, height: 960 }),
+        ],
+        fps: 30,
+        includeAudio: true,
+        effectiveWidth: 1080,
+        effectiveHeight: 1920,
+      };
+      const seen: string[] = [];
+
+      await service.transcodeAll('/src.mp4', tempDir, ladder, (name) => {
+        seen.push(name);
+        return Promise.resolve();
+      });
+
+      expect(seen).toEqual(['360p', '540p']);
+    });
+
+    it('never breaks transcodeAll when no hook is passed (backward compatible)', async () => {
+      const { client: encoder } = fakeSuccessfulEncoder();
+      const service = new HlsTranscodeService(encoder);
+      const ladder: RenditionLadderResult = {
+        rungs: [rung('360p')],
+        fps: 30,
+        includeAudio: true,
+        effectiveWidth: 1080,
+        effectiveHeight: 1920,
+      };
+
+      await expect(
+        service.transcodeAll('/src.mp4', tempDir, ladder),
+      ).resolves.toHaveLength(1);
+    });
+  });
 });

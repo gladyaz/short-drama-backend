@@ -20,6 +20,15 @@ import { THUMBNAIL_CLIENT } from './thumbnail.types';
     ThumbnailService,
     { provide: THUMBNAIL_CLIENT, useClass: FfmpegThumbnailCliClient },
   ],
-  exports: [ThumbnailService],
+  // Slice 11P: `THUMBNAIL_CLIENT` is additionally exported (alongside the
+  // existing `ThumbnailService`) so `TranscodeJobProcessor` can inject the
+  // raw ffmpeg-thumbnail client directly — it needs to upload the generated
+  // poster under the admin-media `thumbnail` key convention
+  // (`buildThumbnailObjectKey`, matching `AdminMediaService
+  // .createThumbnailUpload`'s existing manual-upload key), not
+  // `ThumbnailService.generate`'s own DIFFERENT `thumbnails/<id>/<variant>.jpg`
+  // key convention (`buildThumbnailStorageKey`) — see
+  // `TranscodeJobProcessor`'s doc comment for the full reasoning.
+  exports: [ThumbnailService, THUMBNAIL_CLIENT],
 })
 export class ThumbnailsModule {}

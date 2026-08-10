@@ -197,4 +197,306 @@ describe('TranscodeIntentService', () => {
       expect(affected).toBe(0);
     });
   });
+
+  // Slice 11P — the worker-facing CAS methods.
+  describe('claimRunning', () => {
+    it('claims queued -> running, setting processingStartedAt/processingStep/processingAttempts', async () => {
+      const id = `${testIdPrefix}-claim-ok`;
+      await createFixtureVideo(id, {
+        processingState: 'queued',
+        processingVersion: 1,
+      });
+
+      const affected = await service.claimRunning(id, 1);
+
+      expect(affected).toBe(1);
+      const row = await prisma.video.findUniqueOrThrow({ where: { id } });
+      expect(row.processingState).toBe('running');
+      expect(row.processingStep).toBe('probing');
+      expect(row.processingAttempts).toBe(1);
+      expect(row.processingStartedAt).not.toBeNull();
+    });
+
+    it('a second concurrent claim attempt affects zero rows (only one worker can win)', async () => {
+      const id = `${testIdPrefix}-claim-race`;
+      await createFixtureVideo(id, {
+        processingState: 'queued',
+        processingVersion: 1,
+      });
+
+      const first = await service.claimRunning(id, 1);
+      const second = await service.claimRunning(id, 1);
+
+      expect(first).toBe(1);
+      expect(second).toBe(0);
+      const row = await prisma.video.findUniqueOrThrow({ where: { id } });
+      expect(row.processingAttempts).toBe(1); // not double-incremented
+    });
+
+    it('a stale expected version affects zero rows and leaves the row queued', async () => {
+      const id = `${testIdPrefix}-claim-stale`;
+      await createFixtureVideo(id, {
+        processingState: 'queued',
+        processingVersion: 2,
+      });
+
+      const affected = await service.claimRunning(id, 1);
+
+      expect(affected).toBe(0);
+      const row = await prisma.video.findUniqueOrThrow({ where: { id } });
+      expect(row.processingState).toBe('queued');
+    });
+
+    it('refuses to claim a row that is not currently "queued" (e.g. already running)', async () => {
+      const id = `${testIdPrefix}-claim-not-queued`;
+      await createFixtureVideo(id, {
+        processingState: 'running',
+        processingVersion: 1,
+      });
+
+      const affected = await service.claimRunning(id, 1);
+
+      expect(affected).toBe(0);
+    });
+  });
+
+  describe('updateStep', () => {
+    it('updates processingStep for the current running generation', async () => {
+      const id = `${testIdPrefix}-step-ok`;
+      await createFixtureVideo(id, {
+        processingState: 'running',
+        processingVersion: 1,
+      });
+
+      const affected = await service.updateStep(id, 1, '360p');
+
+      expect(affected).toBe(1);
+      const row = await prisma.video.findUniqueOrThrow({ where: { id } });
+      expect(row.processingStep).toBe('360p');
+    });
+
+    it('affects zero rows for a stale version (superseded mid-run)', async () => {
+      const id = `${testIdPrefix}-step-stale`;
+      await createFixtureVideo(id, {
+        processingState: 'running',
+        processingVersion: 2,
+      });
+
+      const affected = await service.updateStep(id, 1, '360p');
+
+      expect(affected).toBe(0);
+    });
+
+    it('affects zero rows when the row is not currently "running"', async () => {
+      const id = `${testIdPrefix}-step-not-running`;
+      await createFixtureVideo(id, {
+        processingState: 'queued',
+        processingVersion: 1,
+      });
+
+      const affected = await service.updateStep(id, 1, '360p');
+
+      expect(affected).toBe(0);
+    });
+  });
+
+  describe('promoteIfCurrent', () => {
+    const promotion = {
+      hlsMasterKey: 'admin-media/x/hls/v1-a1-uuid/master.m3u8',
+      hlsRenditions: [
+        { name: '360p', width: 360, height: 640, bandwidth: 1_000_000 },
+      ],
+      transcodeProfileVersion: 'ladder-v1',
+    };
+
+    it('promotes a running row at the expected version to ready, setting hlsMasterKey/hlsRenditions/profileVersion', async () => {
+      const id = `${testIdPrefix}-promote-ok`;
+      await createFixtureVideo(id, {
+        processingState: 'running',
+        processingVersion: 1,
+      });
+
+      const affected = await service.promoteIfCurrent(id, 1, promotion);
+
+      expect(affected).toBe(1);
+      const row = await prisma.video.findUniqueOrThrow({ where: { id } });
+      expect(row.processingState).toBe('ready');
+      expect(row.processingStep).toBeNull();
+      expect(row.hlsMasterKey).toBe(promotion.hlsMasterKey);
+      expect(row.hlsRenditions).toEqual(promotion.hlsRenditions);
+      expect(row.transcodeProfileVersion).toBe('ladder-v1');
+      expect(row.processingCompletedAt).not.toBeNull();
+    });
+
+    // Proof 4: a stale version must never flip the live output.
+    it('a stale expected version affects zero rows and leaves hlsMasterKey untouched', async () => {
+      const id = `${testIdPrefix}-promote-stale`;
+      await createFixtureVideo(id, {
+        processingState: 'running',
+        processingVersion: 2,
+      });
+      await prisma.video.update({
+        where: { id },
+        data: { hlsMasterKey: 'admin-media/x/hls/v1-old/master.m3u8' },
+      });
+
+      const affected = await service.promoteIfCurrent(id, 1, promotion);
+
+      expect(affected).toBe(0);
+      const row = await prisma.video.findUniqueOrThrow({ where: { id } });
+      expect(row.hlsMasterKey).toBe('admin-media/x/hls/v1-old/master.m3u8');
+      expect(row.processingState).toBe('running');
+    });
+
+    it('refuses to promote a row that is not currently "running"', async () => {
+      const id = `${testIdPrefix}-promote-not-running`;
+      await createFixtureVideo(id, {
+        processingState: 'queued',
+        processingVersion: 1,
+      });
+
+      const affected = await service.promoteIfCurrent(id, 1, promotion);
+
+      expect(affected).toBe(0);
+    });
+  });
+
+  describe('failWithError', () => {
+    it('fails a running row at the expected version, recording the error code/message', async () => {
+      const id = `${testIdPrefix}-fail-ok`;
+      await createFixtureVideo(id, {
+        processingState: 'running',
+        processingVersion: 1,
+      });
+
+      const affected = await service.failWithError(
+        id,
+        1,
+        'TRANSCODE_FAILED',
+        'ffmpeg exited with a non-zero status for rung "360p"',
+      );
+
+      expect(affected).toBe(1);
+      const row = await prisma.video.findUniqueOrThrow({ where: { id } });
+      expect(row.processingState).toBe('failed');
+      expect(row.processingStep).toBeNull();
+      expect(row.processingErrorCode).toBe('TRANSCODE_FAILED');
+      expect(row.processingErrorMessage).toBe(
+        'ffmpeg exited with a non-zero status for rung "360p"',
+      );
+      expect(row.processingCompletedAt).not.toBeNull();
+    });
+
+    it('a stale expected version affects zero rows', async () => {
+      const id = `${testIdPrefix}-fail-stale`;
+      await createFixtureVideo(id, {
+        processingState: 'running',
+        processingVersion: 2,
+      });
+
+      const affected = await service.failWithError(
+        id,
+        1,
+        'TRANSCODE_FAILED',
+        'stale attempt',
+      );
+
+      expect(affected).toBe(0);
+    });
+  });
+
+  describe('recordSourceProbe', () => {
+    it('persists probed source metadata for a running row at the expected version', async () => {
+      const id = `${testIdPrefix}-probe-ok`;
+      await createFixtureVideo(id, {
+        processingState: 'running',
+        processingVersion: 1,
+      });
+
+      const affected = await service.recordSourceProbe(id, 1, {
+        width: 1080,
+        height: 1920,
+        durationSeconds: 12.4,
+        fps: 29.97,
+      });
+
+      expect(affected).toBe(1);
+      const row = await prisma.video.findUniqueOrThrow({ where: { id } });
+      expect(row.sourceWidth).toBe(1080);
+      expect(row.sourceHeight).toBe(1920);
+      expect(row.sourceDurationSeconds).toBe(12);
+      expect(row.sourceFps).toBeCloseTo(29.97);
+    });
+  });
+
+  describe('recordIntent (Slice 11P: transactional intent primitive)', () => {
+    it('behaves identically to the write half of requestProcessing when called standalone', async () => {
+      const id = `${testIdPrefix}-record-intent-standalone`;
+      await createFixtureVideo(id);
+
+      const version = await service.recordIntent(prisma, id);
+
+      expect(version).toBe(1);
+      const row = await prisma.video.findUniqueOrThrow({ where: { id } });
+      expect(row.processingState).toBe('queued');
+      expect(row.processingVersion).toBe(1);
+    });
+
+    it('runs inside a caller-owned $transaction and is rolled back if the transaction later throws', async () => {
+      const id = `${testIdPrefix}-record-intent-rollback`;
+      await createFixtureVideo(id);
+
+      await expect(
+        prisma.$transaction(async (tx) => {
+          await service.recordIntent(tx, id);
+          throw new Error('simulated failure after the intent write');
+        }),
+      ).rejects.toThrow('simulated failure after the intent write');
+
+      const row = await prisma.video.findUniqueOrThrow({ where: { id } });
+      // Rolled back — the transaction never committed.
+      expect(row.processingState).toBeNull();
+      expect(row.processingVersion).toBe(0);
+    });
+
+    it('resets processingStep/processingAttempts/error fields to their fresh-generation values', async () => {
+      const id = `${testIdPrefix}-record-intent-reset`;
+      await createFixtureVideo(id);
+      await prisma.video.update({
+        where: { id },
+        data: {
+          processingState: 'failed',
+          processingVersion: 1,
+          processingStep: null,
+          processingAttempts: 3,
+          processingErrorCode: 'TRANSCODE_FAILED',
+          processingErrorMessage: 'previous generation failure',
+        },
+      });
+
+      const version = await service.recordIntent(prisma, id);
+
+      expect(version).toBe(2);
+      const row = await prisma.video.findUniqueOrThrow({ where: { id } });
+      expect(row.processingState).toBe('queued');
+      expect(row.processingStep).toBeNull();
+      expect(row.processingAttempts).toBe(0);
+      expect(row.processingErrorCode).toBeNull();
+      expect(row.processingErrorMessage).toBeNull();
+    });
+  });
+
+  describe('enqueueBestEffort', () => {
+    it('enqueues with the deterministic jobId and never throws on a queue failure', async () => {
+      const id = `${testIdPrefix}-enqueue-best-effort`;
+      queue.add.mockRejectedValueOnce(new Error('ECONNREFUSED'));
+
+      await expect(service.enqueueBestEffort(id, 3)).resolves.toBeUndefined();
+
+      expect(queue.add).toHaveBeenCalledWith(`${id}:3`, {
+        videoId: id,
+        processingVersion: 3,
+      });
+    });
+  });
 });

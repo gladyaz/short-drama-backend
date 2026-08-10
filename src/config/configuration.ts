@@ -100,10 +100,57 @@ export interface StorageConfig {
  * harmless. Never logged anywhere (see `TranscodeReadinessService`, which
  * reports presence only, never the value).
  */
+/**
+ * Slice 11P — Production Transcoding Lifecycle (control workspace
+ * DECISIONS.md "2026-08-10 — Slice 11P APPROVED..." entry). Three additional
+ * tunables, all resolved unconditionally by this factory (mirroring
+ * `redisUrl`'s existing "read unconditionally, `env.validation.ts` decides
+ * what's required" split) but only ever consulted by code that itself is
+ * behind `TRANSCODE_ENABLED` — while the flag is `false` (this repo's only
+ * shipped state), none of these three values affects anything.
+ *
+ * Each has a documented, sane default (`DEFAULT_TRANSCODE_MAX_ATTEMPTS`,
+ * `DEFAULT_TRANSCODE_STALLED_AFTER_MINUTES`,
+ * `DEFAULT_TRANSCODE_CLEANUP_GRACE_MINUTES` below) and is OPTIONAL even when
+ * the flag is on — unlike `REDIS_URL`, an admin does not need to set any of
+ * these three just to turn transcoding on. `env.validation.ts`'s
+ * `validateTranscodeConfig` additionally fails boot loudly (only when the
+ * flag is `"true"`) if a PRESENT value for one of these three is not a valid
+ * positive integer — matching the 11G-3 conditional-validation pattern.
+ */
 export interface TranscodeConfig {
   enabled: boolean;
   redisUrl: string | undefined;
+  /** Hard cap on processing attempts per generation before a job gives up permanently (`failed`, `MAX_ATTEMPTS_EXCEEDED`). */
+  maxAttempts: number;
+  /** How long a row may sit in `processingState = "running"` before `TranscodeJanitorService` treats it as stalled and CAS-fails it (`STALE`). */
+  stalledAfterMinutes: number;
+  /**
+   * How long an orphaned/superseded HLS staging prefix must sit untouched
+   * before `TranscodeJanitorService` deletes it. Deliberately LONGER than
+   * the 30-60 minute playback-token TTL design target for the future 11Q
+   * gateway (proposal §9, decision 8) — see
+   * `TranscodeJanitorService`'s doc comment — so a generation a mobile client
+   * may still hold a live authorization token for is never deleted out from
+   * under it, even though this slice never issues such a token itself.
+   */
+  cleanupGraceMinutes: number;
 }
+
+/** Slice 11P default for `TranscodeConfig.maxAttempts` (proposal §8: "3 attempts"). */
+export const DEFAULT_TRANSCODE_MAX_ATTEMPTS = 3;
+
+/** Slice 11P default for `TranscodeConfig.stalledAfterMinutes`. */
+export const DEFAULT_TRANSCODE_STALLED_AFTER_MINUTES = 30;
+
+/**
+ * Slice 11P default for `TranscodeConfig.cleanupGraceMinutes` — explicitly
+ * longer than the 30-60 minute playback-token TTL design target
+ * (proposal §9, decision 8) so a generation a viewer may still be mid-playback
+ * on is never grace-deleted out from under them once that future gateway
+ * ships.
+ */
+export const DEFAULT_TRANSCODE_CLEANUP_GRACE_MINUTES = 120;
 
 export interface RootConfig {
   app: AppConfig;
@@ -140,8 +187,41 @@ export default (): RootConfig => ({
   transcode: {
     enabled: process.env.TRANSCODE_ENABLED === 'true',
     redisUrl: process.env.REDIS_URL,
+    maxAttempts: parsePositiveIntEnv(
+      process.env.TRANSCODE_MAX_ATTEMPTS,
+      DEFAULT_TRANSCODE_MAX_ATTEMPTS,
+    ),
+    stalledAfterMinutes: parsePositiveIntEnv(
+      process.env.TRANSCODE_STALLED_AFTER_MINUTES,
+      DEFAULT_TRANSCODE_STALLED_AFTER_MINUTES,
+    ),
+    cleanupGraceMinutes: parsePositiveIntEnv(
+      process.env.TRANSCODE_CLEANUP_GRACE_MINUTES,
+      DEFAULT_TRANSCODE_CLEANUP_GRACE_MINUTES,
+    ),
   },
 });
+
+/**
+ * Slice 11P: permissive parse — an absent/blank value falls back to
+ * `fallback` silently (the common, flag-off case), and the same fallback is
+ * used for a present-but-invalid value too. This factory is deliberately NOT
+ * where an invalid value fails boot — `env.validation.ts`'s
+ * `validateTranscodeConfig` is (and only when `TRANSCODE_ENABLED=true`),
+ * matching `resolveStorageDriver`'s existing "validate elsewhere, resolve
+ * permissively here" split immediately below.
+ */
+function parsePositiveIntEnv(
+  value: string | undefined,
+  fallback: number,
+): number {
+  if (value === undefined || value.trim().length === 0) {
+    return fallback;
+  }
+
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
 
 /**
  * Phase 11, work unit 11G-3: resolves `STORAGE_DRIVER` unset/empty/`local`

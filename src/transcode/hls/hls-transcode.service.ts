@@ -42,11 +42,24 @@ export class HlsTranscodeService {
     sourcePath: string,
     packageRoot: string,
     ladder: RenditionLadderResult,
+    /**
+     * Slice 11P: an optional hook invoked BEFORE each rung's encode starts —
+     * `TranscodeJobProcessor` uses this to record `processingStep = "<rung
+     * name>"` (e.g. `"360p"`) so operational progress is visible mid-run,
+     * without this class needing any awareness of `Video`/Prisma at all.
+     * Never called by any 11O caller (all pass no 4th argument, unchanged
+     * behavior).
+     */
+    onRungStart?: (rungName: string) => Promise<void>,
   ): Promise<HlsRungArtifact[]> {
     const artifacts: HlsRungArtifact[] = [];
 
     for (const rung of ladder.rungs) {
       const outputDir = join(packageRoot, rung.name);
+
+      if (onRungStart) {
+        await onRungStart(rung.name);
+      }
 
       try {
         await this.encoderClient.encodeRung({

@@ -234,6 +234,52 @@ function validateTranscodeConfig(config: Record<string, unknown>): void {
       'REDIS_URL must be a valid redis:// or rediss:// URL when TRANSCODE_ENABLED=true (shape check only — no network connection is made).',
     );
   }
+
+  // Slice 11P: TRANSCODE_MAX_ATTEMPTS / TRANSCODE_STALLED_AFTER_MINUTES /
+  // TRANSCODE_CLEANUP_GRACE_MINUTES are all OPTIONAL (each has a documented
+  // default in `configuration.ts`) even when TRANSCODE_ENABLED=true — unlike
+  // REDIS_URL above, nothing here requires them to be SET. What this DOES
+  // require, mirroring `validateStorageDriver`'s conditional-shape-check
+  // pattern: if one IS present, it must parse as a positive integer, or boot
+  // fails loudly and names the offending variable (never echoes the actual
+  // malformed value, matching every other error in this file).
+  assertPositiveIntEnvIfPresent(config, 'TRANSCODE_MAX_ATTEMPTS');
+  assertPositiveIntEnvIfPresent(config, 'TRANSCODE_STALLED_AFTER_MINUTES');
+  assertPositiveIntEnvIfPresent(config, 'TRANSCODE_CLEANUP_GRACE_MINUTES');
+}
+
+/** Shape check only — never resolves DNS or opens a connection. */
+function assertPositiveIntEnvIfPresent(
+  config: Record<string, unknown>,
+  key: string,
+): void {
+  const raw = config[key];
+
+  if (raw === undefined || raw === null) {
+    return; // genuinely unset — nothing to validate.
+  }
+
+  // `raw` is narrowed to `string` below (never calling `String()` on an
+  // arbitrary `unknown` value, which would trip `no-base-to-string` — env
+  // config values are always strings in practice; a non-string here is
+  // itself an invalid/unexpected shape, not something to coerce).
+  if (typeof raw !== 'string') {
+    throw new Error(
+      `Invalid ${key}: must be a positive integer when set (see .env.example). TRANSCODE_ENABLED=true is active, so this value is read.`,
+    );
+  }
+
+  if (raw.trim().length === 0) {
+    return; // blank string — treated as "not set".
+  }
+
+  const parsed = Number(raw);
+
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(
+      `Invalid ${key}: must be a positive integer when set (see .env.example). TRANSCODE_ENABLED=true is active, so this value is read.`,
+    );
+  }
 }
 
 /** Shape check only — never resolves DNS or opens a connection. */

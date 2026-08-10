@@ -3,15 +3,29 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { TranscodeConfig } from '../config/configuration';
 import { TranscodeReadinessService } from './transcode-readiness.service';
 
+/**
+ * Slice 11P: this file only ever exercises `enabled`/`redisUrl` (the only
+ * two fields `TranscodeReadinessService` reads) — `Partial<TranscodeConfig>`
+ * plus these fixed defaults for the three 11P-added tunables keeps every
+ * existing call site below unchanged.
+ */
 async function buildService(
-  transcodeConfig: TranscodeConfig,
+  transcodeConfig: Partial<TranscodeConfig> &
+    Pick<TranscodeConfig, 'enabled' | 'redisUrl'>,
 ): Promise<TranscodeReadinessService> {
+  const fullConfig: TranscodeConfig = {
+    maxAttempts: 3,
+    stalledAfterMinutes: 30,
+    cleanupGraceMinutes: 120,
+    ...transcodeConfig,
+  };
+
   const module: TestingModule = await Test.createTestingModule({
     providers: [
       TranscodeReadinessService,
       {
         provide: ConfigService,
-        useValue: { get: () => transcodeConfig },
+        useValue: { get: () => fullConfig },
       },
     ],
   }).compile();

@@ -86,6 +86,13 @@ type VideoRow = {
   accessTierOverride: string | null;
   expectedSizeBytes: number | null;
   expectedContentType: string | null;
+  /**
+   * Slice 11P: read (never written) by `assertHlsReadyForPublish` below —
+   * see that method's doc comment. Not surfaced on `AdminMediaDto` by this
+   * slice (an admin processing-status UI is 11U's scope, not 11P's).
+   */
+  processingState: string | null;
+  hlsMasterKey: string | null;
 };
 
 /**
@@ -276,51 +283,111 @@ export class AdminMediaService {
       MediaLifecycleState.READY,
     );
 
-    const updated = await this.prisma.video.update({
-      where: { id },
-      data: {
-        lifecycleState: nextState,
-        durationSeconds: dto.durationSeconds ?? media.durationSeconds,
-        width: dto.width ?? media.width,
-        height: dto.height ?? media.height,
-      },
-    });
+    const readyUpdateData = {
+      lifecycleState: nextState,
+      durationSeconds: dto.durationSeconds ?? media.durationSeconds,
+      width: dto.width ?? media.width,
+      height: dto.height ?? media.height,
+    };
 
-    // Slice 11N: AFTER the verification above and the ready-transition
-    // succeed — IF AND ONLY IF TRANSCODE_ENABLED=true — request HLS
-    // processing. `isTranscodeEnabled` is `false` whenever `configService`
+    // Slice 11N/11P: `isTranscodeEnabled` is `false` whenever `configService`
     // is absent (every test that does not wire `ConfigModule`/
     // `TranscodeModule`, matching this constructor's `@Optional()` doc
     // comment) or when `TRANSCODE_ENABLED` did not resolve to exactly
-    // `true` — in both cases this whole block is skipped and
-    // `completeUpload`'s behavior/return value is BYTE-IDENTICAL to before
-    // this slice, which is what every pre-existing complete-upload unit/e2e
-    // test asserts, unchanged.
-    //
-    // `requestProcessing` itself never throws for a queue/Redis failure (see
-    // its own doc comment) — it only throws if its own DB write fails. The
-    // try/catch here is an additional, deliberately conservative layer on
-    // top of that: `completeUpload`'s own DB write (the `ready` transition
-    // above) has ALREADY succeeded and been persisted by this point, so a
-    // failure to even START a transcode request must never surface as a
-    // failure of the upload-completion call the admin is waiting on —
-    // matching the proposal's designed "Redis temporarily down ... upload
-    // flow never breaks" failure behavior (§14).
+    // `true` — in both cases the plain, non-transactional branch below runs
+    // and `completeUpload`'s behavior/return value is BYTE-IDENTICAL to
+    // before this slice (proof 16 / the 2026-08-10 Slice 11P approval's
+    // "flag off ⇒ byte-identical existing behavior" requirement), which is
+    // what every pre-existing complete-upload unit/e2e test still asserts,
+    // completely unmodified by this slice.
     const isTranscodeEnabled =
       this.configService?.get('transcode', { infer: true })?.enabled === true;
 
+    let updated: VideoRow;
+    let processingVersion: number | undefined;
+
     if (isTranscodeEnabled && this.transcodeIntentService) {
+      const transcodeIntentService = this.transcodeIntentService;
+
+      // Slice 11P — RESOLVES the carried 11N/11O REQUIRED concern (control
+      // workspace DECISIONS.md, "2026-08-10 — Slice 11P APPROVED..." entry,
+      // binding constraint 5): the durable DB intent
+      // (`TranscodeIntentService.recordIntent` — processingVersion
+      // increment + processingState="queued" + attempts/step/error fields
+      // reset) is created INSIDE the SAME `prisma.$transaction` as this
+      // upload-completion ready-transition. Either BOTH writes commit
+      // together, or NEITHER does — a durable-intent failure can never
+      // leave the row silently `ready` with no processing ever requested
+      // (a "ready but never queued" state, which the approval explicitly
+      // forbids), and it can never leave a "half-completed" row either.
+      //
+      // Idempotency is preserved exactly as before: `assertTransition`
+      // above already guarantees this whole block only runs on a genuine
+      // `draft -> ready` transition — a REPEATED `completeUpload` call
+      // against an already-`ready` (or later) row throws
+      // `INVALID_MEDIA_LIFECYCLE_TRANSITION` before this transaction is ever
+      // opened, so a retried completion call can never double-increment
+      // `processingVersion` or enqueue a second generation for the same
+      // upload.
       try {
-        await this.transcodeIntentService.requestProcessing(id);
+        const result = await this.prisma.$transaction(async (tx) => {
+          const readyRow = await tx.video.update({
+            where: { id },
+            data: readyUpdateData,
+          });
+          const version = await transcodeIntentService.recordIntent(tx, id);
+          return { readyRow, version };
+        });
+
+        updated = result.readyRow;
+        processingVersion = result.version;
       } catch (error) {
-        this.logger.warn(
+        // Loud and explicit, per the approval: the transaction rolled back
+        // (or never committed), so `lifecycleState` is STILL `draft` — this
+        // is never treated as "scheduled". The client may safely retry this
+        // same `complete-upload` call once the underlying issue (e.g. a
+        // transient database failure) is resolved.
+        this.logger.error(
           redactSensitiveText(
-            `Failed to request HLS processing for media "${id}" after a ` +
-              `successful upload completion — the upload itself still ` +
-              `succeeded: ${String(error)}`,
+            `Failed to record HLS processing intent for media "${id}" ` +
+              `during upload completion — the completion was NOT applied ` +
+              `(the transaction rolled back): ${String(error)}`,
           ),
         );
+
+        throw new AppException(
+          AppErrorCode.MEDIA_PROCESSING_INTENT_FAILED,
+          'Failed to record HLS processing intent for this upload ' +
+            'completion — the upload was not marked ready. Retry ' +
+            'completion once the underlying issue is resolved.',
+          HttpStatus.INTERNAL_SERVER_ERROR,
+        );
       }
+    } else {
+      updated = await this.prisma.video.update({
+        where: { id },
+        data: readyUpdateData,
+      });
+    }
+
+    // Enqueue stays POST-COMMIT and best-effort (proposal §8 / 2026-08-10
+    // approval: "Enqueue stays post-commit best-effort"): the durable intent
+    // above has already committed by this point, so a Redis/enqueue failure
+    // here can never lose the intent — `TranscodeReconcilerService.reconcile`
+    // recovers a "queued but never enqueued" row on its next sweep (11N,
+    // extended for 11P — see that service's own doc comment). This mirrors
+    // the proposal's "Redis temporarily down ... upload flow never breaks"
+    // failure behavior (§14): a failure to even enqueue must never surface as
+    // a failure of the upload-completion call the admin is waiting on.
+    if (
+      isTranscodeEnabled &&
+      this.transcodeIntentService &&
+      processingVersion !== undefined
+    ) {
+      await this.transcodeIntentService.enqueueBestEffort(
+        id,
+        processingVersion,
+      );
     }
 
     return toAdminMediaDto(updated);
@@ -503,12 +570,45 @@ export class AdminMediaService {
       to,
     );
 
+    if (to === MediaLifecycleState.PUBLISHED) {
+      this.assertHlsReadyForPublish(media);
+    }
+
     const updated = await this.prisma.video.update({
       where: { id },
       data: { lifecycleState: nextState },
     });
 
     return toAdminMediaDto(updated);
+  }
+
+  /**
+   * Slice 11P — publish gate (2026-08-10 approval, binding constraint 10):
+   * an ADDITIVE guard on top of `MediaLifecycleService`'s existing editorial
+   * transition rules, checked ONLY for rows where `processingState IS NOT
+   * NULL` (an HLS-pipeline row). Such a row may only publish once
+   * `processingState === "ready"` AND `hlsMasterKey` is non-null — i.e. a
+   * fully verified, promoted HLS generation actually exists.
+   *
+   * Rows with `processingState === null` (every legacy/local row, and the
+   * pre-HLS published R2 fixture row) are COMPLETELY unaffected: this method
+   * returns immediately for them, so their publish/unpublish behavior stays
+   * byte-identical to before this slice — the old catalog is never suddenly
+   * required to have HLS output.
+   */
+  private assertHlsReadyForPublish(media: VideoRow): void {
+    if (media.processingState === null) {
+      return;
+    }
+
+    if (media.processingState !== 'ready' || !media.hlsMasterKey) {
+      throw new AppException(
+        AppErrorCode.HLS_NOT_READY_FOR_PUBLISH,
+        `Media "${media.id}" cannot be published until HLS processing is ` +
+          `ready (processingState=${JSON.stringify(media.processingState)})`,
+        HttpStatus.CONFLICT,
+      );
+    }
   }
 
   private async createAssetUpload(

@@ -68,6 +68,9 @@ mobile app (Expo/React Native)  -->  NestJS backend  -->  local company storage 
 | `ADS_GRACE_VIDEOS`    | Optional. Lifetime video watches exempt from ads — added in Phase 15A, slice 15A-S1. See "Ads config API" below. |
 | `TRANSCODE_ENABLED`   | Optional. `true`/`false` (default `false`) feature flag for the HLS transcode-request queue — added in Slice 11N. See "HLS transcode queue foundation" below. |
 | `REDIS_URL`           | Required only when `TRANSCODE_ENABLED=true`; unused/optional otherwise — added in Slice 11N. See "HLS transcode queue foundation" below. |
+| `TRANSCODE_MAX_ATTEMPTS` | Optional (default `3`). Retry cap per processing generation — added in Slice 11P. See "Production transcoding lifecycle" below. |
+| `TRANSCODE_STALLED_AFTER_MINUTES` | Optional (default `30`). Stalled-`running`-row detection window — added in Slice 11P. See "Production transcoding lifecycle" below. |
+| `TRANSCODE_CLEANUP_GRACE_MINUTES` | Optional (default `120`). Orphaned-HLS-staging cleanup grace window — added in Slice 11P. See "Production transcoding lifecycle" below. |
 
 Configuration is validated at startup: the app refuses to start if any
 required variable is missing, or if `STORAGE_ROOT` does not exist / is not a
@@ -1870,6 +1873,259 @@ optional at the code level for the default Queue/Worker backend), so
 merely importing anything from `bullmq` throws `Cannot find module
 'ioredis'` without it installed — confirmed empirically before deciding to
 add it.
+
+## Production transcoding lifecycle (Slice 11P)
+
+Approved per control workspace `DECISIONS.md`, "2026-08-10 — Slice 11P
+APPROVED..."; architecture: `proposals/phase-11-hls-pipeline-proposal.md`
+§6–§8, §14. Turns the Slice 11O proven local FFmpeg/HLS pipeline into a
+production consume path: real worker job processing, versioned/immutable
+output + atomic pointer flip, bounded retry with backoff, crash/stalled
+recovery, grace-aware orphan cleanup, and a publish gate — production
+transcoding stays **disabled by default** throughout (`TRANSCODE_ENABLED`
+still ships `false` everywhere real).
+
+### Schema (additive, reversible)
+
+`Video` gains 13 nullable/defaulted columns, all written EXCLUSIVELY by this
+slice's code (never by 11N/11O): `hlsMasterKey String?` (the live pointer —
+written only by the promotion CAS), `processingStep String?` (display-only
+progress detail within `running`), `processingErrorCode String?` /
+`processingErrorMessage String?` (bounded, secret-free failure detail),
+`processingAttempts Int @default(0)` (per-generation retry counter),
+`processingStartedAt DateTime?` / `processingCompletedAt DateTime?`
+(telemetry timestamps), `sourceWidth Int?` / `sourceHeight Int?` /
+`sourceDurationSeconds Int?` / `sourceFps Float?` (persisted `ffprobe`
+results), `hlsRenditions Json?` (`[{name,width,height,bandwidth}]` for the
+CURRENT generation only), `transcodeProfileVersion String?` (e.g.
+`"ladder-v1"`, written at promotion). Migration:
+`prisma/migrations/20260810103917_add_transcode_lifecycle_columns`, applied
+to both `short_drama_dev` and `short_drama_test` — post-migration row-safety
+verified on both (every new column null/0 on every pre-existing row).
+
+**No `MediaProcessingJob` table** — re-affirming 11N's schema-minimality
+decision: per-attempt history is the columns above plus structured logs;
+Redis-loss recovery is `TranscodeReconcilerService` (11N, unchanged);
+stalled-job detection is `processingStartedAt` + `TRANSCODE_STALLED_AFTER_MINUTES`.
+
+**Rollback:** additive-only, safe to drop at any time (nothing outside this
+slice reads any of these columns):
+
+```sql
+ALTER TABLE "Video"
+  DROP COLUMN "hlsMasterKey",
+  DROP COLUMN "processingStep",
+  DROP COLUMN "processingErrorCode",
+  DROP COLUMN "processingErrorMessage",
+  DROP COLUMN "processingAttempts",
+  DROP COLUMN "processingStartedAt",
+  DROP COLUMN "processingCompletedAt",
+  DROP COLUMN "sourceWidth",
+  DROP COLUMN "sourceHeight",
+  DROP COLUMN "sourceDurationSeconds",
+  DROP COLUMN "sourceFps",
+  DROP COLUMN "hlsRenditions",
+  DROP COLUMN "transcodeProfileVersion";
+```
+
+### The resolved swallowed-intent concern (carried from 11N/11O)
+
+`AdminMediaService.completeUpload` now performs the ready-transition AND the
+durable processing intent write (`TranscodeIntentService.recordIntent` —
+`processingVersion` increment + `processingState="queued"` + attempts/step/
+error fields reset) inside ONE `prisma.$transaction`. Either BOTH commit or
+NEITHER does: a durable-intent failure throws `500
+MEDIA_PROCESSING_INTENT_FAILED` and the row stays exactly `draft` — never
+silently treated as scheduled, and never left "ready but never queued".
+Idempotency is unchanged: `MediaLifecycleService.assertTransition` already
+guarantees this block only runs on a genuine `draft -> ready` transition, so
+a retried `complete-upload` call against an already-`ready` row still 400s
+before the transaction is ever opened — no double-increment. Enqueue stays
+POST-COMMIT and best-effort (`TranscodeIntentService.enqueueBestEffort`) — a
+Redis/enqueue failure after a committed intent is recovered by the existing
+11N `TranscodeReconcilerService.reconcile` sweep. **Flag off (this repo's
+only shipped state) is byte-identical to pre-11P behavior** —
+`admin-media.service.spec.ts`/`admin-media-transcode.spec.ts` are completely
+unmodified and still green. See
+`src/media/admin-media-transcode-intent-failure.spec.ts` for the dedicated
+regression coverage.
+
+### Worker consume path
+
+`TranscodeJobProcessor.process({videoId, processingVersion})`
+(`src/transcode/transcode-job-processor.service.ts`) is the real per-job
+logic, framework-agnostic (no BullMQ import) so every test calls it directly
+with fakes:
+
+1. Load the row; abort `superseded` if it no longer exists, the version no
+   longer matches, or it is not currently `"queued"`.
+2. `TranscodeIntentService.claimRunning` — CAS `queued -> running`
+   (version+state guarded), setting `processingStartedAt`, incrementing
+   `processingAttempts`, clearing prior error fields.
+3. Attempt-cap check: over `TRANSCODE_MAX_ATTEMPTS` CAS-fails immediately
+   with `MAX_ATTEMPTS_EXCEEDED` — no FFmpeg work starts.
+4. Download `admin-media/<id>/source` (`StorageService.downloadObjectToFile`,
+   new narrow bounded method) to a fresh temp dir — `SOURCE_MISSING` on
+   failure.
+5. Probe (`HlsProbeClient`, Slice 11O) — `PROBE_FAILED` on failure; persist
+   via `TranscodeIntentService.recordSourceProbe` (also the first
+   post-download supersede checkpoint).
+6. Compute the ladder (`computeRenditionLadder`, Slice 11O, unchanged).
+7. Transcode every rung (`HlsTranscodeService.transcodeAll`, Slice 11O,
+   unchanged, extended with an optional `onRungStart` hook this slice added
+   for per-rung `processingStep` updates, e.g. `"360p"`) — one rung failing
+   fails the whole job (`TRANSCODE_FAILED`); a supersede detected mid-loop
+   aborts immediately.
+8. Build + write `master.m3u8` locally (`MasterPlaylistService`, unchanged).
+9. Upload every artifact to the fresh, immutable, UNIQUE staging prefix
+   `admin-media/<id>/hls/v<version>-a<attempt>-<uuid>/`
+   (`buildHlsStagingPrefix`), tracking every successfully uploaded key as it
+   happens (a mid-upload crash cleans up exactly what succeeded, never a
+   broad/prefix delete).
+10. Locally re-validate (`HlsPackageValidator`, unchanged) AND
+    bounded-HEAD-verify every uploaded key — either failure cleans up
+    staging and CAS-fails the row (`HLS_PACKAGE_VALIDATION_FAILED` /
+    `UPLOAD_VERIFICATION_FAILED`); neither ever reaches promotion.
+11. Poster: only if the row has no `thumbnailImageKey` yet — generates via
+    the injected `ThumbnailClient` (the same ffmpeg-backed client
+    `ThumbnailsModule` already provides) and uploads to
+    `admin-media/<id>/thumbnail` (`buildThumbnailObjectKey` — the SAME key
+    `AdminMediaService.createThumbnailUpload`'s manual-upload flow uses). A
+    poster failure FAILS THE WHOLE JOB (frozen arch: publish needs a
+    poster). An existing poster is never regenerated.
+12. FINAL ATOMIC PROMOTION (`TranscodeIntentService.promoteIfCurrent`) — the
+    ONLY write path for `hlsMasterKey`/`hlsRenditions`/
+    `transcodeProfileVersion`, version+state guarded. `0` rows affected ⇒
+    superseded at the last moment: does NOT promote, cleans this job's OWN
+    staging, and NEVER touches whatever generation is now live.
+
+Live/current generation is never written to or deleted by a job at any
+point.
+
+### Retry / backoff
+
+Bounded at `TRANSCODE_MAX_ATTEMPTS` (default 3) — enforced at TWO
+independent layers: BullMQ's own `attempts`/`backoff` job options (set at
+enqueue time by `BullmqTranscodeQueueClient.add`, exponential off a 60 s
+base — `TRANSCODE_BACKOFF_BASE_DELAY_MS`) drive redelivery timing, while
+`TranscodeJobProcessor`'s own `processingAttempts` DB counter + cap check is
+the AUTHORITATIVE source of truth for whether a generation is done retrying
+— decoupled on purpose, so a BullMQ-level/DB-level mismatch is harmless (an
+extra redundant delivery after the DB cap is hit is a cheap, idempotent
+`NOT_QUEUED` no-op). A non-final attempt failure uses
+`TranscodeIntentService.requeueForRetry` (`running -> queued`, NOT
+`processingAttempts`-reset) so the row is claimable again; the FINAL allowed
+attempt failing uses the terminal `failWithError` (`running -> failed`)
+instead, preserving the real failure reason rather than a generic
+`MAX_ATTEMPTS_EXCEEDED` on a wasted extra cycle.
+`src/worker/transcode-worker.ts`'s thin BullMQ `Worker` wiring decides, per
+delivery, whether to resolve (done) or re-throw (let BullMQ redeliver) based
+on `TranscodeJobOutcome.terminal` — see `shouldRethrowForBullMqRetry`.
+Retry NEVER re-uploads the source (it still exists in R2); every retry gets
+a brand-new immutable staging prefix (`v<version>-a<attempt>-<uuid>`, a
+fresh `attempt` number AND a fresh `randomUUID()`).
+
+### Crash / stalled recovery
+
+- **Worker process crash mid-job:** the row is left `"running"`.
+  `TranscodeJanitorService.sweepStaleRunning` (bounded, idempotent,
+  flag-gated) finds rows `"running"` longer than
+  `TRANSCODE_STALLED_AFTER_MINUTES` (default 30) and CAS-fails them
+  (`STALE`) — recoverable via a fresh processing request. This is a
+  DB-level backstop distinct from (and not replaced by) BullMQ's own
+  `stalledInterval` reclaim mechanism, which cannot cover total Redis data
+  loss.
+- **R2 upload failure / partial upload:** caught, staging cleaned via the
+  in-memory `uploadedKeys` list, row CAS-failed/requeued — the live
+  generation is untouched (proof 5, exercised by simulating a `putObject`
+  throw mid-upload in `transcode-job-processor.service.spec.ts`).
+- **Episode/row superseded mid-run** (a newer `requestProcessing` call bumped
+  the version): every CAS checkpoint in the pipeline detects this (affected
+  count 0) and aborts immediately, cleaning up its own staging.
+
+### Immutable prefix + pointer-flip model
+
+Every attempt writes to a brand-new, uniquely-named prefix
+(`src/transcode/hls-staging-key.util.ts`); the live set is identified ONLY
+by `Video.hlsMasterKey`, flipped by exactly one version+state-guarded CAS
+(`promoteIfCurrent`). Nothing is ever promoted by copying, and the published
+set is never overwritten in place — a partial/failed generation can
+structurally never become visible.
+
+### Cleanup / grace policy
+
+`TranscodeJanitorService.cleanupOrphanStaging` (bounded, idempotent,
+flag-gated, never destructive to live output): for TERMINAL rows
+(`processingState` `"ready"`/`"failed"`), lists objects under
+`admin-media/<id>/hls/` (`StorageService.listObjectKeysByPrefix`, new narrow
+bounded method — `ListObjectsV2`, single page), groups by generation prefix,
+and deletes any generation that is (a) NOT the active generation (derived
+from `hlsMasterKey`, a STRUCTURAL exclusion — the active prefix is never
+even considered a deletion candidate) AND (b) whose newest object is older
+than `TRANSCODE_CLEANUP_GRACE_MINUTES` (default **120** minutes —
+**deliberately longer** than the future 11Q playback-token TTL design target
+of 30–60 minutes, so a generation a viewer may still hold a live
+authorization token for is never deleted out from under them). Never
+touches `source`/`cover`/`thumbnail` keys (prefix-scoped to `hls/` only). A
+per-object delete failure is logged loudly and does not abort the rest of
+the sweep; an unswept object is picked up again on the next sweep.
+**Scheduling:** follows the Phase 13 (13A-B2) `RetentionSchedulerService`
+precedent (env-gated, OFF by default, the injectable methods are the real
+foundation) — reuses `TRANSCODE_ENABLED` itself as the single schedule gate
+(no second env var) rather than inventing one purely to control "does the
+interval exist" on top of a feature that is already off by default; the
+persistent worker mode below registers a `setInterval` sweep every 5
+minutes (`TRANSCODE_JANITOR_INTERVAL_MS`) only while it is running.
+
+### Publish gate
+
+`AdminMediaService`'s publish transition gains one additive guard
+(`assertHlsReadyForPublish`), checked ONLY for rows where
+`processingState IS NOT NULL` (an HLS-pipeline row): such a row may only
+publish once `processingState === "ready"` AND `hlsMasterKey` is non-null,
+or it is refused with `409 HLS_NOT_READY_FOR_PUBLISH`. Rows with
+`processingState === null` — every legacy/local row, and the pre-HLS
+published R2 fixture row — are completely unaffected; their publish/
+unpublish behavior is byte-identical to before this slice. See
+`src/media/admin-media-publish-gate.spec.ts`.
+
+### Persistent worker mode
+
+`src/worker/main.ts`'s `bootstrapWorker` now branches on
+`TRANSCODE_ENABLED`: `false` (default smoke mode, unchanged from Slice 11O)
+boots, logs readiness, closes, and exits `0`; `true` (isolated test/dev
+conditions only) starts the real BullMQ transcode worker
+(`src/worker/transcode-worker.ts`, concurrency 1) plus the periodic janitor
+sweep, and keeps the process alive until `SIGTERM`/`SIGINT` triggers a
+graceful shutdown. `WorkerModule` is a dynamic module
+(`WorkerModule.register()`): it reads `TRANSCODE_ENABLED` BEFORE building
+its `imports` and only includes `PrismaModule`/`TranscodeModule` (needed
+for `TranscodeJobProcessor`/`TranscodeJanitorService`'s real DB access in
+persistent mode) when the flag is exactly `true`. In the default flag-off
+smoke mode those modules are absent from the module graph entirely, so the
+boot has ZERO database dependency — it exits `0` even when `DATABASE_URL`
+is unreachable (the Slice 11O invariant, restored and regression-tested in
+`worker.module.spec.ts` after review fix cycle 1).
+
+### Config (`TRANSCODE_MAX_ATTEMPTS` / `TRANSCODE_STALLED_AFTER_MINUTES` / `TRANSCODE_CLEANUP_GRACE_MINUTES`)
+
+All three OPTIONAL, mirroring the 11G-3 conditional-validation pattern: each
+has a documented default (3 / 30 / 120) and is read unconditionally by
+`configuration.ts`'s factory, but `env.validation.ts` only rejects a
+PRESENT-but-invalid (non-positive-integer) value, and only while
+`TRANSCODE_ENABLED=true`. See `.env.example` for placeholders.
+
+### Observability
+
+Structured, secret-free logs (via the existing `redactSensitiveText` layer)
+for: job accepted (attempt/max), per-step transitions, per-rung
+`processingStep` updates, promotion/failure/supersede outcomes with wall-
+clock duration, janitor actions (stale-run age, cleanup counts), and cleanup
+failures (always logged loudly, never silently swallowed). Every persisted
+`processingErrorMessage` is redacted AND length-bounded before it ever
+reaches the database — never a raw, unredacted exception message or stack
+trace (see `transcode-job-processor.service.spec.ts`'s dedicated sentinel
+test).
 
 ## Testing
 

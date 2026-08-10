@@ -16,7 +16,13 @@ function buildConfigService(
       secretAccessKey: 'mock-secret-should-never-be-logged',
       publicBaseUrl: undefined,
     },
-    transcode: { enabled: false, redisUrl: undefined },
+    transcode: {
+      enabled: false,
+      redisUrl: undefined,
+      maxAttempts: 3,
+      stalledAfterMinutes: 30,
+      cleanupGraceMinutes: 120,
+    },
     ...overrides,
   };
 
@@ -71,6 +77,9 @@ describe('WorkerReadinessService', () => {
         transcode: {
           enabled: true,
           redisUrl: 'redis://secret-should-not-appear:6379',
+          maxAttempts: 3,
+          stalledAfterMinutes: 30,
+          cleanupGraceMinutes: 120,
         },
       }),
     );

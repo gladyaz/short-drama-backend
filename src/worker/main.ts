@@ -1,6 +1,12 @@
 import { Logger } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { NestFactory } from '@nestjs/core';
 import { redactSensitiveText } from '../common/logging/redact';
+import { RootConfig } from '../config/configuration';
+import { TranscodeJanitorService } from '../transcode/transcode-janitor.service';
+import { TranscodeJobProcessor } from '../transcode/transcode-job-processor.service';
+import { TRANSCODE_JANITOR_INTERVAL_MS } from '../transcode/transcode.constants';
+import { startTranscodeWorker } from './transcode-worker';
 import { WorkerModule } from './worker.module';
 import { WorkerReadinessService } from './worker-readiness.service';
 
@@ -23,28 +29,100 @@ import { WorkerReadinessService } from './worker-readiness.service';
  * Boots `WorkerModule`, logs a secret-free readiness summary (ffmpeg/ffprobe
  * presence via the injected `FfmpegAvailabilityClient`, plus a config
  * summary containing only booleans/enum-like strings — never a secret,
- * value, credential, or absolute internal path), closes the application
- * context, and exits `0`.
+ * value, credential, or absolute internal path), then branches on
+ * `TRANSCODE_ENABLED`:
+ *
+ * - **`false` (default smoke mode, unchanged from Slice 11O — this repo's
+ *   only shipped state):** closes the application context and returns
+ *   (the caller below exits `0`). Never starts a worker, never touches
+ *   Redis.
+ * - **`true` (Slice 11P persistent worker mode, isolated test/dev
+ *   conditions ONLY — never this repo's real default, per the 2026-08-10
+ *   approval's binding constraint 13):** starts the real BullMQ transcode
+ *   worker (`startTranscodeWorker`) and keeps this application context OPEN
+ *   INDEFINITELY (the returned promise does not resolve) until an operator
+ *   sends `SIGTERM`/`SIGINT`, at which point the worker and the application
+ *   context are closed gracefully before the process exits `0`. This is
+ *   what makes `node dist/worker/main` under `TRANSCODE_ENABLED=true` behave
+ *   like a normal long-running worker process (matching the proposal's
+ *   "Prod v1 ... worker (`node dist/worker`) under pm2/systemd as a separate
+ *   service" topology) instead of the smoke-mode boot-and-exit.
  */
 export async function bootstrapWorker(): Promise<void> {
-  const app = await NestFactory.createApplicationContext(WorkerModule, {
-    logger: ['log', 'warn', 'error'],
-  });
+  const app = await NestFactory.createApplicationContext(
+    WorkerModule.register(),
+    {
+      logger: ['log', 'warn', 'error'],
+    },
+  );
 
   const logger = new Logger('Worker');
+  const readinessService = app.get(WorkerReadinessService);
+  const summary = await readinessService.check();
 
-  try {
-    const readinessService = app.get(WorkerReadinessService);
-    const summary = await readinessService.check();
+  logger.log(
+    redactSensitiveText(
+      `short-drama-backend worker starting — ${JSON.stringify(summary)}`,
+    ),
+  );
 
-    logger.log(
-      redactSensitiveText(
-        `short-drama-backend worker starting — ${JSON.stringify(summary)}`,
-      ),
-    );
-  } finally {
+  if (!summary.config.transcodeEnabled) {
     await app.close();
+    return;
   }
+
+  const configService = app.get<ConfigService<RootConfig>>(ConfigService);
+  const transcodeConfig = configService.get('transcode', { infer: true })!;
+  const processor = app.get(TranscodeJobProcessor);
+  const worker = startTranscodeWorker(transcodeConfig.redisUrl!, processor);
+
+  logger.log(
+    'Transcode worker started — persistent mode (TRANSCODE_ENABLED=true).',
+  );
+
+  // Slice 11P: periodic janitor sweeps — `TranscodeJanitorService`'s own
+  // methods are the tested, injectable foundation (see its doc comment);
+  // this `setInterval` is the thin, deliberately untested-by-design
+  // scheduling wrapper around them (mirrors `startTranscodeWorker`'s own
+  // "never construct/exercise the real long-running thing in a unit test"
+  // precedent). Runs only in this same flag-gated persistent-mode branch —
+  // `TRANSCODE_ENABLED=false` (this repo's shipped default) never registers
+  // this interval at all.
+  const janitor = app.get(TranscodeJanitorService);
+  const janitorInterval = setInterval(() => {
+    void janitor
+      .sweepStaleRunning()
+      .catch((error: unknown) =>
+        logger.error(
+          redactSensitiveText(
+            `Janitor sweepStaleRunning failed: ${String(error)}`,
+          ),
+        ),
+      );
+    void janitor
+      .cleanupOrphanStaging()
+      .catch((error: unknown) =>
+        logger.error(
+          redactSensitiveText(
+            `Janitor cleanupOrphanStaging failed: ${String(error)}`,
+          ),
+        ),
+      );
+  }, TRANSCODE_JANITOR_INTERVAL_MS);
+
+  await new Promise<void>((resolve) => {
+    const shutdown = (signal: string): void => {
+      logger.log(`Received ${signal} — shutting down transcode worker...`);
+      clearInterval(janitorInterval);
+      void worker
+        .close()
+        .then(() => app.close())
+        .then(() => resolve());
+    };
+
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
+    process.on('SIGINT', () => shutdown('SIGINT'));
+  });
 }
 
 // Process-level last-resort handlers, mirroring `../main.ts`'s convention —

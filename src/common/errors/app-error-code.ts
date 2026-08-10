@@ -229,4 +229,42 @@ export enum AppErrorCode {
    * bucket, endpoint, or key value.
    */
   MEDIA_PLAYBACK_SOURCE_UNAVAILABLE = 'MEDIA_PLAYBACK_SOURCE_UNAVAILABLE',
+  // Slice 11O (FFmpeg/HLS worker proof on ONE synthetic video)
+  /**
+   * Returned when `SyntheticSourceService` cannot produce or validate the
+   * disposable synthetic MP4 fixture (ffmpeg generation failure, or the
+   * generated file fails its own ffprobe sanity check — wrong stream
+   * shape, out-of-band duration). Never a company/user media failure: this
+   * service only ever touches its own `fs.mkdtemp` output.
+   */
+  HLS_SOURCE_GENERATION_FAILED = 'HLS_SOURCE_GENERATION_FAILED',
+  /**
+   * Returned when a single rung's ffmpeg transcode+package invocation exits
+   * non-zero or otherwise fails. Per the 2026-08-10 Slice 11O approval, one
+   * failed rung fails the WHOLE job — a partial ladder is never packaged.
+   */
+  HLS_TRANSCODE_FAILED = 'HLS_TRANSCODE_FAILED',
+  /**
+   * Returned by `HlsPackageValidator` when the locally-produced HLS package
+   * fails any binding local-validation check (missing/zero-byte artifact,
+   * unparseable playlist, dimension/duration/segment-count mismatch, or a
+   * path that resolves outside the package's temp root). Local failure
+   * means STOP — no R2 byte is ever written (2026-08-10 approval, binding
+   * constraint 6).
+   */
+  HLS_PACKAGE_VALIDATION_FAILED = 'HLS_PACKAGE_VALIDATION_FAILED',
+  /**
+   * Returned when the gated real-R2 upload phase cannot verify every
+   * expected uploaded object (HEAD missing, size mismatch, wrong
+   * Content-Type) — never used in the local-only path, which never touches
+   * R2 at all.
+   */
+  HLS_UPLOAD_VERIFICATION_FAILED = 'HLS_UPLOAD_VERIFICATION_FAILED',
+  /**
+   * Returned when the binding cleanup step (2026-08-10 approval, item 10)
+   * cannot prove every recorded uploaded object was actually deleted —
+   * surfaced loudly rather than silently swallowed, per the approval's
+   * "unprovable cleanup ⇒ STOP + prominent report" requirement.
+   */
+  HLS_CLEANUP_VERIFICATION_FAILED = 'HLS_CLEANUP_VERIFICATION_FAILED',
 }

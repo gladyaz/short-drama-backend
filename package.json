@@ -21,7 +21,8 @@
     "test:e2e": "jest --config ./test/jest-e2e.json",
     "db:seed": "ts-node --compiler-options '{\"module\":\"CommonJS\"}' prisma/seed.ts",
     "media:fixtures": "ts-node --compiler-options '{\"module\":\"CommonJS\"}' scripts/generate-media-fixtures.ts",
-    "retention": "ts-node --compiler-options '{\"module\":\"CommonJS\"}' scripts/run-retention.ts"
+    "retention": "ts-node --compiler-options '{\"module\":\"CommonJS\"}' scripts/run-retention.ts",
+    "hls:local-proof": "ts-node --compiler-options '{\"module\":\"CommonJS\"}' scripts/hls-local-proof.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1094.0",

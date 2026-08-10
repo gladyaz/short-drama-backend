@@ -82,6 +82,8 @@ export function validateEnv(
 
   validateDevToolsNodeEnv(config);
 
+  validateTranscodeConfig(config);
+
   return config;
 }
 
@@ -186,6 +188,59 @@ function isValidObjectStorageEndpoint(value: string): boolean {
   try {
     const url = new URL(value);
     return url.protocol === 'http:' || url.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Slice 11N: `TRANSCODE_ENABLED` feature flag + conditionally required
+ * `REDIS_URL`, mirroring `validateStorageDriver`'s r2-conditional shape
+ * exactly (2026-08-10 DECISIONS.md approval: "REDIS_URL — validated as
+ * REQUIRED only when TRANSCODE_ENABLED=true ... mirror the 11G-3 conditional
+ * env-var pattern"). `TRANSCODE_ENABLED` not being the exact string `"true"`
+ * needs nothing extra — the default, safe posture, and the ONLY posture this
+ * slice ever ships (`TRANSCODE_ENABLED=true` is a hard prohibition outside
+ * explicitly-scoped, queue-mocking tests). `"true"` requires `REDIS_URL` to
+ * be present (name/shape only — never a network probe, never logs the
+ * value, matching `validateStorageDriver`'s `OBJECT_STORAGE_ENDPOINT` shape
+ * check).
+ */
+function validateTranscodeConfig(config: Record<string, unknown>): void {
+  if (config.TRANSCODE_ENABLED !== 'true') {
+    return;
+  }
+
+  // Captured BEFORE the presence check below narrows the `config.REDIS_URL`
+  // property-access expression itself (TS narrows a truthy-checked `unknown`
+  // property to `{}`, which lacks a meaningful `toString` and would trip
+  // `no-base-to-string` at the `String()` call further down) — `rawRedisUrl`
+  // is a separate local binding untouched by that narrowing, so `String()`
+  // below still runs against the original, un-narrowed `unknown`, matching
+  // `validateStorageDriver`'s `String(config.OBJECT_STORAGE_ENDPOINT)` usage
+  // above exactly.
+  const rawRedisUrl = config.REDIS_URL;
+
+  if (!config.REDIS_URL) {
+    throw new Error(
+      'Missing required environment variable: REDIS_URL. TRANSCODE_ENABLED=true requires REDIS_URL to be set (see .env.example). Values are never logged.',
+    );
+  }
+
+  const redisUrl = String(rawRedisUrl);
+
+  if (!isValidRedisUrl(redisUrl)) {
+    throw new Error(
+      'REDIS_URL must be a valid redis:// or rediss:// URL when TRANSCODE_ENABLED=true (shape check only — no network connection is made).',
+    );
+  }
+}
+
+/** Shape check only — never resolves DNS or opens a connection. */
+function isValidRedisUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'redis:' || url.protocol === 'rediss:';
   } catch {
     return false;
   }

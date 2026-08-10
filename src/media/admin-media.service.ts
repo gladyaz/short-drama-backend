@@ -1,10 +1,14 @@
 import { randomUUID } from 'crypto';
-import { HttpStatus, Injectable } from '@nestjs/common';
+import { HttpStatus, Injectable, Logger, Optional } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { AppErrorCode } from '../common/errors/app-error-code';
 import { AppException } from '../common/errors/app.exception';
+import { redactSensitiveText } from '../common/logging/redact';
+import { RootConfig } from '../config/configuration';
 import { deriveAccessTier } from '../entitlements/entitlement.constants';
 import { PrismaService } from '../prisma/prisma.service';
 import { StorageService } from '../storage/storage.service';
+import { TranscodeIntentService } from '../transcode/transcode-intent.service';
 import { CompleteMediaUploadDto } from './dto/complete-media-upload.dto';
 import { CreateMediaAssetUploadDto } from './dto/create-media-asset-upload.dto';
 import { CreateMediaUploadDto } from './dto/create-media-upload.dto';
@@ -102,10 +106,25 @@ type VideoRow = {
  */
 @Injectable()
 export class AdminMediaService {
+  private readonly logger = new Logger(AdminMediaService.name);
+
+  /**
+   * `configService`/`transcodeIntentService` are Slice 11N additions, both
+   * `@Optional()` — deliberately so this service keeps compiling and
+   * behaving exactly as before for every test that constructs it directly
+   * (e.g. `admin-media.service.spec.ts`'s bare `providers: [AdminMediaService,
+   * ...]` array, which imports neither `ConfigModule` nor `TranscodeModule`)
+   * without those tests needing to change at all. When either is absent
+   * (`undefined`), `completeUpload` below treats transcode processing as
+   * disabled — the exact same effective behavior as `TRANSCODE_ENABLED=false`.
+   */
   constructor(
     private readonly prisma: PrismaService,
     private readonly storageService: StorageService,
     private readonly mediaLifecycleService: MediaLifecycleService,
+    @Optional() private readonly configService?: ConfigService<RootConfig>,
+    @Optional()
+    private readonly transcodeIntentService?: TranscodeIntentService,
   ) {}
 
   async createUpload(
@@ -266,6 +285,43 @@ export class AdminMediaService {
         height: dto.height ?? media.height,
       },
     });
+
+    // Slice 11N: AFTER the verification above and the ready-transition
+    // succeed — IF AND ONLY IF TRANSCODE_ENABLED=true — request HLS
+    // processing. `isTranscodeEnabled` is `false` whenever `configService`
+    // is absent (every test that does not wire `ConfigModule`/
+    // `TranscodeModule`, matching this constructor's `@Optional()` doc
+    // comment) or when `TRANSCODE_ENABLED` did not resolve to exactly
+    // `true` — in both cases this whole block is skipped and
+    // `completeUpload`'s behavior/return value is BYTE-IDENTICAL to before
+    // this slice, which is what every pre-existing complete-upload unit/e2e
+    // test asserts, unchanged.
+    //
+    // `requestProcessing` itself never throws for a queue/Redis failure (see
+    // its own doc comment) — it only throws if its own DB write fails. The
+    // try/catch here is an additional, deliberately conservative layer on
+    // top of that: `completeUpload`'s own DB write (the `ready` transition
+    // above) has ALREADY succeeded and been persisted by this point, so a
+    // failure to even START a transcode request must never surface as a
+    // failure of the upload-completion call the admin is waiting on —
+    // matching the proposal's designed "Redis temporarily down ... upload
+    // flow never breaks" failure behavior (§14).
+    const isTranscodeEnabled =
+      this.configService?.get('transcode', { infer: true })?.enabled === true;
+
+    if (isTranscodeEnabled && this.transcodeIntentService) {
+      try {
+        await this.transcodeIntentService.requestProcessing(id);
+      } catch (error) {
+        this.logger.warn(
+          redactSensitiveText(
+            `Failed to request HLS processing for media "${id}" after a ` +
+              `successful upload completion — the upload itself still ` +
+              `succeeded: ${String(error)}`,
+          ),
+        );
+      }
+    }
 
     return toAdminMediaDto(updated);
   }

@@ -4,11 +4,14 @@ import { PrismaService } from '../prisma/prisma.service';
 import { HealthController } from './health.controller';
 import { StorageReadinessService } from './storage-readiness.service';
 import { StorageReadinessResponse } from './storage-readiness.types';
+import { TranscodeReadinessService } from './transcode-readiness.service';
+import { TranscodeReadinessResponse } from './transcode-readiness.types';
 
 describe('HealthController', () => {
   let controller: HealthController;
   let queryRaw: jest.Mock;
   let checkStorageReadiness: jest.Mock<StorageReadinessResponse, []>;
+  let checkTranscodeReadiness: jest.Mock<TranscodeReadinessResponse, []>;
 
   const fixtureReadiness: StorageReadinessResponse = {
     driver: 'local',
@@ -16,11 +19,19 @@ describe('HealthController', () => {
     configPresent: true,
   };
 
+  // Slice 11N: the flag-off shape is the default this slice ships.
+  const fixtureTranscodeReadiness: TranscodeReadinessResponse = {
+    enabled: false,
+  };
+
   beforeEach(async () => {
     queryRaw = jest.fn().mockResolvedValue([{ '?column?': 1 }]);
     checkStorageReadiness = jest
       .fn<StorageReadinessResponse, []>()
       .mockReturnValue(fixtureReadiness);
+    checkTranscodeReadiness = jest
+      .fn<TranscodeReadinessResponse, []>()
+      .mockReturnValue(fixtureTranscodeReadiness);
 
     const module: TestingModule = await Test.createTestingModule({
       controllers: [HealthController],
@@ -29,6 +40,10 @@ describe('HealthController', () => {
         {
           provide: StorageReadinessService,
           useValue: { check: checkStorageReadiness },
+        },
+        {
+          provide: TranscodeReadinessService,
+          useValue: { check: checkTranscodeReadiness },
         },
         // Route-level @UseGuards(DevToolsGuard) resolves through DI even in
         // unit tests, and the guard's only dependency is ConfigService.
@@ -96,5 +111,29 @@ describe('HealthController', () => {
 
     expect(details.storage).toEqual(r2Readiness);
     expect(details.storage.publicDeliveryAvailable).toBe(false);
+  });
+
+  // Slice 11N. `TranscodeReadinessService` itself is unit tested in
+  // `transcode-readiness.service.spec.ts`; here we only confirm the
+  // controller wires its result through untouched, under the `transcode`
+  // key — mirroring the `storage` coverage immediately above.
+  it('includes the transcode-readiness result from TranscodeReadinessService', async () => {
+    const details = await controller.getDetails();
+
+    expect(checkTranscodeReadiness).toHaveBeenCalledTimes(1);
+    expect(details.transcode).toEqual(fixtureTranscodeReadiness);
+  });
+
+  it('passes an enabled transcode readiness result through untouched', async () => {
+    const enabledReadiness: TranscodeReadinessResponse = {
+      enabled: true,
+      configPresent: true,
+      ready: true,
+    };
+    checkTranscodeReadiness.mockReturnValue(enabledReadiness);
+
+    const details = await controller.getDetails();
+
+    expect(details.transcode).toEqual(enabledReadiness);
   });
 });

@@ -355,3 +355,89 @@ describe('validateEnv — 11H-B1/11H-T1: OBJECT_STORAGE_PUBLIC_BASE_URL is optio
     });
   });
 });
+
+/**
+ * Slice 11N — HLS Processing Data Model + Queue Foundation. `REDIS_URL` is
+ * required only when `TRANSCODE_ENABLED=true`, mirroring the
+ * `STORAGE_DRIVER`/`OBJECT_STORAGE_*` conditional-validation shape above
+ * exactly (2026-08-10 DECISIONS.md approval, item: "mirror the 11G-3
+ * conditional env-var pattern").
+ */
+describe('validateEnv — TRANSCODE_ENABLED / REDIS_URL (Slice 11N)', () => {
+  it('boots with TRANSCODE_ENABLED unset and no REDIS_URL at all', () => {
+    expect(() => validateEnv({ ...VALID_CONFIG })).not.toThrow();
+  });
+
+  it.each(['', 'TRUE', 'True', '1', 'yes', 'false', 'garbage'])(
+    'boots with no REDIS_URL when TRANSCODE_ENABLED=%s (only the exact string "true" requires it)',
+    (value) => {
+      expect(() =>
+        validateEnv({ ...VALID_CONFIG, TRANSCODE_ENABLED: value }),
+      ).not.toThrow();
+    },
+  );
+
+  it('boots when TRANSCODE_ENABLED=true and REDIS_URL is a valid redis:// URL', () => {
+    expect(() =>
+      validateEnv({
+        ...VALID_CONFIG,
+        TRANSCODE_ENABLED: 'true',
+        REDIS_URL: 'redis://localhost:6379',
+      }),
+    ).not.toThrow();
+  });
+
+  it('boots when TRANSCODE_ENABLED=true and REDIS_URL uses the TLS rediss:// scheme', () => {
+    expect(() =>
+      validateEnv({
+        ...VALID_CONFIG,
+        TRANSCODE_ENABLED: 'true',
+        REDIS_URL: 'rediss://localhost:6380',
+      }),
+    ).not.toThrow();
+  });
+
+  it('throws naming REDIS_URL when TRANSCODE_ENABLED=true and REDIS_URL is absent', () => {
+    expect(() =>
+      validateEnv({ ...VALID_CONFIG, TRANSCODE_ENABLED: 'true' }),
+    ).toThrow(/Missing required environment variable: REDIS_URL/);
+  });
+
+  it('rejects a malformed REDIS_URL when TRANSCODE_ENABLED=true (shape check only, no network)', () => {
+    expect(() =>
+      validateEnv({
+        ...VALID_CONFIG,
+        TRANSCODE_ENABLED: 'true',
+        REDIS_URL: 'not-a-valid-url',
+      }),
+    ).toThrow(/REDIS_URL must be a valid redis:\/\/ or rediss:\/\/ URL/);
+  });
+
+  it('rejects a non-redis scheme when TRANSCODE_ENABLED=true (e.g. http://)', () => {
+    expect(() =>
+      validateEnv({
+        ...VALID_CONFIG,
+        TRANSCODE_ENABLED: 'true',
+        REDIS_URL: 'http://localhost:6379',
+      }),
+    ).toThrow(/REDIS_URL must be a valid redis:\/\/ or rediss:\/\/ URL/);
+  });
+
+  it('never echoes a REDIS_URL value in the thrown message', () => {
+    const sentinel = 'redis://SENTINEL-11N-DO-NOT-LEAK-a1b2c3@localhost:6379';
+    let caught: Error | undefined;
+
+    try {
+      validateEnv({
+        ...VALID_CONFIG,
+        TRANSCODE_ENABLED: 'true',
+        REDIS_URL: `not-a-valid-url-but-contains-${sentinel}`,
+      });
+    } catch (error) {
+      caught = error as Error;
+    }
+
+    expect(caught).toBeInstanceOf(Error);
+    expect(caught?.message).not.toContain(sentinel);
+  });
+});

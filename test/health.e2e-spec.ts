@@ -3,6 +3,7 @@ import { HttpStatus, INestApplication } from '@nestjs/common';
 import request from 'supertest';
 import { App } from 'supertest/types';
 import { AppModule } from './../src/app.module';
+import { TRANSCODE_QUEUE } from './../src/transcode/transcode.types';
 
 interface ErrorResponseBody {
   statusCode: number;
@@ -18,9 +19,17 @@ interface StorageReadinessBody {
   publicDeliveryAvailable?: boolean;
 }
 
+/** Slice 11N. `configPresent`/`ready` are only present when `enabled` is `true`. */
+interface TranscodeReadinessBody {
+  enabled: boolean;
+  configPresent?: boolean;
+  ready?: boolean;
+}
+
 interface HealthDetailsBody {
   status: string;
   storage: StorageReadinessBody;
+  transcode: TranscodeReadinessBody;
 }
 
 /**
@@ -157,6 +166,92 @@ describe('Health storage-readiness (e2e)', () => {
       expect(serialized).not.toMatch(
         /endpoint|bucket|accesskey|secretaccess|publicbaseurl|storageroot/,
       );
+    });
+
+    // Slice 11N: this suite inherits the repo's default TRANSCODE_ENABLED
+    // (unset/false — see .env/.env.example) — the shipped default.
+    it('GET /health/details reports transcode: { enabled: false } only — no configPresent/ready keys', async () => {
+      const response = await request(app.getHttpServer())
+        .get('/health/details')
+        .expect(HttpStatus.OK);
+
+      const { transcode } = response.body as HealthDetailsBody;
+
+      expect(transcode).toEqual({ enabled: false });
+      expect(Object.keys(transcode)).toEqual(['enabled']);
+    });
+  });
+
+  /**
+   * Slice 11N, proof 11 (secret-free health output) at the HTTP layer. This
+   * is an "explicitly-scoped test case that mocks the queue" — the hard
+   * prohibition's carve-out for `TRANSCODE_ENABLED=true`:
+   * `TRANSCODE_QUEUE` is overridden with a jest mock BEFORE the module
+   * compiles, so `TranscodeModule`'s factory never constructs a real
+   * `BullmqTranscodeQueueClient`/`IORedis` client, and no real Redis
+   * connection is ever attempted — `REDIS_URL` here is a deliberately fake,
+   * unreachable value that only needs to satisfy `env.validation.ts`'s
+   * presence/shape check at boot.
+   */
+  describe('with TRANSCODE_ENABLED=true (queue mocked)', () => {
+    let app: INestApplication<App>;
+    const previousTranscodeEnabled = process.env.TRANSCODE_ENABLED;
+    const previousRedisUrl = process.env.REDIS_URL;
+    const SECRET_SENTINEL_REDIS = 'S3NT1NEL-11N-DO-NOT-LEAK-REDIS-URL-VALUE';
+
+    beforeAll(async () => {
+      process.env.TRANSCODE_ENABLED = 'true';
+      process.env.REDIS_URL = `redis://${SECRET_SENTINEL_REDIS}@127.0.0.1:65535/0`;
+      process.env.DEV_TOOLS_ENABLED = 'true';
+
+      const moduleFixture: TestingModule = await Test.createTestingModule({
+        imports: [AppModule],
+      })
+        .overrideProvider(TRANSCODE_QUEUE)
+        .useValue({ add: jest.fn().mockResolvedValue(undefined) })
+        .compile();
+
+      app = moduleFixture.createNestApplication();
+      await app.init();
+    });
+
+    afterAll(async () => {
+      try {
+        if (app) {
+          await app.close();
+        }
+      } finally {
+        delete process.env.DEV_TOOLS_ENABLED;
+        if (previousTranscodeEnabled === undefined) {
+          delete process.env.TRANSCODE_ENABLED;
+        } else {
+          process.env.TRANSCODE_ENABLED = previousTranscodeEnabled;
+        }
+        if (previousRedisUrl === undefined) {
+          delete process.env.REDIS_URL;
+        } else {
+          process.env.REDIS_URL = previousRedisUrl;
+        }
+      }
+    });
+
+    it('GET /health/details reports transcode: { enabled: true, configPresent: true, ready: true } and leaks no REDIS_URL value', async () => {
+      const response = await request(app.getHttpServer())
+        .get('/health/details')
+        .expect(HttpStatus.OK);
+
+      const body = response.body as HealthDetailsBody;
+
+      expect(body.transcode).toEqual({
+        enabled: true,
+        configPresent: true,
+        ready: true,
+      });
+
+      const serialized = JSON.stringify(body);
+      expect(serialized).not.toContain('redis://');
+      expect(serialized).not.toContain(SECRET_SENTINEL_REDIS);
+      expect(serialized).not.toContain('127.0.0.1:65535');
     });
   });
 

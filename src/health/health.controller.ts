@@ -3,6 +3,8 @@ import { DevToolsGuard } from '../entitlements/guards/dev-tools.guard';
 import { PrismaService } from '../prisma/prisma.service';
 import { StorageReadinessService } from './storage-readiness.service';
 import { StorageReadinessResponse } from './storage-readiness.types';
+import { TranscodeReadinessService } from './transcode-readiness.service';
+import { TranscodeReadinessResponse } from './transcode-readiness.types';
 
 interface HealthResponse {
   status: 'ok';
@@ -24,6 +26,14 @@ interface HealthDetailsResponse {
    * absolute storage path.
    */
   storage: StorageReadinessResponse;
+  /**
+   * Slice 11N: secret-free transcode-readiness signal — see
+   * `TranscodeReadinessResponse` for the exact shape. Never `REDIS_URL`'s
+   * value. Flag off (this slice's shipped default) reports only
+   * `{ enabled: false }` — transcode readiness is NOT required for overall
+   * app readiness in that state (2026-08-10 DECISIONS.md approval, item 7).
+   */
+  transcode: TranscodeReadinessResponse;
 }
 
 @Controller('health')
@@ -31,6 +41,7 @@ export class HealthController {
   constructor(
     private readonly prisma: PrismaService,
     private readonly storageReadiness: StorageReadinessService,
+    private readonly transcodeReadiness: TranscodeReadinessService,
   ) {}
 
   @Get()
@@ -66,6 +77,7 @@ export class HealthController {
       nodeVersion: process.version,
       version: process.env.npm_package_version ?? null,
       storage: this.storageReadiness.check(),
+      transcode: this.transcodeReadiness.check(),
     };
   }
 }

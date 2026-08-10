@@ -66,6 +66,8 @@ mobile app (Expo/React Native)  -->  NestJS backend  -->  local company storage 
 | `ADS_MAX_VIDEOS_BETWEEN_ADS` | Optional. Upper bound of the randomized ad-threshold range — added in Phase 15A, slice 15A-S1. See "Ads config API" below. |
 | `ADS_MIN_SECONDS_BETWEEN_ADS` | Optional. Cooldown (seconds) between shown ads — added in Phase 15A, slice 15A-S1. See "Ads config API" below. |
 | `ADS_GRACE_VIDEOS`    | Optional. Lifetime video watches exempt from ads — added in Phase 15A, slice 15A-S1. See "Ads config API" below. |
+| `TRANSCODE_ENABLED`   | Optional. `true`/`false` (default `false`) feature flag for the HLS transcode-request queue — added in Slice 11N. See "HLS transcode queue foundation" below. |
+| `REDIS_URL`           | Required only when `TRANSCODE_ENABLED=true`; unused/optional otherwise — added in Slice 11N. See "HLS transcode queue foundation" below. |
 
 Configuration is validated at startup: the app refuses to start if any
 required variable is missing, or if `STORAGE_ROOT` does not exist / is not a
@@ -1795,6 +1797,79 @@ global `ThrottlerGuard`'s default rate limit (`DEFAULT_THROTTLE_LIMIT`/
 `DEFAULT_THROTTLE_TTL_MS` in `src/common/rate-limit.constants.ts`, 300
 requests/60s per IP) with no per-route override. No schema change, no
 migration, and no new dependency were introduced for this slice.
+
+## HLS transcode queue foundation (Slice 11N)
+
+Data-model + queue FOUNDATION only — no FFmpeg, no HLS, no worker process.
+Approved per control workspace `DECISIONS.md`, "2026-08-10 — Slice 11N
+APPROVED..."; architecture: `proposals/phase-11-hls-pipeline-proposal.md`
+§7–§8.
+
+**Schema (additive, reversible):** `Video` gains exactly two nullable/
+defaulted columns — `processingState String?` (`null` = no processing
+pipeline for this row, the permanent state for every legacy/local row;
+otherwise app-layer-validated `"queued" | "running" | "ready" | "failed"`,
+NOT a Postgres enum) and `processingVersion Int @default(0)` (a monotonic,
+per-row CAS token). Migration:
+`prisma/migrations/*_add_processing_state_and_version`, applied to both
+`short_drama_dev` and `short_drama_test`. **Rollback:** drop the pair
+(`ALTER TABLE "Video" DROP COLUMN "processingState", DROP COLUMN
+"processingVersion";` and `DROP INDEX "Video_processingState_idx";`) — safe
+at any time, since nothing outside this slice reads either column yet.
+**No `MediaProcessingJob` table was created** — this slice's Redis-loss
+recovery works entirely off `Video.processingState = "queued"` via
+`TranscodeReconcilerService`; a durable per-attempt history table is
+deferred to whichever future slice (11O+) first needs one, per the approval's
+schema-minimality constraint.
+
+**Feature flag:** `TRANSCODE_ENABLED` must be the exact string `"true"` to
+activate anything — unset, empty, `"TRUE"`, `"1"`, or any other value all
+resolve to `false` (fail-closed). `false` is this repository's shipped
+default everywhere; `TRANSCODE_ENABLED=true` is a hard prohibition outside
+explicitly-scoped, queue-mocking tests. `REDIS_URL` is required (by
+`env.validation.ts`, name/shape only, never a network probe) only when the
+flag is `true`; while it is `false`, `REDIS_URL`'s absence — or Redis never
+having been installed at all — is completely harmless: no Redis client is
+ever constructed.
+
+**Queue module (`src/transcode/`):** `TranscodeIntentService.requestProcessing`
+does a single atomic Prisma update (`processingVersion: { increment: 1 }`,
+`processingState: "queued"`) — DB write first — then best-effort enqueues a
+`{ videoId, processingVersion }` payload onto the BullMQ `media-transcode`
+queue with jobId `"<videoId>:<processingVersion>"` (dedupe); an
+enqueue/Redis failure is caught, logged (redacted) at `warn`, and never
+thrown — the DB row stays durably `"queued"`.
+`TranscodeIntentService.transitionIfVersion` is the generic CAS primitive
+(`updateMany` guarded on `processingVersion`) every future worker must use.
+`TranscodeReconcilerService.reconcile(limit = 25)` re-enqueues rows still
+`"queued"` with their CURRENT version — idempotent (same jobId), bounded,
+never mutates state, never deletes anything, and is a no-op while the flag is
+off. No cron/scheduler wiring in this slice — that arrives with the worker
+slice that will actually consume these jobs.
+
+**Enqueue point:** `POST /admin/media/:id/complete-upload`
+(`AdminMediaService.completeUpload`), AFTER the existing 11L
+HEAD/size/type verification and the `ready` lifecycle transition succeed,
+calls `requestProcessing` IF AND ONLY IF `TRANSCODE_ENABLED=true`. With the
+flag `false` (this slice's only shipped state), `completeUpload`'s behavior
+is byte-for-byte unchanged from before this slice.
+
+**Readiness:** `GET /health/details` (dev-tools-gated, per the existing
+11G-4 pattern) gains a `transcode` field — `{ enabled: false }` only while
+the flag is off (transcode readiness is not required for overall app
+readiness in that state), or `{ enabled: true, configPresent, ready }`
+(config-presence only, never a live Redis probe) while it is on. Never
+`REDIS_URL`'s value, a credential, a host, or a port.
+
+**New dependencies:** `bullmq` (the requested addition) plus `ioredis`,
+which had to be installed explicitly too — despite the original plan
+assuming it would come in transitively, `bullmq@6`'s own code
+unconditionally `require()`s `ioredis` at module-load time (it is listed as
+an *optional peer* dependency in `package.json`, but is not actually
+optional at the code level for the default Queue/Worker backend), so
+merely importing anything from `bullmq` throws `Cannot find module
+'ioredis'` without it installed — confirmed empirically before deciding to
+add it.
 
 ## Testing
 

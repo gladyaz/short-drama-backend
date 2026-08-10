@@ -80,10 +80,36 @@ export interface StorageConfig {
   publicBaseUrl: string | undefined;
 }
 
+/**
+ * Slice 11N — HLS Processing Data Model + Queue Foundation (control
+ * workspace DECISIONS.md "2026-08-10 — Slice 11N APPROVED..." entry).
+ * `enabled` mirrors `RetentionScheduleConfig.enabled`'s existing
+ * **fail-closed, exact-string** shape exactly (`resolveRetentionScheduleConfig`
+ * in `../retention/retention-schedule.config.ts`): `TRANSCODE_ENABLED` must
+ * be the literal string `"true"` to activate anything — absent, empty,
+ * `"TRUE"`, `"1"`, `"yes"`, or any other value all resolve to `false`, never
+ * the reverse. `false` is this slice's only shipped state (2026-08-10
+ * approval, prohibition list: "no `TRANSCODE_ENABLED=true` anywhere").
+ *
+ * `redisUrl` is read unconditionally by this factory (mirroring every other
+ * field here — `configuration.ts` never itself decides what is
+ * required/optional, `env.validation.ts` does), but is REQUIRED (by
+ * `env.validation.ts`'s `validateTranscodeConfig`) only when `enabled` is
+ * `true`. While `enabled` is `false`, nothing in this codebase ever reads
+ * `redisUrl` — its absence, or an unreachable value, is completely
+ * harmless. Never logged anywhere (see `TranscodeReadinessService`, which
+ * reports presence only, never the value).
+ */
+export interface TranscodeConfig {
+  enabled: boolean;
+  redisUrl: string | undefined;
+}
+
 export interface RootConfig {
   app: AppConfig;
   auth: AuthConfig;
   storage: StorageConfig;
+  transcode: TranscodeConfig;
 }
 
 export default (): RootConfig => ({
@@ -110,6 +136,10 @@ export default (): RootConfig => ({
     accessKeyId: process.env.OBJECT_STORAGE_ACCESS_KEY_ID ?? '',
     secretAccessKey: process.env.OBJECT_STORAGE_SECRET_ACCESS_KEY ?? '',
     publicBaseUrl: process.env.OBJECT_STORAGE_PUBLIC_BASE_URL,
+  },
+  transcode: {
+    enabled: process.env.TRANSCODE_ENABLED === 'true',
+    redisUrl: process.env.REDIS_URL,
   },
 });
 

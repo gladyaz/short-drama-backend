@@ -239,10 +239,77 @@ model Video {
   /// can never be used to bypass verification on a NEWLY created row.
   expectedSizeBytes             Int?
   expectedContentType           String?
+  /// Slice 11N — HLS Processing Data Model + Queue Foundation (control
+  /// workspace DECISIONS.md "2026-08-10 — Slice 11N APPROVED..." entry;
+  /// architecture: `proposals/phase-11-hls-pipeline-proposal.md` §6-§8). The
+  /// PROCESSING axis, deliberately INDEPENDENT of the editorial
+  /// `lifecycleState` axis above (draft/ready/published/unpublished/failed
+  /// tracks EDITORIAL state; this tracks HLS ENCODING progress — a
+  /// `published` row can be mid-transcode, and a `failed` transcode does not
+  /// touch `lifecycleState`).
+  ///
+  /// Nullable with NO default, so every pre-existing row (all 40+
+  /// legacy/local rows with only `storageKey`, and every admin-created row
+  /// from before this migration) keeps compiling and backfills to `null` —
+  /// this additive migration changes no existing row's value. `null` means
+  /// "no HLS processing pipeline has ever been requested for this row" — the
+  /// PERMANENT state for a legacy/local row, which this slice never touches
+  /// (nothing in 11N writes to a row unless `AdminMediaService.completeUpload`
+  /// explicitly calls `TranscodeIntentService.requestProcessing` on it, and
+  /// that only happens when `TRANSCODE_ENABLED=true`, which this slice never
+  /// ships as `true`).
+  ///
+  /// App-layer validated values ONLY — NOT a Postgres enum, matching this
+  /// schema's existing `Video.category`/`lifecycleState` plain-string
+  /// precedent: `"queued" | "running" | "ready" | "failed"` (see
+  /// `src/transcode/transcode.constants.ts`'s `PROCESSING_STATES`).
+  /// `PROBING`/`TRANSCODING`/`PACKAGING`/`VERIFYING` are explicitly NOT
+  /// states here (proposal §6: "their transition rules would be identical,
+  /// so as states they'd be aesthetic") — that level of detail is a future,
+  /// display-only `processingStep` column, deliberately NOT added by this
+  /// slice (schema-minimality: 11N does not exercise it).
+  ///
+  /// This slice (11N) is the ONLY writer that exists today, and it only ever
+  /// writes `"queued"` (`TranscodeIntentService.requestProcessing` and
+  /// `TranscodeReconcilerService.reconcile`, which re-enqueues but never
+  /// changes this column). `"running"`/`"ready"`/`"failed"` are reserved for
+  /// the FFmpeg worker slice (11O+) that does not exist yet — no code path
+  /// in this repository writes them today. `TranscodeIntentService
+  /// .transitionIfVersion` is the generic CAS primitive a future worker MUST
+  /// use to write them safely (see `processingVersion` below), but nothing
+  /// calls it with any of those three values yet.
+  processingState                String?
+  /// Slice 11N: monotonic PER-ROW processing-generation counter — the
+  /// compare-and-swap (CAS) token every current and future processing write
+  /// must present unchanged before it is allowed to mutate `processingState`
+  /// (`TranscodeIntentService.transitionIfVersion`, an `updateMany` guarded
+  /// on `processingVersion: expectedVersion`; a stale/superseded version
+  /// affects zero rows). Defaults to 0 so every pre-existing row (and every
+  /// row created without specifying it) backfills to exactly `0` — this
+  /// additive migration changes no existing row's value.
+  ///
+  /// Incremented atomically — `{ increment: 1 }` inside the SAME single
+  /// Prisma `update` call that also sets `processingState = "queued"`
+  /// (`TranscodeIntentService.requestProcessing`), never a separate
+  /// read-then-write — so two concurrent `requestProcessing` calls against
+  /// the same row race-safely land on two DISTINCT, consecutive versions
+  /// (e.g. 1 then 2), never the same value twice. The resulting version
+  /// becomes both the BullMQ job's dedupe identity
+  /// (`jobId = "<videoId>:<processingVersion>"`, see
+  /// `transcode.constants.ts#buildTranscodeJobId`) and the exact value
+  /// `TranscodeReconcilerService.reconcile` re-reads fresh from this column
+  /// before every re-enqueue attempt (never a version it cached earlier) —
+  /// a duplicate/late worker attempt against a superseded generation can
+  /// never silently overwrite a newer one.
+  processingVersion              Int     @default(0)
 
   @@index([seriesId])
   @@index([sortOrder])
   @@index([lifecycleState])
+  /// Slice 11N: `TranscodeReconcilerService.reconcile` filters on
+  /// `processingState = "queued"` for every sweep — indexed for the same
+  /// reason `lifecycleState` already is above.
+  @@index([processingState])
 }
 
 // Phase 11, work unit 11E-4: additive series metadata. `id` intentionally

@@ -32,7 +32,7 @@
 
 import { resolveContentType } from './content-type';
 import { buildObjectKey, normalizeRelativePath } from './path';
-import { parseRangeHeader } from './range';
+import { parseRangeHeader, resolveReturnedRange } from './range';
 import { maybeGetFromCache, maybePutInCache } from './cache';
 import { verify } from './token';
 import type { CacheLike, Env } from './env.types';
@@ -209,11 +209,17 @@ export async function handleRequest(
 
   let status = 200;
   if (object.range) {
+    // 11Q-A1 workers-types gate: the real `R2Object.range` is the
+    // three-variant `R2Range` union, so it must be resolved against the
+    // object's total size before a `Content-Range` can be built —
+    // reading `.offset`/`.length` directly off it was a type error
+    // against the ambient types.
+    const resolved = resolveReturnedRange(object.range, object.size);
     status = 206;
-    headers.set('Content-Length', String(object.range.length));
+    headers.set('Content-Length', String(resolved.length));
     headers.set(
       'Content-Range',
-      `bytes ${object.range.offset}-${object.range.offset + object.range.length - 1}/${object.size}`,
+      `bytes ${resolved.offset}-${resolved.offset + resolved.length - 1}/${object.size}`,
     );
   } else {
     headers.set('Content-Length', String(object.size));

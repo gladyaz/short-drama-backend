@@ -1,4 +1,8 @@
-import type { MediaObjectRangeRequest } from './env.types';
+import type {
+  MediaObjectRange,
+  MediaObjectRangeRequest,
+  MediaObjectReturnedRange,
+} from './env.types';
 
 /**
  * Slice 11Q — minimal `Range: bytes=...` header parser. Deliberately
@@ -57,4 +61,29 @@ export function parseRangeHeader(
   }
 
   return { offset, length: end - offset + 1 };
+}
+
+/**
+ * 11Q-A1 workers-types gate follow-through: the REAL `R2Object.range` is a
+ * three-variant union (`{offset, length?} | {offset?, length} | {suffix}`),
+ * so a `Content-Range` header can never be built by reading `offset`/
+ * `length` directly off it. This resolver is a TOTAL function given the
+ * object's total size — every variant normalizes deterministically:
+ *   offset-only  -> the slice runs to the end   (length = size - offset)
+ *   length-only  -> the slice starts at zero    (offset = 0)
+ *   suffix       -> the last N bytes            (offset = size - N, capped)
+ */
+export function resolveReturnedRange(
+  range: MediaObjectReturnedRange,
+  totalSize: number,
+): MediaObjectRange {
+  if ('suffix' in range && range.suffix !== undefined) {
+    const length = Math.min(range.suffix, totalSize);
+    return { offset: totalSize - length, length };
+  }
+
+  const withOffset = range as { offset?: number; length?: number };
+  const offset = withOffset.offset ?? 0;
+  const length = withOffset.length ?? Math.max(totalSize - offset, 0);
+  return { offset, length };
 }

@@ -24,15 +24,33 @@ export interface MediaObjectRange {
 }
 
 /**
+ * The range shape a real R2 `.get()` RESPONSE may carry (`R2Object.range`).
+ * Faithfully mirrors the ambient `R2Range` union from
+ * `@cloudflare/workers-types` — any of the three variants may come back,
+ * with `offset`/`length` individually optional. 11Q-A1's workers-types
+ * compile gate (workers-types-compat.ts) proved the previous concrete
+ * `{offset, length}` shape was NOT what the real API declares; the honest
+ * fix is to model the real union here and resolve it against the object's
+ * total size in `resolveReturnedRange` (range.ts) — never to assume both
+ * fields are present.
+ */
+export type MediaObjectReturnedRange =
+  | { offset: number; length?: number }
+  | { offset?: number; length: number }
+  | { suffix: number };
+
+/**
  * The shape this gateway needs from an R2 `.get()` response. `size` is
  * ALWAYS the object's total size (matching real R2Object semantics),
  * regardless of whether this particular read was ranged — `range`, when
- * present, describes exactly which slice `body` contains.
+ * present, describes which slice `body` contains, in the real API's own
+ * (union) terms; use `resolveReturnedRange` to obtain concrete
+ * offset/length before building `Content-Range`.
  */
 export interface MediaObject {
   body: ReadableStream<Uint8Array>;
   size: number;
-  range?: MediaObjectRange;
+  range?: MediaObjectReturnedRange;
 }
 
 /**

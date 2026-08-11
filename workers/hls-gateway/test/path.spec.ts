@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { buildObjectKey, normalizeRelativePath } from '../src/path';
+import vectors from './token-vectors.json';
 
 describe('normalizeRelativePath (Slice 11Q, load-bearing path security)', () => {
   it('accepts a clean a/b/c.ext relative path unchanged', () => {
@@ -102,5 +103,67 @@ describe('buildObjectKey', () => {
 
   it('returns null for an empty relative path', () => {
     expect(buildObjectKey(prefix, '')).toBeNull();
+  });
+});
+
+describe('buildObjectKey structural media-scope confinement (Slice 11Q-A2 fix cycle 1, HIGH finding)', () => {
+  /**
+   * This is the GENUINE cross-media scope proof for this path-embedded-token
+   * architecture. Per-request media isolation is not enforced by any
+   * separate "does this token own this media" check at request time — it is
+   * enforced structurally, once, right here: `buildObjectKey` only ever
+   * concatenates the token's own verified prefix with an already-clean
+   * relative path, and asserts the result `startsWith(prefix)`. Given that,
+   * for ANY clean (allowlisted, traversal-free) `rel` — including one that
+   * textually contains another media's id as an ordinary path segment —
+   * the produced key can only ever land under THIS prefix, never under a
+   * different media's prefix. A traversal-free, genuinely cross-media,
+   * scope-distinct 403 cannot exist at the HTTP layer (see index.spec.ts
+   * TEST 23's reframed docstring); this test is what actually backs that
+   * claim, at the layer where the guarantee is real.
+   */
+  const prefixA = vectors.prefix;
+  const prefixB = vectors.otherPrefix;
+
+  const cleanRels = [
+    'master.m3u8',
+    '360p/index.m3u8',
+    '360p/seg_00001.m4s',
+    // Adversarial-but-clean: textually contains media B's real id as a
+    // plain path segment. `normalizeRelativePath` would accept this rel
+    // (it is traversal-free and allowlist-clean) — the question this test
+    // answers is whether `buildObjectKey` can be tricked into resolving it
+    // against media B's real prefix instead of media A's.
+    `${vectors.otherMediaId}/master.m3u8`,
+  ];
+
+  it('for every clean relative path, the resulting key either starts with the authorized prefix or is null — never anything else', () => {
+    for (const rel of cleanRels) {
+      const key = buildObjectKey(prefixA, rel);
+      // buildObjectKey never fails for a non-empty prefix + non-empty rel,
+      // but the null branch is asserted too so this stays true even if a
+      // future implementation legitimately rejects some input.
+      expect(key === null || key.startsWith(prefixA)).toBe(true);
+    }
+  });
+
+  it('the adversarial rel (embedding media B\'s id as a literal segment) resolves ONLY under media A\'s prefix — never under media B\'s real prefix, and never equals media B\'s real object key', () => {
+    const adversarialRel = `${vectors.otherMediaId}/master.m3u8`;
+    const key = buildObjectKey(prefixA, adversarialRel);
+
+    // It must be confined to media A's own prefix...
+    expect(key).toBe(`${prefixA}${vectors.otherMediaId}/master.m3u8`);
+    expect(key?.startsWith(prefixA)).toBe(true);
+
+    // ...and it must NEVER land under media B's real prefix, nor collide
+    // with media B's actual object key (prefixB + "master.m3u8"). This is
+    // the mutation-resistant half of the proof: if `buildObjectKey`'s
+    // `startsWith` containment guard were ever removed AND a future
+    // refactor changed key construction away from plain concatenation
+    // (e.g. to something that could "resolve" the embedded segment against
+    // a different base), this assertion — not just the concatenation
+    // itself — is what would catch the prefix escape.
+    expect(key?.startsWith(prefixB)).toBe(false);
+    expect(key).not.toBe(`${prefixB}master.m3u8`);
   });
 });

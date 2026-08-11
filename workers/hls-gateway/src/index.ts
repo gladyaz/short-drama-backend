@@ -208,12 +208,23 @@ export async function handleRequest(
   });
 
   let status = 200;
-  if (object.range) {
-    // 11Q-A1 workers-types gate: the real `R2Object.range` is the
-    // three-variant `R2Range` union, so it must be resolved against the
-    // object's total size before a `Content-Range` can be built —
-    // reading `.offset`/`.length` directly off it was a type error
-    // against the ambient types.
+  // 11Q-A2 fix: emit 206 / Content-Range ONLY when the CLIENT actually sent a
+  // valid Range request — `range` is the PARSED request range (from the
+  // `parseRangeHeader` call above), which is non-null exactly when the client
+  // asked for a byte range this gateway understood. It is NOT gated on
+  // `object.range` alone: real Cloudflare R2's `.get()` populates
+  // `R2Object.range` even on a FULL, non-ranged read, so gating on the
+  // provider's field returned a bogus 206 for plain GETs — the exact defect
+  // the live 11Q-A1 proof exposed (see HUMAN_ACTIONS.md CF-01). A malformed
+  // Range header parses to `range = null`, so it also correctly falls through
+  // to a full 200 (fail-safe), matching `parseRangeHeader`'s documented
+  // "malformed -> serve the full object" contract. `object.range` is still
+  // required in the guard so `resolveReturnedRange` has a real returned range
+  // to resolve.
+  if (range && object.range) {
+    // The real `R2Object.range` is the three-variant `R2Range` union, so it
+    // must be resolved against the object's total size before a
+    // `Content-Range` can be built (11Q-A1 workers-types gate).
     const resolved = resolveReturnedRange(object.range, object.size);
     status = 206;
     headers.set('Content-Length', String(resolved.length));

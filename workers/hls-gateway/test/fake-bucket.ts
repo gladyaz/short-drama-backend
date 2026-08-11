@@ -11,6 +11,23 @@ import type { MediaBucket, MediaObject, MediaObjectRangeRequest } from '../src/e
 export class FakeMediaBucket implements MediaBucket {
   private readonly objects = new Map<string, Uint8Array>();
 
+  /**
+   * 11Q-A2: when true, a FULL (no-range) `.get()` still returns an object
+   * whose `.range` is populated (`{offset:0, length:size}`). This faithfully
+   * reproduces the REAL Cloudflare R2 behavior observed during the live
+   * 11Q-A1 proof — R2 sets `R2Object.range` even on a full read — which this
+   * fake previously did NOT do, which is precisely why the non-Range HTTP-206
+   * defect escaped the unit suite. This models the PROVIDER's behavior, not
+   * the gateway implementation. Off by default, so every pre-existing test is
+   * unchanged.
+   */
+  private fullReadReturnsRange = false;
+
+  /** Enable the real-R2 "range populated even on a full read" quirk. */
+  simulateFullReadRange(on = true): void {
+    this.fullReadReturnsRange = on;
+  }
+
   put(key: string, bytes: Uint8Array): void {
     this.objects.set(key, bytes);
   }
@@ -32,7 +49,11 @@ export class FakeMediaBucket implements MediaBucket {
     const range = options?.range;
 
     if (!range) {
-      return { body: toReadableStream(bytes), size };
+      // 11Q-A2: mimic real R2, which returns `.range` even for a full read
+      // when the quirk mode is enabled.
+      return this.fullReadReturnsRange
+        ? { body: toReadableStream(bytes), size, range: { offset: 0, length: size } }
+        : { body: toReadableStream(bytes), size };
     }
 
     const resolved = resolveRange(range, size);

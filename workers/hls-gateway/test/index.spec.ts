@@ -227,6 +227,106 @@ describe('handleRequest (Slice 11Q gateway handler)', () => {
     expect(response.headers.get('Cache-Control')).toBe('private, max-age=0');
   });
 
+  it('[TEST 20 · 11Q-A2 REGRESSION] a non-Range GET returns 200 with the full body and NO Content-Range, EVEN WHEN real R2 populates object.range on a full read', async () => {
+    // Reproduces the exact real-R2 behavior the live 11Q-A1 proof exposed:
+    // R2's `.get()` sets `R2Object.range` even for a FULL read. The gateway
+    // must key its 206 on the CLIENT's Range intent, not on `object.range`.
+    // Before the 11Q-A2 fix this returned 206 with a bogus Content-Range
+    // (`bytes 0-N/N`) for a plain GET — this test fails against that code and
+    // passes only once the fix gates 206 on the parsed request range.
+    bucket.simulateFullReadRange(true);
+    const response = await handleRequest(
+      requestFor(vectors.valid, 'master.m3u8'),
+      env,
+    );
+    expect(response.status).toBe(200);
+    expect(response.headers.has('Content-Range')).toBe(false);
+    expect(response.headers.get('Content-Length')).toBe(
+      String('#EXTM3U\nmaster-playlist-body'.length),
+    );
+    expect(await response.text()).toBe('#EXTM3U\nmaster-playlist-body');
+  });
+
+  it('[TEST 21 · 11Q-A2] a VALID Range request still returns 206 with a correct Content-Range (regression guard: `simulateFullReadRange(true)` is deliberately a no-op on this code path, since a real Range request takes the `resolveRange` branch — it is enabled here only to prove the 11Q-A2 fix does not regress genuine ranges alongside the full-read quirk)', async () => {
+    bucket.simulateFullReadRange(true);
+    const response = await handleRequest(
+      requestFor(vectors.valid, 'master.m3u8', { Range: 'bytes=0-3' }),
+      env,
+    );
+    expect(response.status).toBe(206);
+    expect(response.headers.get('Content-Range')).toBe(
+      `bytes 0-3/${'#EXTM3U\nmaster-playlist-body'.length}`,
+    );
+    expect(response.headers.get('Content-Length')).toBe('4');
+    expect(
+      await streamToText(response.body as ReadableStream<Uint8Array>),
+    ).toBe('#EXT');
+  });
+
+  it('[TEST 22 · 11Q-A2] a MALFORMED Range header is fail-safe: full 200, no Content-Range, even with the real-R2 quirk enabled', async () => {
+    bucket.simulateFullReadRange(true);
+    const response = await handleRequest(
+      requestFor(vectors.valid, 'master.m3u8', { Range: 'bytes=not-a-range' }),
+      env,
+    );
+    expect(response.status).toBe(200);
+    expect(response.headers.has('Content-Range')).toBe(false);
+    expect(await response.text()).toBe('#EXTM3U\nmaster-playlist-body');
+  });
+
+  it('[TEST 23 · 11Q-A2 WRONG-MEDIA] a cross-media-SHAPED traversal payload aimed at media B\'s REAL, EXISTING object is rejected by path hygiene (403) before any bucket touch — not a coincidental miss', async () => {
+    // WHAT THIS TEST ACTUALLY PROVES (fix cycle 1 reframe — this test was
+    // previously mislabeled as a "media scope" rejection; it is not): the
+    // 403 below fires in `normalizeRelativePath`'s traversal rejection —
+    // the IDENTICAL mechanism as TEST 7/8 — because the payload contains a
+    // literal ".." traversal. It never reaches any media-scope check,
+    // because in this path-embedded-token architecture there IS no
+    // separate per-request media-scope check: `buildObjectKey` (see
+    // src/path.ts) enforces confinement structurally, by concatenating the
+    // token's OWN prefix with the relative path and asserting the result
+    // stays within that prefix. A traversal-free, genuinely cross-media,
+    // scope-distinct 403 cannot exist at the HTTP layer — a traversal-free
+    // cross-media request always resolves (harmlessly) under media A's own
+    // prefix and 404s instead (proven by TEST 4b). The REAL, non-vacuous
+    // "a media-A token can never address media-B's object" proof lives at
+    // the unit layer in path.spec.ts's "buildObjectKey structural
+    // media-scope confinement" tests, which exercise buildObjectKey
+    // directly (including a traversal-free adversarial rel) and show it
+    // can only ever emit a key under its own prefix.
+    //
+    // What THIS test still legitimately shows: the target of the traversal
+    // payload below is not some fictitious path — media B's object really
+    // exists in the bucket (OTHER_MASTER_KEY, seeded in beforeEach) and is
+    // genuinely served by media B's own valid token. So the 403 for media
+    // A's token, immediately after, is not a coincidental miss against an
+    // absent object (absence alone would be a 404 — see TEST 4b); it is
+    // path hygiene rejecting the traversal shape before the bucket is ever
+    // touched, regardless of what the payload targets.
+    const bTokenResponse = await handleRequest(
+      requestFor(vectors.validDifferentPrefix, 'master.m3u8'),
+      env,
+    );
+    expect(bTokenResponse.status).toBe(200);
+    expect(await bTokenResponse.text()).toBe('#EXTM3U\nother-episode-master');
+
+    // Media A's VALID token, given a traversal payload shaped to look like
+    // it targets media B's real key. The literal ".." in the payload is
+    // what triggers the 403 (path-layer traversal rejection, same
+    // mechanism as TEST 7/8) — this fires before any bucket lookup, so
+    // the object's existence above is what rules out "it just doesn't
+    // exist" as an alternative explanation for the rejection.
+    const getSpy = vi.spyOn(bucket, 'get');
+    const crossMediaPath =
+      '..%2f..%2f..%2fvideo-hlsq-fixture-02%2fhls%2fv1-a1-22222222-2222-2222-2222-222222222222%2fmaster.m3u8';
+    const aTokenResponse = await handleRequest(
+      requestFor(vectors.valid, crossMediaPath),
+      env,
+    );
+    expect(aTokenResponse.status).toBe(403);
+    expect(aTokenResponse.status).not.toBe(404); // rejected before the object's absence could matter
+    expect(getSpy).not.toHaveBeenCalled(); // never reached B's (existing) key
+  });
+
   describe('[TEST 15/16/17] cache-enabled behavior (isolated CACHE_ENABLED=true env, fake cache)', () => {
     function fakeCache(): CacheLike & { store: Map<string, Response> } {
       const store = new Map<string, Response>();

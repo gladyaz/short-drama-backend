@@ -1,3 +1,4 @@
+import { VideoContentKind } from './video-content-kind.types';
 import { VideoRecord } from './video.types';
 
 /**
@@ -44,6 +45,9 @@ function buildSeriesEpisodes(input: SeriesEpisodesInput): VideoRecord[] {
       likeCount: input.baseLikeCount + (input.fileNames.length - index) * 2,
       width: input.width,
       height: input.height,
+      // Every seeded row is real catalog content. Stated explicitly rather
+      // than left to the column default, so the seed says what it means.
+      contentKind: VideoContentKind.DRAMA,
     };
   });
 }

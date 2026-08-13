@@ -1,5 +1,7 @@
+import { VideoContentKind } from '../../videos/video-content-kind.types';
 import {
   IsBoolean,
+  IsIn,
   IsInt,
   IsOptional,
   IsString,
@@ -66,4 +68,13 @@ export class UpdateMediaMetadataDto {
   @IsOptional()
   @IsBoolean()
   hasEmbeddedIndonesianSubtitle?: boolean;
+
+  /**
+   * Explicit catalog classification. Correctable through this guarded admin
+   * endpoint so a row misclassified at creation time never needs hand-written
+   * SQL - which is how the two pre-existing QA fixtures had to be fixed.
+   */
+  @IsOptional()
+  @IsIn(Object.values(VideoContentKind))
+  contentKind?: VideoContentKind;
 }

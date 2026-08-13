@@ -1,3 +1,4 @@
+import { VideoContentKind } from '../../videos/video-content-kind.types';
 import {
   IsBoolean,
   IsIn,
@@ -111,4 +112,18 @@ export class CreateMediaUploadDto {
    */
   @IsIn(ALLOWED_UPLOAD_CONTENT_TYPES)
   contentType!: string;
+
+  /**
+   * Explicit catalog classification for the row this upload creates.
+   *
+   * Optional: omitting it falls through to the `Video.contentKind` column
+   * default (`drama`), which is right for real content and keeps every
+   * existing caller working unchanged. It exists so an INTERNAL fixture can
+   * declare itself at creation time - the alternative is what this contract
+   * was introduced to end, a synthetic row indistinguishable from a real
+   * drama that can only be corrected with raw SQL.
+   */
+  @IsOptional()
+  @IsIn(Object.values(VideoContentKind))
+  contentKind?: VideoContentKind;
 }

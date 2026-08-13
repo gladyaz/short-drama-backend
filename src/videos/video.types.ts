@@ -1,3 +1,5 @@
+import { VideoContentKind } from './video-content-kind.types';
+
 export interface VideoRecord {
   id: string;
   seriesId: string;
@@ -15,6 +17,14 @@ export interface VideoRecord {
   /** Pixel dimensions measured with ffprobe against the real source file. */
   width?: number;
   height?: number;
+  /**
+   * Explicit catalog classification - `drama` for real user-facing content,
+   * `qa_fixture` for internal technical fixtures kept in the catalog on
+   * purpose. Persisted on `Video.contentKind`; never inferred from title,
+   * channel, language, storage key or dimensions. Required rather than
+   * optional so every construction site has to declare it.
+   */
+  contentKind: VideoContentKind;
 }
 
 export interface VideoResponseDto {
@@ -34,6 +44,14 @@ export interface VideoResponseDto {
   durationSeconds?: number;
   width?: number;
   height?: number;
+  /**
+   * Explicit catalog classification - `drama` for real user-facing content,
+   * `qa_fixture` for internal technical fixtures kept in the catalog on
+   * purpose. Persisted on `Video.contentKind`; never inferred from title,
+   * channel, language, storage key or dimensions. Required rather than
+   * optional so every construction site has to declare it.
+   */
+  contentKind: VideoContentKind;
 }
 
 /**

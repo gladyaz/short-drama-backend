@@ -6,6 +6,7 @@ import { AppModule } from './../src/app.module';
 import { AppExceptionFilter } from './../src/common/filters/app-exception.filter';
 import { PrismaService } from './../src/prisma/prisma.service';
 import { StorageService } from './../src/storage/storage.service';
+import { VideoContentKind } from './../src/videos/video-content-kind.types';
 import type { AuthResponseDto } from './../src/auth/auth.types';
 import {
   deriveAccessTier,
@@ -142,6 +143,43 @@ describe('Videos (e2e)', () => {
       expect(video.hasEmbeddedIndonesianSubtitle).toBe(true);
       expect(video.storageKey.startsWith('/')).toBe(false);
     }
+  });
+
+  it('GET /videos/feed exposes an explicit contentKind on every row, consistent with GET /videos/:id', async () => {
+    const feed = (
+      await request(app.getHttpServer())
+        .get('/videos/feed')
+        .expect(HttpStatus.OK)
+    ).body as VideoResponseDto[];
+
+    expect(feed.length).toBeGreaterThan(0);
+
+    for (const video of feed) {
+      // Present on EVERY row - a client must never have to infer the
+      // classification from title, channel, language or storage key.
+      expect(video).toHaveProperty('contentKind');
+      expect([VideoContentKind.DRAMA, VideoContentKind.QA_FIXTURE]).toContain(
+        video.contentKind,
+      );
+    }
+
+    // Real catalog rows are classified as drama by the column default, with
+    // no per-row declaration needed.
+    expect(
+      feed.some((video) => video.contentKind === VideoContentKind.DRAMA),
+    ).toBe(true);
+
+    // The single-video endpoint must agree with the feed, or a client that
+    // deep-links into a video would classify it differently from the list it
+    // came from.
+    const sample = feed[0];
+    const single = (
+      await request(app.getHttpServer())
+        .get(`/videos/${sample.id}`)
+        .expect(HttpStatus.OK)
+    ).body as VideoResponseDto;
+
+    expect(single.contentKind).toBe(sample.contentKind);
   });
 
   /**

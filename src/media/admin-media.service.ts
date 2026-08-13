@@ -51,6 +51,10 @@ const UPDATABLE_METADATA_FIELDS = [
   'sourceLanguage',
   'episodeNumber',
   'hasEmbeddedIndonesianSubtitle',
+  // Included so a row misclassified at creation time can be corrected
+  // through the guarded admin API rather than by hand-written SQL - which
+  // is exactly how the two pre-existing QA fixtures had to be fixed.
+  'contentKind',
 ] as const;
 
 /**
@@ -76,6 +80,8 @@ type VideoRow = {
   sourceLanguage: string;
   hasEmbeddedIndonesianSubtitle: boolean;
   lifecycleState: string;
+  /** Plain string at rest, like `lifecycleState` - see the schema comment. */
+  contentKind: string;
   objectStorageKey: string | null;
   objectStorageVariant: string | null;
   coverImageKey: string | null;
@@ -178,6 +184,13 @@ export class AdminMediaService {
         expectedSizeBytes: dto.sizeBytes,
         expectedContentType: dto.contentType,
         lifecycleState: MediaLifecycleState.DRAFT,
+        // Explicit when the caller declared one, otherwise the column
+        // default (`drama`). An internal fixture can therefore mark itself
+        // at creation time instead of being indistinguishable from real
+        // content until someone patches it in SQL.
+        ...(dto.contentKind === undefined
+          ? {}
+          : { contentKind: dto.contentKind }),
         // Work unit 11F-4: every newly created row gets an explicit
         // access tier at creation time, derived from `episodeNumber`
         // exactly like the backfill migration and `prisma/seed.ts` do —

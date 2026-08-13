@@ -1,12 +1,15 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
 import * as fs from 'fs';
+import { readFileSync } from 'fs';
+import { join } from 'path';
 import { AppErrorCode } from '../common/errors/app-error-code';
 import { AppException } from '../common/errors/app.exception';
 import { PrismaService } from '../prisma/prisma.service';
 import { PLAYBACK_URL_EXPIRY_SECONDS } from '../storage/storage.constants';
 import { StorageService } from '../storage/storage.service';
 import * as hlsPlaybackTokenUtil from '../transcode/hls/hls-playback-token.util';
+import { VideoContentKind } from './video-content-kind.types';
 import { VideosService } from './videos.service';
 import { VIDEOS } from './videos.data';
 
@@ -305,6 +308,165 @@ describe('VideosService', () => {
 
       expect(caught).toBeInstanceOf(AppException);
       expect((caught as AppException).code).toBe(AppErrorCode.VIDEO_NOT_FOUND);
+    });
+  });
+
+  describe('contentKind classification contract', () => {
+    const qaFixtureId = `${testVideoIdPrefix}-qa`;
+
+    /**
+     * The two real synthetic rows the QA-data reconciliation statement in
+     * `*_add_video_content_kind/migration.sql` targets by primary key. Asserted
+     * against the live catalog rather than a fixture, because the point of
+     * those statements is that THESE rows are classified - a fixture could
+     * pass while the real reconciliation silently missed.
+     */
+    const REAL_QA_FIXTURE_IDS = [
+      'media-11rqa-8ac6a7f3',
+      'media-54d5a084-bd85-4939-ba60-ab6534916a48',
+    ];
+
+    beforeEach(async () => {
+      await prisma.video.create({
+        data: {
+          id: qaFixtureId,
+          seriesId: `${testVideoIdPrefix}-series`,
+          title: 'Spec QA Fixture',
+          episodeNumber: 99,
+          channelName: 'Spec Channel',
+          caption: 'Spec QA fixture caption',
+          category: 'drama',
+          storageKey: 'Spec Series/qa.mp4',
+          sourceLanguage: 'zh',
+          hasEmbeddedIndonesianSubtitle: true,
+          likeCount: 0,
+          contentKind: 'qa_fixture',
+        },
+      });
+    });
+
+    it('exposes contentKind on every feed row', async () => {
+      const feed = await service.findAll();
+
+      expect(feed.length).toBeGreaterThan(0);
+      for (const video of feed) {
+        expect(Object.keys(video)).toContain('contentKind');
+        expect([VideoContentKind.DRAMA, VideoContentKind.QA_FIXTURE]).toContain(
+          video.contentKind,
+        );
+      }
+    });
+
+    it('classifies a row that declared nothing as drama, via the column default', async () => {
+      // `testVideos` never sets contentKind - exactly like every pre-existing
+      // catalog row before the migration - so this proves the backfill
+      // default, not just an explicitly-written value.
+      const feed = await service.findAll();
+      const seeded = feed.find(
+        (video) => video.id === `${testVideoIdPrefix}-01`,
+      );
+
+      expect(seeded?.contentKind).toBe(VideoContentKind.DRAMA);
+    });
+
+    it('classifies an explicitly declared fixture as qa_fixture', async () => {
+      const feed = await service.findAll();
+
+      expect(feed.find((video) => video.id === qaFixtureId)?.contentKind).toBe(
+        VideoContentKind.QA_FIXTURE,
+      );
+    });
+
+    it('pins the migration statement that reclassifies the two known QA rows', () => {
+      // The behavioural check below can only assert what is IN the database it
+      // runs against, and the two synthetic ids exist only where they were
+      // created - not in a fresh test/CI database. Without this, deleting the
+      // reconciliation UPDATE from the migration would leave the whole suite
+      // green. Reading the committed SQL is what makes the guard hold
+      // everywhere.
+      const migrationSql = readFileSync(
+        join(
+          __dirname,
+          '../../prisma/migrations/20260813124007_add_video_content_kind/migration.sql',
+        ),
+        'utf8',
+      );
+      const statement = migrationSql
+        .split('\n')
+        .filter((line) => !line.trim().startsWith('--'))
+        .join('\n');
+
+      expect(statement).toMatch(/UPDATE\s+"Video"/i);
+      expect(statement).toMatch(/SET\s+"contentKind"\s*=\s*'qa_fixture'/i);
+      for (const id of REAL_QA_FIXTURE_IDS) {
+        expect(statement).toContain(id);
+      }
+      // Scoped by primary key - never by a title/channel/language pattern.
+      expect(statement).toMatch(/WHERE\s+"id"\s+IN/i);
+    });
+
+    it('classifies the two real reconciled QA rows as qa_fixture, where they exist', async () => {
+      const feed = await service.findAll();
+      const present = REAL_QA_FIXTURE_IDS.filter((id) =>
+        feed.some((video) => video.id === id),
+      );
+
+      // A fresh test/CI database legitimately has neither fixture; the
+      // statement itself is pinned by the test above, so this one only has to
+      // prove the applied result wherever they are present.
+      for (const id of present) {
+        expect(feed.find((video) => video.id === id)?.contentKind).toBe(
+          VideoContentKind.QA_FIXTURE,
+        );
+      }
+    });
+
+    it('drops no row: a qa_fixture is still served by the feed', async () => {
+      // The classification is metadata for clients, NOT a server-side filter.
+      // The 11R HLS sample has to stay reachable for internal playback QA.
+      //
+      // Asserted against rows THIS spec owns rather than a global COUNT:
+      // other suites create and delete fixtures in the same database
+      // concurrently, so comparing findAll()'s length to a separately-executed
+      // count is a race, not a guarantee.
+      const feed = await service.findAll();
+      const ids = new Set(feed.map((video) => video.id));
+
+      expect(ids.has(qaFixtureId)).toBe(true);
+      expect(feed.find((video) => video.id === qaFixtureId)?.contentKind).toBe(
+        VideoContentKind.QA_FIXTURE,
+      );
+      for (const seeded of testVideos) {
+        expect(ids.has(seeded.id)).toBe(true);
+      }
+    });
+
+    it('leaves the feed contract otherwise unchanged - one page, no duplicates', async () => {
+      // `findAll` takes no arguments and returns a single page; the ordering
+      // contract (`orderBy: { sortOrder: 'asc' }`) is untouched by this slice.
+      // Scoped to this spec's own rows for the same reason as above - a
+      // global comparison races other suites.
+      const feed = await service.findAll();
+      const ids = feed.map((video) => video.id);
+
+      expect(new Set(ids).size).toBe(ids.length);
+      for (const owned of [
+        ...testVideos.map((video) => video.id),
+        qaFixtureId,
+      ]) {
+        expect(ids).toContain(owned);
+      }
+    });
+
+    it('reports the same classification from findById as from the feed', async () => {
+      const feed = await service.findAll();
+
+      for (const id of [`${testVideoIdPrefix}-01`, qaFixtureId]) {
+        const fromFeed = feed.find((video) => video.id === id);
+        const fromById = await service.findById(id);
+
+        expect(fromById.contentKind).toBe(fromFeed?.contentKind);
+      }
     });
   });
 

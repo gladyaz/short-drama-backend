@@ -196,6 +196,37 @@ model Video {
   /// column default (which exists for backfill safety, not as the intended
   /// state for freshly created rows).
   lifecycleState                String    @default("published")
+  /// Explicit catalog content classification (`VideoContentKind` in
+  /// `src/videos/video-content-kind.types.ts`): `"drama"` for real,
+  /// user-facing content, `"qa_fixture"` for internal technical fixtures that
+  /// live in the catalog on purpose (the 11R HLS sample, a disposable
+  /// admin-upload test row). It exists because NO pre-existing field could
+  /// tell the two apart reliably — `sourceLanguage` describes the content's
+  /// language rather than its realness, an empty `storageKey` is how
+  /// R2-backed media is legitimately represented, and title/channelName are
+  /// display strings. Clients must READ this field, never infer it.
+  ///
+  /// Defaults to `"drama"` so the additive migration leaves every one of the
+  /// 42 pre-existing rows a normal catalog row — the same backfill-safety
+  /// reasoning as `lifecycleState`/`sortOrder` above — and so a future admin
+  /// upload, which is real content, is correctly classified without the
+  /// caller having to remember. The two known synthetic rows are set to
+  /// `"qa_fixture"` by a targeted, id-scoped QA-data reconciliation statement
+  /// in the same migration; that statement is data cleanup for two known
+  /// fixtures, NOT runtime classification logic.
+  ///
+  /// Plain `String`, not a Postgres enum, matching the
+  /// `category`/`lifecycleState`/`Entitlement.tier` precedent: a third kind
+  /// (trailer, promo) then needs no SCHEMA migration — but it does need the
+  /// `VideoContentKind` enum and `toVideoContentKind()` updated, because that
+  /// narrowing function reports anything it does not recognise as `drama`
+  /// (and logs a warning). "No migration" is not "no code change".
+  ///
+  /// DELIBERATELY NOT FILTERED SERVER-SIDE. `VideosService#findAll` still
+  /// returns qa_fixture rows, so internal QA and the 11R playback sample keep
+  /// working exactly as before; excluding them from a consumer catalog is the
+  /// presenting client's decision.
+  contentKind                   String    @default("drama")
   /// Phase 11, work unit 11E-3: per-episode admin access-tier override.
   /// Nullable with NO default, so every one of the 40 pre-existing rows (and
   /// every caller that creates/updates a `Video` without specifying it, e.g.

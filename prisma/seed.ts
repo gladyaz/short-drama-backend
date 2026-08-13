@@ -29,6 +29,14 @@ import { VIDEOS } from '../src/videos/videos.data';
  * OMITTED from the `update` branch: re-running this seed against an
  * already-seeded database must never reset an admin's explicit override
  * (set via `PATCH /admin/media/:id/access-tier`) back to the derived
+ * EXCEPTION (content classification): `contentKind` IS present in `record`
+ * and therefore IS written by the `update` branch. That is intentional for
+ * these 40 curated rows - they are real drama by definition, so the seed
+ * owning their classification is correct. It does mean reclassifying one of
+ * THEM to `qa_fixture` would be reverted by the next seed run; the two real
+ * QA fixtures are unaffected, as they carry `media-*` ids that are not in
+ * `VIDEOS` and are never upserted here.
+ *
  * default, matching the existing precedent that `update` never touches any
  * other admin-settable additive column (`lifecycleState`, object-storage
  * keys, etc. are likewise absent from `record` and therefore untouched here).

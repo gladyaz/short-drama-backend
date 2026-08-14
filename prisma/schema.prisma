@@ -499,6 +499,50 @@ model Series {
   /// actually removes the row and is refused (409) whenever the series
   /// still has published episodes.
   archivedAt    DateTime?
+  /// Work unit "SERIES COVER UPLOAD BACKEND CONTRACT" fix cycle 1 (2026-08-15,
+  /// closing the reviewer-reproduced stale/replayed-`complete` HIGH finding):
+  /// the durable, server-side record of the ONE object key `createCoverUpload`
+  /// most recently minted for this series — mirrors the 11P
+  /// `TranscodeIntentService`/`processingVersion` precedent of persisting
+  /// upload/processing INTENT so a later completion step can be verified
+  /// against a durable expectation, not trusted on its shape alone. Nullable
+  /// with NO default, so every pre-existing row (all 4 seeded `Series` rows,
+  /// and any row created before this migration) keeps compiling and
+  /// backfills to `null` — this additive migration changes no existing row's
+  /// value, and does NOT retroactively invent a pending key for a series that
+  /// never had an in-flight upload.
+  ///
+  /// Written by exactly two places:
+  /// - `SeriesService.createCoverUpload` sets it to the freshly minted key on
+  ///   EVERY presign call, overwriting any prior pending value — "latest mint
+  ///   wins". This does NOT reintroduce the "no `coverImageKey` persistence on
+  ///   presign" criterion this work unit's original acceptance criterion 1
+  ///   established: `coverImageKey` (the PUBLIC, served cover) and the public
+  ///   `coverUrl` derived from it are completely untouched by this write —
+  ///   `pendingCoverImageKey` is purely private upload-intent bookkeeping, an
+  ///   internal column no read DTO (`SeriesDto`/`SeriesWithCoverDto`) exposes.
+  /// - `SeriesService.completeCoverUpload` clears it back to `null` the
+  ///   instant a matching key is successfully verified and promoted to
+  ///   `coverImageKey`.
+  /// - `SeriesService.update` ALSO clears it whenever `coverImageKey` is
+  ///   explicitly set to `null` via `PATCH /admin/series/:id` — an explicit
+  ///   clear invalidates any upload that was still in flight, so a
+  ///   stale/replayed `complete` for that abandoned key has nothing left to
+  ///   match.
+  ///
+  /// `completeCoverUpload` accepts `dto.key` ONLY when it equals this column
+  /// (the normal, in-flight-upload path) OR equals the row's CURRENT
+  /// `coverImageKey` (an idempotent re-complete of an already-persisted
+  /// cover, a harmless no-op). Any other well-formed
+  /// (`isValidSeriesCoverObjectKey`-passing) key is neither the row's current
+  /// intent nor its current live cover — it is a SUPERSEDED or already-cleared
+  /// key from an earlier generation — and is rejected with `409
+  /// SERIES_COVER_KEY_SUPERSEDED` rather than silently re-applied. This is
+  /// what closes the reviewer's two reproduced repros: replaying `complete`
+  /// with an old, already-superseded key can never again revert a
+  /// since-replaced cover, and can never again "un-clear" a cover that was
+  /// explicitly PATCHed to `null`.
+  pendingCoverImageKey String?
 
   @@index([sortOrder])
 }

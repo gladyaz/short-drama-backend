@@ -11,12 +11,23 @@ import {
   Query,
   UseGuards,
 } from '@nestjs/common';
+import { Throttle } from '@nestjs/throttler';
 import { AdminGuard } from '../admin/guards/admin.guard';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
+import {
+  ADMIN_MEDIA_UPLOAD_INITIATE_RATE_LIMIT,
+  ADMIN_MEDIA_UPLOAD_INITIATE_RATE_TTL_MS,
+} from '../common/rate-limit.constants';
+import { CompleteSeriesCoverUploadDto } from './dto/complete-series-cover-upload.dto';
+import { CreateSeriesCoverUploadDto } from './dto/create-series-cover-upload.dto';
 import { CreateSeriesDto } from './dto/create-series.dto';
 import { ListAdminSeriesQueryDto } from './dto/list-admin-series-query.dto';
 import { UpdateSeriesDto } from './dto/update-series.dto';
-import { SeriesDto } from './series.types';
+import {
+  CreateSeriesCoverUploadResponseDto,
+  SeriesDto,
+  SeriesWithCoverDto,
+} from './series.types';
 import { SeriesService } from './series.service';
 
 /**
@@ -37,7 +48,7 @@ export class SeriesController {
   constructor(private readonly seriesService: SeriesService) {}
 
   @Get()
-  list(@Query() query: ListAdminSeriesQueryDto): Promise<SeriesDto[]> {
+  list(@Query() query: ListAdminSeriesQueryDto): Promise<SeriesWithCoverDto[]> {
     return this.seriesService.list(query);
   }
 
@@ -50,7 +61,7 @@ export class SeriesController {
    * `@Get()`/`@Get(':id')` precedent.
    */
   @Get(':id')
-  findById(@Param('id') id: string): Promise<SeriesDto> {
+  findById(@Param('id') id: string): Promise<SeriesWithCoverDto> {
     return this.seriesService.findById(id);
   }
 
@@ -65,6 +76,48 @@ export class SeriesController {
     @Body() body: UpdateSeriesDto,
   ): Promise<SeriesDto> {
     return this.seriesService.update(id, body);
+  }
+
+  /**
+   * Work unit "SERIES COVER UPLOAD BACKEND CONTRACT" (approved 2026-08-14):
+   * presign-init for a cover-image upload. Mirrors
+   * `AdminMediaController`'s dedicated, tighter-than-default throttle on
+   * its own presigned-PUT-minting route (`ADMIN_MEDIA_UPLOAD_INITIATE_RATE_
+   * LIMIT`, 60/minute) — same rationale here: each call mints a real,
+   * credential-backed presigned R2 `PUT` URL, so this must not inherit the
+   * generous app-wide default throttle.
+   */
+  @Post(':id/cover')
+  @Throttle({
+    default: {
+      limit: ADMIN_MEDIA_UPLOAD_INITIATE_RATE_LIMIT,
+      ttl: ADMIN_MEDIA_UPLOAD_INITIATE_RATE_TTL_MS,
+    },
+  })
+  createCoverUpload(
+    @Param('id') id: string,
+    @Body() body: CreateSeriesCoverUploadDto,
+  ): Promise<CreateSeriesCoverUploadResponseDto> {
+    return this.seriesService.createCoverUpload(id, body);
+  }
+
+  /**
+   * Work unit "SERIES COVER UPLOAD BACKEND CONTRACT": verifies the upload
+   * and, only on success, persists `Series.coverImageKey` (see
+   * `SeriesService.completeCoverUpload`'s doc comment for the full
+   * verification order). No dedicated throttle override — unlike the
+   * presign-init route above, this does not mint a new credential-backed
+   * URL; it relies on the app-wide default throttler, matching
+   * `AdminMediaController.completeUpload`'s existing precedent (also
+   * un-throttled beyond the default).
+   */
+  @HttpCode(HttpStatus.OK)
+  @Post(':id/cover/complete')
+  completeCoverUpload(
+    @Param('id') id: string,
+    @Body() body: CompleteSeriesCoverUploadDto,
+  ): Promise<SeriesWithCoverDto> {
+    return this.seriesService.completeCoverUpload(id, body);
   }
 
   /**

@@ -316,4 +316,52 @@ export enum AppErrorCode {
    * value, is what's being reported).
    */
   HLS_GATEWAY_NOT_CONFIGURED = 'HLS_GATEWAY_NOT_CONFIGURED',
+  // Work unit "SERIES COVER UPLOAD BACKEND CONTRACT" (approved 2026-08-14)
+  /**
+   * Returned by `POST /admin/series/:id/cover/complete` when `key` does not
+   * have the exact `admin-series/<this series' id>/cover/<uuid>` shape this
+   * series' own presign step would have minted — e.g. it belongs to a
+   * DIFFERENT series, an unrelated `admin-media/...` object, or is simply
+   * malformed. Checked BEFORE any `StorageService.headObject` call, so a
+   * crafted key is rejected without ever asking storage about it.
+   */
+  SERIES_COVER_KEY_INVALID = 'SERIES_COVER_KEY_INVALID',
+  /**
+   * Returned by `POST /admin/series/:id/cover/complete` when the uploaded
+   * object's real, R2-reported `Content-Type` (`StorageService.headObject`)
+   * is not one of `ALLOWED_SERIES_COVER_CONTENT_TYPES`
+   * (`series/series-cover.constants.ts`) — checked against the actual HEAD
+   * response, not the client's presign-time declaration (nothing is
+   * persisted between presign and complete to compare against; see
+   * `SeriesService.createCoverUpload`'s doc comment). `Series.coverImageKey`
+   * is left untouched.
+   */
+  SERIES_COVER_CONTENT_TYPE_NOT_ALLOWED = 'SERIES_COVER_CONTENT_TYPE_NOT_ALLOWED',
+  /**
+   * Returned by `POST /admin/series/:id/cover/complete` when the uploaded
+   * object's real size (`StorageService.headObject`'s `contentLength`) is
+   * zero or exceeds `MAX_SERIES_COVER_UPLOAD_BYTES`
+   * (`series/series-cover.constants.ts`). `Series.coverImageKey` is left
+   * untouched.
+   */
+  SERIES_COVER_SIZE_OUT_OF_BOUND = 'SERIES_COVER_SIZE_OUT_OF_BOUND',
+  // Work unit "SERIES COVER UPLOAD BACKEND CONTRACT" fix cycle 1 (2026-08-15)
+  /**
+   * Returned by `POST /admin/series/:id/cover/complete` when `key` is a
+   * well-formed key for THIS series (passes `isValidSeriesCoverObjectKey`)
+   * but matches NEITHER the series' current `pendingCoverImageKey` (the most
+   * recently minted, still-in-flight upload intent) NOR its current
+   * `coverImageKey` (the idempotent-re-complete case, which is a no-op
+   * success, not this error). Closes a reviewer-reproduced HIGH finding: a
+   * stale/replayed `complete` call carrying an OLD, already-superseded key —
+   * e.g. one from before a legitimate replace, or one minted before an
+   * explicit `PATCH { coverImageKey: null }` clear — could previously
+   * silently succeed and revert/un-clear `Series.coverImageKey`. Now it is
+   * rejected outright: `Series.coverImageKey` is left completely untouched.
+   * Deliberately distinct from `SERIES_COVER_KEY_INVALID` (that code means
+   * "this key was never a valid shape for this series at all"; this one
+   * means "the key IS a real key this series once minted, but it is no
+   * longer the current pending or live one").
+   */
+  SERIES_COVER_KEY_SUPERSEDED = 'SERIES_COVER_KEY_SUPERSEDED',
 }

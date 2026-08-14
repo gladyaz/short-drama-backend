@@ -42,6 +42,64 @@ Any change to a route, field, shape, status code, or error code documented
 here requires a new, explicit `DECISIONS.md` entry re-freezing the contract
 before 11F-6/11F-7 (or any later work) may rely on the changed behavior.
 
+**Re-freeze, 2026-08-14 (work unit "SERIES COVER UPLOAD BACKEND CONTRACT",
+approved in the control workspace's `DECISIONS.md` "2026-08-14 — SERIES
+COVER UPLOAD BACKEND CONTRACT APPROVED..." entry and
+`phases/phase-series-metadata.md` §"Work unit 2", baseline `a895116`,
+recorded BEFORE implementation):** adds the real Series poster/cover upload
+flow this document had no prior coverage for, and changes two previously
+frozen behaviors:
+1. **New:** `POST /admin/series/:id/cover` (presign-init) and
+   `POST /admin/series/:id/cover/complete` (verify + persist) — see the
+   "Admin series" section below.
+2. **Changed:** `PATCH /admin/series/:id`'s `coverImageKey` now explicitly
+   accepts `null` (clears the cover) as a documented, distinct third state
+   alongside "omitted" (unchanged) and "a string" (set/replace) — previously
+   undocumented (an accidental side effect of `class-validator`'s
+   `@IsOptional()`, never a stated contract).
+3. **Changed:** `GET /admin/series` and `GET /admin/series/:id` now return
+   `SeriesWithCoverDto` (adds a signed `coverUrl` field) instead of the plain
+   `SeriesDto` — additive, all previously-documented fields are unchanged.
+   `POST /admin/series`, `PATCH /admin/series/:id`, and the archive/unarchive
+   routes are UNCHANGED — they still return the plain `SeriesDto`.
+
+Nothing about `POST /admin/media`, `GET/PATCH /admin/media/:id`,
+`POST /admin/media/:id/complete-upload`, `publish`/`unpublish`, or the
+pre-existing `POST /admin/media/:id/cover`/`:id/thumbnail` routes changed —
+those stay exactly as documented below (the new series-cover routes are a
+separate, additive surface, deliberately not built on top of the pre-existing
+`CreateMediaAssetUploadDto`/`createAssetUpload` pattern — see this section's
+own note on why).
+
+**Re-freeze, 2026-08-15 (fix cycle 1, closing a reviewer-reproduced HIGH
+finding against the 2026-08-14 cover-upload contract above):** a reviewer
+proved that, because nothing was persisted at presign time, `POST
+/admin/series/:id/cover/complete` accepted ANY previously-minted, well-formed
+key for a series forever — including one from a generation already replaced
+by a later upload, or one whose cover had since been explicitly cleared via
+`PATCH { coverImageKey: null }`. A stale/replayed `complete` call could
+therefore silently revert a legitimate replace, or silently un-clear an
+explicit clear. This is now closed with an additive, nullable
+`Series.pendingCoverImageKey` column (mirroring the 11P
+`TranscodeIntentService` durable-intent precedent):
+1. `POST /admin/series/:id/cover` now ALSO writes the freshly minted key into
+   `pendingCoverImageKey` (latest mint always wins — a new presign
+   invalidates any earlier one). Still does **not** touch the public
+   `coverImageKey`/`coverUrl`.
+2. `POST /admin/series/:id/cover/complete` now accepts `key` only when it
+   equals the row's CURRENT `pendingCoverImageKey` (normal path) or its
+   CURRENT `coverImageKey` (idempotent re-complete, unchanged). Any other
+   well-formed key is rejected with a new `409 SERIES_COVER_KEY_SUPERSEDED`
+   — never silently re-applied.
+3. `PATCH /admin/series/:id { coverImageKey: null }` now ALSO clears
+   `pendingCoverImageKey` in the same write — an explicit clear invalidates
+   any upload that was still in flight.
+
+See the "Admin series" section's `POST /admin/series/:id/cover/complete`
+entry and the error-codes table below for the full updated behavior. Every
+other 2026-08-14 behavior (replace semantics, idempotency on the
+already-live key, the four independent verification checks) is unchanged.
+
 ## Conventions
 
 - No global route prefix (e.g. `GET /health`, not `GET /api/health`).
@@ -348,13 +406,16 @@ touches, updates, or reorders any `Video` row (except the read-only count
 Query param `includeArchived` (`ListAdminSeriesQueryDto`, optional): a
 strict `"true"`/`"false"` string (case-insensitive) coerced to boolean; any
 other value → `400`. **Excludes archived rows by default** — pass
-`?includeArchived=true` to include them too. Returns `200 SeriesDto[]`,
-ordered by `sortOrder` then `id`. No pagination on this route.
+`?includeArchived=true` to include them too. Returns `200
+SeriesWithCoverDto[]` (2026-08-14 re-freeze: `SeriesDto` plus a signed
+`coverUrl`, see `SeriesWithCoverDto` below), ordered by `sortOrder` then
+`id`. No pagination on this route.
 
 ### `GET /admin/series/:id`
 
-Returns `200 SeriesDto` (archived or not — only the default `list` view
-hides archived rows), or `404 SERIES_NOT_FOUND` for an unknown `id`.
+Returns `200 SeriesWithCoverDto` (archived or not — only the default `list`
+view hides archived rows; an episode-less series returns normally too, this
+route never reads `Video`), or `404 SERIES_NOT_FOUND` for an unknown `id`.
 
 ### `POST /admin/series`
 
@@ -369,16 +430,145 @@ Body (`CreateSeriesDto`):
 
 A duplicate `id` (pre-checked, and also caught if a race loses to a raw
 Postgres unique-constraint violation) → `409 SERIES_ALREADY_EXISTS`. Returns
-`201 SeriesDto`.
+`201 SeriesDto` (the plain shape — NOT `SeriesWithCoverDto`; unchanged by the
+2026-08-14 re-freeze).
 
 ### `PATCH /admin/series/:id`
 
 Body (`UpdateSeriesDto`): any subset of `title` (1–200 chars),
-`coverImageKey` (1–500 chars), `sortOrder` (int `>= 0`) — same constraints
-as create. `id` itself is not accepted in the body (immutable; rejected by
-the global whitelist). At least one field must be present, or `400
-EMPTY_SERIES_UPDATE`. Unknown `id` → `404 SERIES_NOT_FOUND`. Returns `200
-SeriesDto` (updated).
+`coverImageKey`, `sortOrder` (int `>= 0`). `id` itself is not accepted in the
+body (immutable; rejected by the global whitelist). At least one field must
+be present, or `400 EMPTY_SERIES_UPDATE`. Unknown `id` → `404
+SERIES_NOT_FOUND`. Returns `200 SeriesDto` (updated; the plain shape, not
+`SeriesWithCoverDto`).
+
+**`coverImageKey`'s three explicit states (2026-08-14 re-freeze — previously
+undocumented):**
+- **Omitted from the body:** unchanged.
+- **`null`:** explicitly clears the cover (`Series.coverImageKey` is set to
+  `NULL`). This is the only route that can clear a cover — there is no
+  dedicated `DELETE .../cover` route.
+- **A non-empty string, 1–500 chars:** sets/replaces the raw object key —
+  unchanged behavior from before the re-freeze. In normal operation this is
+  set via the verified `POST /admin/series/:id/cover` +
+  `.../cover/complete` flow below, not by writing an unverified key directly
+  through this route.
+
+### `POST /admin/series/:id/cover` (NEW, 2026-08-14 re-freeze)
+
+Presign-init for a cover-image upload. Body (`CreateSeriesCoverUploadDto`,
+both fields REQUIRED):
+
+| Field | Type | Constraint |
+|---|---|---|
+| `contentType` | string | one of `image/jpeg`, `image/png`, `image/webp` (closed allow-list — no SVG/video/`application/*`) |
+| `sizeBytes` | integer | `1`–`10485760` (10 MiB, `MAX_SERIES_COVER_UPLOAD_BYTES`) |
+
+Unknown `id` → `404 SERIES_NOT_FOUND` (checked before any presign). The
+object key is entirely SERVER-generated —
+`admin-series/<url-encoded seriesId>/cover/<uuid>` — the client never
+supplies or chooses a key; a raw `key` field in the request body is rejected
+by the global whitelist (`400`). Returns `201`:
+
+```json
+{ "upload": { "url": "...", "key": "...", "expiresAt": "..." } }
+```
+
+Does **not** persist `Series.coverImageKey` or return a `series`/`media`
+field — nothing is confirmed uploaded yet. Rate-limited to the same 60
+requests/minute as `POST /admin/media` (`ADMIN_MEDIA_UPLOAD_INITIATE_RATE_LIMIT`,
+see "Rate limiting" below) — each call mints a real, credential-backed
+presigned R2 `PUT` URL.
+
+**Fix cycle 1 (2026-08-15): DOES write `Series.pendingCoverImageKey` = the
+freshly minted key** (overwriting any prior pending value — the latest mint
+always wins). This is a private, internal upload-INTENT record, never
+exposed on `SeriesDto`/`SeriesWithCoverDto` and never itself treated as "the
+cover" — the "does not persist `coverImageKey`" guarantee above is
+completely unaffected; `pendingCoverImageKey` is a separate column that only
+`POST .../cover/complete` reads, to verify a caller's `key` against a
+durable server record instead of trusting the key's shape alone. See that
+route's entry below.
+
+### `POST /admin/series/:id/cover/complete` (NEW, 2026-08-14 re-freeze;
+**currency check ADDED 2026-08-15, fix cycle 1**)
+
+Verifies the upload and, only on success, persists
+`Series.coverImageKey`. Body (`CompleteSeriesCoverUploadDto`):
+`{ "key": "..." }` — the exact `key` the preceding presign-init response
+returned. Checks, in order, BEFORE any database write:
+
+1. The series exists (`404 SERIES_NOT_FOUND` otherwise).
+2. `key` has the exact `admin-series/<this series' id>/cover/<uuid>` shape
+   THIS series' own presign step would have minted — a key belonging to a
+   different series, an `admin-media/...` object, or any malformed string
+   → `400 SERIES_COVER_KEY_INVALID` (checked before any storage call).
+3. **(fix cycle 1 — currency check)** `key` must equal EITHER the series'
+   current `pendingCoverImageKey` (the normal path — proceeds to checks 4–5
+   below) OR its current `coverImageKey` (an idempotent re-complete of the
+   already-live cover — an immediate `200` no-op, no re-verification, no
+   re-write, identical to the pre-2026-08-15 idempotent behavior). Any OTHER
+   well-formed key — real shape, but neither the current upload intent nor
+   the current live cover — is a superseded/stale/replayed key from an
+   earlier generation → `409 SERIES_COVER_KEY_SUPERSEDED`. **This is what
+   makes a stale/replayed `complete` call harmless instead of a silent
+   revert or un-clear** — see the 2026-08-15 re-freeze note above for the
+   two reproduced attack scenarios this closes.
+4. The object actually exists at that key (`StorageService.headObject`) →
+   `400 MEDIA_FILE_NOT_FOUND` if not.
+5. The object's REAL, R2-reported `Content-Type` is one of the allowed MIME
+   types → `409 SERIES_COVER_CONTENT_TYPE_NOT_ALLOWED` if not.
+6. The object's REAL, R2-reported size is within `1`–`10485760` bytes →
+   `409 SERIES_COVER_SIZE_OUT_OF_BOUND` if not.
+
+**Content-Type/Content-Length are checked at complete-time against R2's own
+reported HEAD metadata (checks 5–6), never the client's presign-time
+declaration or the raw request bytes** — the presigned `PUT` itself does
+**not** cryptographically bind what gets uploaded to the `contentType`/
+`sizeBytes` originally declared at presign-init; a client could `PUT` bytes
+of a different real type/size than it declared, and R2 will happily store
+them. `headObject`'s response is the authoritative, independently-verified
+source of truth this route checks against — but it is still a `Content-Type`
+*label* R2 reports (whatever the uploader's `PUT` set it to), **not**
+magic-byte/content-sniffing of the actual image bytes. A caller could
+therefore upload non-image bytes labeled with an allowed image
+`Content-Type` and pass checks 5–6. This is a known, documented gap, not a
+claim of full content validation — real magic-byte sniffing is explicitly
+**future hardening**, not implemented by this contract.
+
+Only once every check passes does this write `Series.coverImageKey = key`
+and, in the SAME write, clear `Series.pendingCoverImageKey` back to `null`
+(fix cycle 1) — then return `200 SeriesWithCoverDto` (including a freshly
+signed `coverUrl`). **Idempotent**: calling this again with the same,
+already-persisted `key` (i.e. `key === coverImageKey`) is a no-op success —
+unchanged from before the 2026-08-15 fix, though now implemented as an
+explicit short-circuit (check 3) rather than a harmless re-verification.
+
+**Replace semantics:** the OLD `coverImageKey` stays authoritative until a
+NEW upload is independently verified — a failed verification (any of checks
+2–6 above) leaves `Series.coverImageKey` completely untouched, never
+partially cleared or overwritten; a failure at check 5 or 6 ALSO leaves
+`pendingCoverImageKey` untouched (the upload can be retried against the same
+pending key without re-presigning). A successful replacement overwrites the
+pointer with the new key.
+
+**Orphan behavior (documented, not automated):** replacing a cover does
+**not** delete the previous object from R2 — `SeriesService` never calls
+`StorageService.deleteObject` for a cover. The old object becomes an orphan
+once nothing references it; cleaning up orphaned cover objects is not
+implemented by this work unit and would need a separate, explicit sweep
+(mirroring the existing HLS-generation janitor's pattern, `TranscodeJanitorService`,
+if ever built for covers). **A cover that is presigned but never completed
+(the client abandons the upload, or the object genuinely never lands in
+R2) is likewise an orphan-in-waiting**: `pendingCoverImageKey` records the
+intent server-side, but nothing in this work unit deletes the R2 object at
+that key, and an abandoned/failed-completion object can sit in R2
+indefinitely (bounded only by `MAX_SERIES_COVER_UPLOAD_BYTES` per object,
+and by the fact that every presign requires an authenticated, admin-guarded,
+rate-limited (`ADMIN_MEDIA_UPLOAD_INITIATE_RATE_LIMIT`) request). As with
+the replaced-cover orphan case above, a bounded, explicit sweep (mirroring
+`TranscodeJanitorService`) is the recommended future hardening — not
+implemented here.
 
 ### `POST /admin/series/:id/archive`
 
@@ -419,6 +609,24 @@ episodes, use `archive` instead — it has no such restriction.
 | `createdAt` | string (ISO 8601) |
 | `updatedAt` | string (ISO 8601) |
 | `archivedAt` | string (ISO 8601) \| null — `null` = active |
+
+## `SeriesWithCoverDto` (`src/series/series.types.ts`, 2026-08-14 re-freeze)
+
+Returned by `GET /admin/series`, `GET /admin/series/:id`, and
+`POST /admin/series/:id/cover/complete` — every `SeriesDto` field above,
+plus:
+
+| Field | Type |
+|---|---|
+| `coverUrl` | string \| null |
+
+`coverUrl` is a presigned R2 GET URL (`StorageService.createPresignedGetUrl`,
+1-hour expiry, minted fresh per request, never persisted) resolved from
+`coverImageKey`, or `null` when `coverImageKey` is unset — including for an
+archived or episode-less series (this DTO/these routes never read `Video` at
+all). Reuses the exact same `resolveSeriesCoverUrl` helper the public
+`GET /series`/`GET /series/:id` surface already uses, so the two can never
+drift.
 
 ## Access-tier model
 
@@ -532,6 +740,10 @@ caught by the filter's dedicated exposed-client-error branch and returned as
 | `INVALID_ACCESS_TOKEN` | 401 | `JwtAuthGuard`: missing/malformed/expired/invalid token |
 | `HTTP_ERROR` | 400 (usually); also 429 (rate limit, see "Rate limiting" above) and 413 (body too large, see "Request body size limit" above) | Generic class-validator/`forbidNonWhitelisted` failure, or a generic exposed `HttpException`/`http-errors`-shaped client error from outside the service layer — see "Conventions" above |
 | `INTERNAL_ERROR` | 500 | Unhandled exception fallback |
+| `SERIES_COVER_KEY_INVALID` | 400 | `POST /admin/series/:id/cover/complete`: `key` does not belong to this series' cover prefix (2026-08-14 re-freeze) |
+| `SERIES_COVER_CONTENT_TYPE_NOT_ALLOWED` | 409 | `POST /admin/series/:id/cover/complete`: the object's real `Content-Type` is not an allowed cover MIME type (2026-08-14 re-freeze) |
+| `SERIES_COVER_SIZE_OUT_OF_BOUND` | 409 | `POST /admin/series/:id/cover/complete`: the object's real size is outside `1`–`10485760` bytes (2026-08-14 re-freeze) |
+| `SERIES_COVER_KEY_SUPERSEDED` | 409 | `POST /admin/series/:id/cover/complete`: `key` is well-formed for this series but matches neither its current `pendingCoverImageKey` nor its current `coverImageKey` — a superseded/stale/replayed key (2026-08-15, fix cycle 1) |
 
 ## Explicitly still GATED (do NOT wire as real in 11F-6)
 
@@ -539,12 +751,13 @@ The admin dashboard must keep these mocked / visibly pending — none of them
 make a real network call anywhere in this backend today:
 
 - **Real R2 presigned byte uploads.** `POST /admin/media`,
-  `POST /admin/media/:id/cover`, and `POST /admin/media/:id/thumbnail` all
-  call `StorageService.createPresignedPutUrl`, and
-  `POST /admin/media/:id/complete-upload` calls
-  `StorageService.objectExists` — **every test that exercises these routes
-  mocks `StorageService`** (`src/storage/storage.service.ts` constructs a
-  real `S3Client` only when the app actually boots against real
+  `POST /admin/media/:id/cover`, `POST /admin/media/:id/thumbnail`, and (as
+  of the 2026-08-14 re-freeze) `POST /admin/series/:id/cover` all call
+  `StorageService.createPresignedPutUrl`; `POST /admin/media/:id/complete-upload`
+  and `POST /admin/series/:id/cover/complete` call
+  `StorageService.headObject`/`objectExists` — **every test that exercises
+  these routes mocks `StorageService`** (`src/storage/storage.service.ts`
+  constructs a real `S3Client` only when the app actually boots against real
   `OBJECT_STORAGE_*` env vars, which this credential-free slice never
   supplies with real credentials). The returned `upload.url` is a real
   presigned-URL shape but nothing has verified an actual byte can be PUT to

@@ -7,13 +7,13 @@ import { FREE_EPISODE_LIMIT } from '../entitlements/entitlement.constants';
 import { EntitlementsService } from '../entitlements/entitlements.service';
 import { MediaLifecycleState } from '../media/media-lifecycle.types';
 import { PrismaService } from '../prisma/prisma.service';
-import { DEFAULT_GET_URL_EXPIRY_SECONDS } from '../storage/storage.constants';
 import { StorageService } from '../storage/storage.service';
 import { VideoContentKind } from '../videos/video-content-kind.types';
 import {
   toVideoRecord,
   toVideoResponseDto,
 } from '../videos/video-response.util';
+import { resolveSeriesCoverUrl } from './series-cover-url.util';
 import {
   SeriesDetailPublicDto,
   SeriesListResponseDto,
@@ -213,34 +213,12 @@ export class PublicSeriesService {
     return {
       id: series.id,
       title: series.title,
-      coverUrl: await this.resolveCoverUrl(series.coverImageKey),
+      coverUrl: await resolveSeriesCoverUrl(
+        this.storageService,
+        series.coverImageKey,
+      ),
       ...computeSeriesAggregate(episodes, this.entitlementsService),
     };
-  }
-
-  /**
-   * Mirrors `VideosService.getPlaybackUrl`'s established R2 pattern
-   * (presigned GET, minted fresh per request, never persisted) — applied
-   * here to `Series.coverImageKey` instead of a video's playable source.
-   * `DEFAULT_GET_URL_EXPIRY_SECONDS` (1 hour, not the video-specific
-   * `PLAYBACK_URL_EXPIRY_SECONDS`), because a cover image is a generic,
-   * cacheable display asset with no playback-authorization semantics —
-   * unlike `playbackUrl`, a longer-lived cover URL does not gate access to
-   * anything.
-   */
-  private async resolveCoverUrl(
-    coverImageKey: string | null,
-  ): Promise<string | null> {
-    if (!coverImageKey) {
-      return null;
-    }
-
-    const signed = await this.storageService.createPresignedGetUrl(
-      coverImageKey,
-      { expiresInSeconds: DEFAULT_GET_URL_EXPIRY_SECONDS },
-    );
-
-    return signed.url;
   }
 }
 

@@ -24,9 +24,11 @@ import { SeriesService } from './series.service';
  * some of its routes are guarded and others (none, for that module) are
  * not. `EntitlementsModule` (for the shared
  * `EntitlementsService.resolveEpisodePremium` rule) and `StorageModule`
- * (for `StorageService.createPresignedGetUrl`, resolving `coverUrl`) are
- * imported directly, matching `VideosModule`'s existing pattern for the
- * exact same two dependencies.
+ * (for `StorageService.createPresignedGetUrl`, resolving `coverUrl`; and,
+ * as of work unit "SERIES COVER UPLOAD BACKEND CONTRACT",
+ * `createPresignedPutUrl`/`headObject` for the admin-guarded cover-upload
+ * flow on `SeriesService` too) are imported directly, matching
+ * `VideosModule`'s existing pattern for the exact same two dependencies.
  */
 @Module({
   imports: [AuthModule, AdminModule, EntitlementsModule, StorageModule],

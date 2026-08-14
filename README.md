@@ -433,10 +433,41 @@ against the live, seeded `Video.title` values (e.g. `series-010` episode
 Waktu - Episode 1"`). No runtime string heuristic (split/replace/regex on
 an episode title) is used anywhere; see the backfill migration's own doc
 comment (`prisma/migrations/20260814142551_backfill_series_metadata`) for
-the full source citation. An admin can edit a series's `title`/
-`coverImageKey`/`sortOrder` any time via the existing, unchanged
-`PATCH /admin/series/:id` (Phase 11, work unit 11E-4 — already supported
-this before this work unit; no new admin route was needed).
+the full source citation. An admin can edit a series's `title`/`sortOrder`
+any time via the existing `PATCH /admin/series/:id` (Phase 11, work unit
+11E-4).
+
+**Cover art upload (work unit "SERIES COVER UPLOAD BACKEND CONTRACT",
+2026-08-14 — a real, verified path for admins to upload the poster art
+noted above as unpopulated for all 4 series).**
+`coverImageKey` is no longer written by simply PATCHing an arbitrary string —
+the recommended path is a verified two-step upload:
+`POST /admin/series/:id/cover` (presign-init: `{contentType, sizeBytes}`,
+closed image allow-list, 10 MiB max, server-generated key) then
+`POST /admin/series/:id/cover/complete` (`{key}`: HEAD-verifies the object
+actually exists with an allowed content type and size, ONLY THEN persists
+`Series.coverImageKey`). `PATCH /admin/series/:id { coverImageKey: null }`
+remains the only way to explicitly CLEAR a cover; a raw string via `PATCH`
+still works for a manually-known key but bypasses verification, so the
+upload flow is preferred. See `docs/admin-api-contract.md`'s "Admin series"
+section (2026-08-14 re-freeze) for the full request/response shapes, error
+codes, and replace/orphan semantics.
+
+**Fix cycle 1 (2026-08-15) — stale/replayed `complete` closed.** A reviewer
+proved that, because nothing was persisted at presign time, a
+stale/replayed `POST .../cover/complete` carrying an OLD, already-superseded
+key could silently revert a legitimate replace or un-clear an explicit
+`PATCH { coverImageKey: null }`. Closed with an additive
+`Series.pendingCoverImageKey` column (mirrors the 11P
+`TranscodeIntentService` durable-intent precedent): the presign step records
+the freshly minted key there (latest mint wins), and `complete` now only
+accepts a `key` that matches the current pending key (normal path) or the
+current live `coverImageKey` (idempotent no-op) — any other well-formed key
+is rejected with `409 SERIES_COVER_KEY_SUPERSEDED`. An explicit
+`PATCH { coverImageKey: null }` also clears the pending key. See
+`docs/admin-api-contract.md`'s 2026-08-15 re-freeze note for full detail,
+including the documented (not yet automated) orphan-cleanup and
+Content-Type/Length verification caveats for a never-completed upload.
 
 ### What changed in Phase 8 (internal only)
 
@@ -1831,24 +1862,74 @@ unaffected.
 | `archivedAt` | ISO-8601 timestamp or `null` | work unit 11F-1; `null` = active. Set/cleared only via the archive/unarchive routes below. |
 
 - **`GET /admin/series`** — returns `200` with `Series` rows as
-  `SeriesDto[]`, ordered by `sortOrder` then `id`. **Excludes archived rows
+  `SeriesWithCoverDto[]` (`SeriesDto` + a signed `coverUrl`, 2026-08-14
+  re-freeze), ordered by `sortOrder` then `id`. **Excludes archived rows
   by default** (work unit 11F-1) — pass `?includeArchived=true` (a
   validated boolean; any value other than exactly `true`/`false`,
   case-insensitive, is rejected with `400`) to include them too.
 - **`GET /admin/series/:id`** — work unit 11F-1 read-detail. Returns `200`
-  with the `SeriesDto` (archived or not), or `404 SERIES_NOT_FOUND` for an
-  unknown id.
+  with the `SeriesWithCoverDto` (archived or not, episode-less or not), or
+  `404 SERIES_NOT_FOUND` for an unknown id.
 - **`POST /admin/series`** — body `{ "id", "title", "coverImageKey"?,
-  "sortOrder"? }`. Returns `201` with the created `SeriesDto`. A
-  duplicate `id` returns a clean `409 SERIES_ALREADY_EXISTS` (pre-checked,
-  and also caught if a race loses to a raw Prisma unique-constraint
-  violation) rather than an unstructured 500.
+  "sortOrder"? }`. Returns `201` with the created `SeriesDto` (the plain
+  shape). A duplicate `id` returns a clean `409 SERIES_ALREADY_EXISTS`
+  (pre-checked, and also caught if a race loses to a raw Prisma
+  unique-constraint violation) rather than an unstructured 500.
 - **`PATCH /admin/series/:id`** — a partial edit: any subset of `title`,
   `coverImageKey`, `sortOrder` (same constraints as create). `id` itself
   is not accepted in the body (rejected by the global whitelist — it is
   immutable). At least one field must be present, or `400
   EMPTY_SERIES_UPDATE`. An unknown `id` returns `404 SERIES_NOT_FOUND`.
-  Returns `200` with the updated `SeriesDto`.
+  Returns `200` with the updated `SeriesDto` (the plain shape).
+  **`coverImageKey` (2026-08-14 re-freeze): three explicit states** —
+  omitted (unchanged), `null` (explicitly clears the cover — the only way
+  to remove one), or a non-empty string (sets/replaces the raw key,
+  unverified — prefer the upload flow below for real uploads). **Fix cycle
+  1 (2026-08-15):** an explicit `null` ALSO clears the private
+  `pendingCoverImageKey` column in the same write, invalidating any
+  upload that was still in flight — see the `.../cover/complete` entry
+  below.
+- **`POST /admin/series/:id/cover`** (NEW, 2026-08-14 re-freeze) — presign
+  a cover-image upload. Body `{ "contentType", "sizeBytes" }`, both
+  required: `contentType` is one of `image/jpeg`/`image/png`/`image/webp`
+  (closed allow-list); `sizeBytes` is `1`–`10485760` (10 MiB). Returns
+  `201 { "upload": { "url", "key", "expiresAt" } }` — the object key is
+  entirely server-generated (`admin-series/<seriesId>/cover/<uuid>`, the
+  client never chooses one) and nothing is persisted on the PUBLIC
+  `Series.coverImageKey`/`coverUrl` yet. An unknown `id` returns
+  `404 SERIES_NOT_FOUND`. **Fix cycle 1 (2026-08-15):** DOES record the
+  minted key into the private `Series.pendingCoverImageKey` column (latest
+  mint overwrites any earlier pending one) — internal upload-intent
+  bookkeeping only, never exposed on any response DTO; see below.
+- **`POST /admin/series/:id/cover/complete`** (NEW, 2026-08-14 re-freeze;
+  currency check ADDED 2026-08-15, fix cycle 1) —
+  body `{ "key" }` (the key the presign step returned). Verifies, in
+  order: the series exists; `key` belongs to THIS series' cover prefix and
+  has the right shape (`400 SERIES_COVER_KEY_INVALID` otherwise); **`key`
+  equals the series' current `pendingCoverImageKey` (normal path) or its
+  current `coverImageKey` (idempotent no-op success) — any other
+  well-formed key is a superseded/stale/replayed key from an earlier
+  generation and is rejected with `409 SERIES_COVER_KEY_SUPERSEDED`
+  (fix cycle 1)**; the object actually exists (`400 MEDIA_FILE_NOT_FOUND`
+  otherwise); its real content type is allowed (`409
+  SERIES_COVER_CONTENT_TYPE_NOT_ALLOWED` otherwise); its real size is
+  within bound (`409 SERIES_COVER_SIZE_OUT_OF_BOUND` otherwise). Only then
+  persists `Series.coverImageKey`, clears `pendingCoverImageKey`, and
+  returns `200 SeriesWithCoverDto`. Idempotent on a repeated call with the
+  already-live key. **Replace semantics:** the OLD cover stays
+  authoritative until a NEW upload is fully verified — a failed
+  verification never clears or overwrites it. **Content-Type/Length are
+  not cryptographically bound by the presigned PUT itself** — a caller
+  could label non-image bytes with an allowed `Content-Type`; the
+  authoritative check happens here, against R2's own HEAD-reported
+  metadata, not against magic bytes (real content-sniffing is documented
+  future hardening, not implemented). **Orphans:** the previous object is
+  never auto-deleted from R2 when replaced, and a presigned-but-
+  never-completed (or failed-verification) upload also leaves an orphan
+  object in R2 — neither case is automated cleanup today (documented, not
+  implemented — a bounded janitor sweep mirroring
+  `TranscodeJanitorService` is the recommended future hardening; see
+  `docs/admin-api-contract.md` for the full detail).
 - **`POST /admin/series/:id/archive`** — work unit 11F-1: safe (soft)
   archive, the PRIMARY "delete" action — sets `archivedAt` to now. No data
   loss, fully reversible via `unarchive`. **Idempotent**: calling it again

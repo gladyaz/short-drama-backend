@@ -312,6 +312,132 @@ filesystem paths.
 unauthenticated — only the stream route (the protected asset itself)
 requires a token.
 
+### Public catalog: `GET /series` and `GET /series/:id`
+
+Work unit "SERIES METADATA + DISCOVER ARTWORK CONTRACT": public,
+**unauthenticated** endpoints for curated series metadata — a `Series`
+row exists purely as an application-level annotation of an existing
+`Video.seriesId` grouping (no DB-level foreign key; see `src/series/series
+.service.ts`'s class doc for why), and until this work unit there was no
+public read API for it at all (only the admin-guarded `/admin/series`
+CRUD from Phase 11, documented in `docs/admin-api-contract.md`). Neither
+route changes `GET /videos/feed`'s shape, status codes, or ordering in any
+way — both are purely additive.
+
+#### `GET /series`
+
+Returns every active (not archived), non-empty curated series:
+
+```json
+{ "items": [ /* SeriesPublicDto[] */ ] }
+```
+
+Wrapped in an `{ "items": [...] }` envelope rather than a bare array — the
+admin `GET /admin/media` list already establishes a paginated
+`{ items, total, page, pageSize }` envelope precedent in this codebase; this
+shape means real pagination fields could be added to the SAME object later
+without a breaking change (clients already read `.items`). `total`/`page`/
+`pageSize` are deliberately omitted for now: with exactly 4 curated series
+and no pagination actually implemented, adding those fields would be
+presenting fabricated metadata as real — the same "no fabrication" rule
+this contract applies to dates and view counts. `GET /videos/feed` is
+UNCHANGED by this — it stays a bare `VideoResponseDto[]`, its own
+established, unrelated contract.
+
+`SeriesPublicDto`:
+
+```json
+{
+  "id": "series-104",
+  "title": "Malapetaka Datang: Benteng Bergerakku",
+  "coverUrl": null,
+  "category": "action",
+  "sourceLanguage": "zh",
+  "episodeCount": 10,
+  "totalLikes": 650,
+  "hasPremiumEpisodes": true
+}
+```
+
+- `coverUrl`: a presigned R2 GET URL (same `StorageService
+  .createPresignedGetUrl` mechanism `GET /videos/:id/playback` already uses
+  for R2-backed video, minted fresh per request, never persisted) built
+  from `Series.coverImageKey`, or `null` if no cover has been uploaded.
+  **Every one of the 4 real series is `null` today** — a full poster/
+  key-art audit (DB columns, R2 key references, upload records, seed/
+  fixtures, docs, local assets, migrations) found no cover or thumbnail art
+  anywhere in this system (`Video.coverImageKey`/`thumbnailImageKey` are
+  0/42 populated). This is reported honestly as `null`, never fabricated.
+  Named `coverUrl` (not `posterUrl`) to mirror the `xImageKey` -> `xUrl`
+  transform this codebase already uses for `Video.thumbnailImageKey` ->
+  `VideoResponseDto.thumbnailUrl`.
+- `category`/`sourceLanguage`: the shared value across the series's
+  published, `contentKind: "drama"` episodes, or `null` if there are none
+  or if they disagree — never guessed.
+- `episodeCount`/`totalLikes`/`hasPremiumEpisodes`: truthful aggregates
+  computed at request time from those same episodes (never persisted on
+  `Series`, so they can never go stale). `hasPremiumEpisodes` reuses the
+  exact same `EntitlementsService.resolveEpisodePremium` rule the stream/
+  playback routes already enforce. Rankings/aggregates here are strictly
+  likes-based — no views, trending, or date-based signal is ever
+  fabricated.
+
+A `Series` row whose `seriesId` grouping currently has **zero** qualifying
+episodes (published AND `contentKind: "drama"`) is silently excluded — this
+is also the mechanism that keeps a QA-fixture-only grouping (e.g. the 11R
+HLS sample's `series-11rqa`) from ever appearing here: no `Series` row is
+ever created for one (the backfill migration only creates the 4 real,
+verified series), and even if one existed, it would have zero qualifying
+episodes.
+
+#### `GET /series/:id`
+
+Returns one series's canonical metadata plus **every** qualifying episode,
+in the exact same `VideoResponseDto` shape `GET /videos/feed` already
+returns (built from the same shared mapping function, so the two can never
+drift), ordered by `episodeNumber` ascending — the natural intra-series
+viewing order, distinct from `GET /videos/feed`'s own cross-series curated
+`sortOrder`:
+
+```json
+{
+  "id": "series-104",
+  "title": "Malapetaka Datang: Benteng Bergerakku",
+  "coverUrl": null,
+  "category": "action",
+  "sourceLanguage": "zh",
+  "episodeCount": 10,
+  "totalLikes": 650,
+  "hasPremiumEpisodes": true,
+  "episodes": [ /* VideoResponseDto[] */ ]
+}
+```
+
+`404 { "statusCode": 404, "code": "SERIES_NOT_FOUND", "message": "Series not found" }`
+for three distinct conditions, deliberately collapsed into one outcome
+(matching this codebase's existing anti-enumeration precedent, e.g.
+`VIDEO_NOT_FOUND` for both "no such video" and "not published"): no such
+`Series` row; a `Series` row that exists but is archived (archived is
+excluded from the public surface entirely here, unlike the admin
+`GET /admin/series/:id`, which intentionally still returns an archived
+row for operational reasons); or a `Series` row with zero qualifying
+episodes.
+
+#### Canonical titles and admin write access
+
+The 4 real series' titles were verified against `src/videos/videos.data.ts`
+— the actual seed source `prisma/seed.ts` imports to populate every one of
+the 40 real `Video` rows these `seriesId`s describe — and cross-checked
+against the live, seeded `Video.title` values (e.g. `series-010` episode
+1's persisted title is literally `"Kue Gulung Kaya Raya: Kedaiku Menembus
+Waktu - Episode 1"`). No runtime string heuristic (split/replace/regex on
+an episode title) is used anywhere; see the backfill migration's own doc
+comment (`prisma/migrations/20260814142551_backfill_series_metadata`) for
+the full source citation. An admin can edit a series's `title`/
+`coverImageKey`/`sortOrder` any time via the existing, unchanged
+`PATCH /admin/series/:id` (Phase 11, work unit 11E-4 — already supported
+this before this work unit; no new admin route was needed).
+
 ### What changed in Phase 8 (internal only)
 
 `/videos/feed`, `/videos/:id`, and `/videos/:id/stream` are now backed by a

@@ -1,0 +1,79 @@
+-- Work unit "SERIES METADATA + DISCOVER ARTWORK CONTRACT": data-only
+-- backfill. NO schema/DDL change — the "Series" table already exists
+-- (migration 20260725053813_add_series_model, extended by
+-- 20260725062834_add_series_archived_at) and every column here is
+-- populated exactly as that DDL defines it. Mirrors the existing
+-- data-only-migration precedent set by
+-- 20260725070000_backfill_video_access_tier_override and the QA-data
+-- reconciliation statement in 20260813124007_add_video_content_kind.
+--
+-- WHAT THIS DOES: inserts exactly 4 "Series" rows, one per real, curated
+-- drama series already present in "Video"."seriesId" (verified live: 40
+-- "Video" rows, 10 per id, each "published"/"drama" — see this repo's
+-- audit trail). Does NOT touch a single "Video" row: no UPDATE, no DELETE,
+-- no INSERT against "Video" anywhere in this file.
+--
+-- CANONICAL TITLE SOURCE (per-series, so this is verifiable, not
+-- invented): "src/videos/videos.data.ts" — the actual seed source
+-- `prisma/seed.ts` imports (`import { VIDEOS } from
+-- '../src/videos/videos.data'`) to populate every one of the 40 real
+-- "Video" rows this migration's 4 ids describe. This is the single
+-- strongest available source: it is literally the data that produced the
+-- live rows, not a derived/reconstructed guess. Each title below is the
+-- exact `title` field `buildSeriesEpisodes` in that file passes for the
+-- series (before that function appends " - Episode N" per episode) —
+-- cross-verified live against the actual seeded "Video"."title" values,
+-- e.g. "series-010" episode 1's persisted title is literally "Kue Gulung
+-- Kaya Raya: Kedaiku Menembus Waktu - Episode 1", confirming the prefix
+-- below is correct. No runtime string heuristic (split/replace/regex on an
+-- episode title) is used anywhere in application code to derive these —
+-- this is a one-time, explicit, verified backfill, exactly as required:
+--   series-104  "Malapetaka Datang: Benteng Bergerakku"
+--   series-010  "Kue Gulung Kaya Raya: Kedaiku Menembus Waktu"
+--   series-101  "Hidup Bahagiaku Bersama Sang Permaisuri"
+--   series-105  "Hati Yin yang Jahat: Antagonis Serang Habis-habisan"
+--
+-- "sortOrder" mirrors the curated cross-series order already established
+-- by "Video"."sortOrder" (work unit 8P-4: derived from each record's
+-- position in the `VIDEOS` array, series-104 first) — 0/1/2/3 in the same
+-- series-104, series-010, series-101, series-105 order, so a future public
+-- listing that orders "Series" by "sortOrder" agrees with the existing
+-- curated feed order instead of introducing a second, disagreeing order.
+--
+-- "coverImageKey" is NULL for all 4: a full poster/key-art audit (DB
+-- columns, R2 key references, upload records, seed/fixtures, docs, local
+-- assets, migrations) found NO cover or thumbnail art anywhere in this
+-- system — "Video"."coverImageKey"/"thumbnailImageKey" are 0/42 populated
+-- today. This is left honestly NULL rather than fabricated; the public API
+-- built on top of this table (`GET /series`) reports `coverUrl: null` for
+-- exactly this reason. An admin can set it later via the existing
+-- `PATCH /admin/series/:id` (work unit 11E-4, unchanged by this slice).
+--
+-- "createdAt"/"updatedAt": `(CURRENT_TIMESTAMP AT TIME ZONE 'UTC')`, NOT
+-- bare `CURRENT_TIMESTAMP` — this database's session `TimeZone` is
+-- `Asia/Jakarta` (UTC+7), and both columns are `TIMESTAMP(3)` WITHOUT a
+-- time zone. Bare `CURRENT_TIMESTAMP` would store the session-local
+-- (Jakarta) wall-clock reading into that naive column, silently 7 hours
+-- ahead of the UTC instant every other write path in this codebase stores
+-- there (see `src/auth/account-lockout.service.ts` and
+-- `src/auth/auth.service.ts` for the same established
+-- `AT TIME ZONE 'UTC'` pattern on raw SQL timestamp writes). The
+-- `AT TIME ZONE 'UTC'` conversion pins this insert to the correct UTC
+-- instant regardless of the connecting session's time zone setting.
+--
+-- IDEMPOTENT: `ON CONFLICT ("id") DO NOTHING`. Safe to have run before —
+-- matches zero rows on a database where these 4 ids already exist — and,
+-- just as importantly, NEVER clobbers a title/coverImageKey/sortOrder an
+-- admin has since edited via `PATCH /admin/series/:id`.
+--
+-- REVERSIBLE: a follow-up data-only migration doing
+-- `DELETE FROM "Series" WHERE "id" IN ('series-104','series-010',
+-- 'series-101','series-105');` fully undoes this with no data loss — no
+-- "Video" row is ever touched by either direction.
+INSERT INTO "Series" ("id", "title", "coverImageKey", "sortOrder", "createdAt", "updatedAt", "archivedAt")
+VALUES
+  ('series-104', 'Malapetaka Datang: Benteng Bergerakku', NULL, 0, (CURRENT_TIMESTAMP AT TIME ZONE 'UTC'), (CURRENT_TIMESTAMP AT TIME ZONE 'UTC'), NULL),
+  ('series-010', 'Kue Gulung Kaya Raya: Kedaiku Menembus Waktu', NULL, 1, (CURRENT_TIMESTAMP AT TIME ZONE 'UTC'), (CURRENT_TIMESTAMP AT TIME ZONE 'UTC'), NULL),
+  ('series-101', 'Hidup Bahagiaku Bersama Sang Permaisuri', NULL, 2, (CURRENT_TIMESTAMP AT TIME ZONE 'UTC'), (CURRENT_TIMESTAMP AT TIME ZONE 'UTC'), NULL),
+  ('series-105', 'Hati Yin yang Jahat: Antagonis Serang Habis-habisan', NULL, 3, (CURRENT_TIMESTAMP AT TIME ZONE 'UTC'), (CURRENT_TIMESTAMP AT TIME ZONE 'UTC'), NULL)
+ON CONFLICT ("id") DO NOTHING;

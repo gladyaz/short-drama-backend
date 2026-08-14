@@ -1,4 +1,4 @@
-import { Injectable, HttpStatus, Logger } from '@nestjs/common';
+import { Injectable, HttpStatus } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { existsSync, statSync } from 'fs';
 import {
@@ -9,7 +9,6 @@ import {
 import { AppErrorCode } from '../common/errors/app-error-code';
 import { AppException } from '../common/errors/app.exception';
 import { MediaLifecycleState } from '../media/media-lifecycle.types';
-import { VideoContentKind } from './video-content-kind.types';
 import { PrismaService } from '../prisma/prisma.service';
 import { PLAYBACK_URL_EXPIRY_SECONDS } from '../storage/storage.constants';
 import { StorageService } from '../storage/storage.service';
@@ -31,6 +30,7 @@ import {
 } from './video.types';
 import { resolveSafeStoragePath } from './storage-path.util';
 import { resolvePlaybackSource } from './playback-source.util';
+import { toVideoRecord, toVideoResponseDto } from './video-response.util';
 
 export interface StreamableVideo {
   record: VideoRecord;
@@ -304,11 +304,12 @@ export class VideosService {
   }
 
   /**
-   * Prisma's generated `Video` type represents nullable optional columns as
-   * `T | null`, whereas `VideoRecord` (used across the rest of the app,
-   * including `videos.data.ts`) represents them as `T | undefined`. This
-   * normalizes the DB row into the app-level shape without changing any
-   * value that was actually present.
+   * Work unit "SERIES METADATA + DISCOVER ARTWORK CONTRACT": delegates to
+   * the extracted, shared `toVideoRecord` (`./video-response.util.ts`) —
+   * behavior-preserving, byte-identical output to before this extraction.
+   * See that file's doc comment for why it was pulled out (the new public
+   * `GET /series/:id` reuses the exact same mapping for its embedded
+   * episode objects).
    */
   private toVideoRecord(record: {
     id: string;
@@ -327,73 +328,12 @@ export class VideosService {
     height: number | null;
     contentKind: string;
   }): VideoRecord {
-    return {
-      ...record,
-      durationSeconds: record.durationSeconds ?? undefined,
-      width: record.width ?? undefined,
-      height: record.height ?? undefined,
-      // The column is a plain string at rest (see the schema comment), so it
-      // is narrowed here, at the one boundary where DB rows become app
-      // records. Anything unrecognised is treated as ordinary catalog
-      // content: a row is only ever WITHHELD from a consumer catalog on an
-      // explicit `qa_fixture`, never on a value we failed to parse.
-      contentKind: toVideoContentKind(record.contentKind),
-    };
+    return toVideoRecord(record);
   }
 
   private toResponseDto(record: VideoRecord): VideoResponseDto {
-    return {
-      id: record.id,
-      seriesId: record.seriesId,
-      title: record.title,
-      episodeNumber: record.episodeNumber,
-      channelName: record.channelName,
-      caption: record.caption,
-      category: record.category,
-      storageKey: record.storageKey,
-      playbackUrl: `${this.appConfig.publicBaseUrl}/videos/${record.id}/stream`,
-      sourceLanguage: record.sourceLanguage,
-      hasEmbeddedIndonesianSubtitle: record.hasEmbeddedIndonesianSubtitle,
-      likeCount: record.likeCount,
-      durationSeconds: record.durationSeconds,
-      width: record.width,
-      height: record.height,
-      contentKind: record.contentKind,
-    };
+    return toVideoResponseDto(record, this.appConfig.publicBaseUrl);
   }
-}
-
-/**
- * Narrows the persisted `Video.contentKind` string to the enum.
- *
- * Deliberately fail-OPEN: an unknown value becomes `DRAMA`. The alternative
- * (defaulting to `QA_FIXTURE`) would let a typo or a future third kind
- * silently erase real content from every consumer catalog, which is a far
- * worse failure than a fixture briefly showing up.
- */
-const contentKindLogger = new Logger('VideoContentKind');
-
-function toVideoContentKind(value: string): VideoContentKind {
-  if (
-    value !== (VideoContentKind.DRAMA as string) &&
-    value !== (VideoContentKind.QA_FIXTURE as string)
-  ) {
-    // Fail-open is deliberate (see below) but must not be SILENT: an
-    // unrecognised value means a write path invented a kind this build does
-    // not know, and it will be reported to clients as ordinary content.
-    contentKindLogger.warn(
-      `Unrecognised Video.contentKind ${JSON.stringify(value)}; treating as ` +
-        `${VideoContentKind.DRAMA}. Add it to VideoContentKind and toVideoContentKind.`,
-    );
-  }
-
-  // `as string` matches the existing `MediaLifecycleState.PUBLISHED` cast
-  // above: the column is a plain string at rest, so comparing it to an enum
-  // member is exactly the widening this codebase already does at that
-  // boundary.
-  return value === (VideoContentKind.QA_FIXTURE as string)
-    ? VideoContentKind.QA_FIXTURE
-    : VideoContentKind.DRAMA;
 }
 
 /**

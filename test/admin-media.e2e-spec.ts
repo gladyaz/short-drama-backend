@@ -202,6 +202,52 @@ describe('Admin Media (e2e)', () => {
         .send({ ...validCreateBody, episodeNumber: 'not-a-number' })
         .expect(HttpStatus.BAD_REQUEST);
     });
+
+    /**
+     * Work unit "Episode Access-Tier + Category Contract Hardening":
+     * `category` is now a closed set (`VIDEO_CATEGORIES`) rather than a
+     * freeform 1-100 char string — an unrecognised value is rejected with a
+     * clean `400`, end-to-end through the real global `ValidationPipe`, and
+     * no row is created.
+     */
+    it('POST /admin/media returns 400 for an unrecognised category and creates no row', async () => {
+      const categorySeriesId = `${testSeriesId}-category-invalid`;
+      await request(app.getHttpServer())
+        .post('/admin/media')
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({
+          ...validCreateBody,
+          seriesId: categorySeriesId,
+          category: 'thriller',
+        })
+        .expect(HttpStatus.BAD_REQUEST);
+
+      const rows = await prisma.video.findMany({
+        where: { seriesId: categorySeriesId },
+      });
+      expect(rows).toHaveLength(0);
+    });
+
+    it.each(['action', 'comedy', 'drama', 'romance'])(
+      'POST /admin/media accepts the canonical category "%s"',
+      async (category) => {
+        const categorySeriesId = `${testSeriesId}-category-valid-${category}`;
+        const response = await request(app.getHttpServer())
+          .post('/admin/media')
+          .set('Authorization', `Bearer ${adminAccessToken}`)
+          .send({
+            ...validCreateBody,
+            seriesId: categorySeriesId,
+            category,
+          })
+          .expect(HttpStatus.CREATED);
+
+        const body = response.body as CreateUploadResponseBody & {
+          media: { category: string };
+        };
+        expect(body.media.category).toBe(category);
+      },
+    );
   });
 
   /**
@@ -1393,6 +1439,19 @@ describe('Admin Media (e2e)', () => {
       });
     });
 
+    it('returns 400 for an unrecognised category and leaves the row untouched', async () => {
+      const id = await createFixture(`${patchSeriesId}-category-invalid`);
+
+      await request(app.getHttpServer())
+        .patch(`/admin/media/${id}`)
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({ category: 'thriller' })
+        .expect(HttpStatus.BAD_REQUEST);
+
+      const persisted = await prisma.video.findUnique({ where: { id } });
+      expect(persisted?.category).toBe('drama');
+    });
+
     it('preserves lifecycleState, objectStorageKey, likeCount and sortOrder', async () => {
       const id = await createFixture(`${patchSeriesId}-untouched`, {
         lifecycleState: 'published',
@@ -1770,6 +1829,64 @@ describe('Admin Media (e2e)', () => {
 
       const body = response.body as ErrorResponseBody;
       expect(body.code).toBe('VIDEO_NOT_FOUND');
+    });
+
+    /**
+     * Work unit "Episode Access-Tier + Category Contract Hardening":
+     * `AdminMediaDto.accessTier` (the resolved/effective tier) is ADDITIVE
+     * alongside the pre-existing raw `accessTierOverride`, and an admin PATCH
+     * through this route is immediately reflected on the PUBLIC
+     * `GET /videos/:id` response's `accessTier` field — proving the admin
+     * write path and the public read path agree by construction (both go
+     * through the same `resolveAccessTier`).
+     */
+    it('AdminMediaDto.accessTier reflects the resolved tier, distinct from the raw accessTierOverride', async () => {
+      const id = await createFixture(`${accessTierSeriesId}-resolved-default`);
+
+      const created = await prisma.video.findUnique({ where: { id } });
+      expect(created?.accessTierOverride).toBeNull();
+
+      const response = await request(app.getHttpServer())
+        .patch(`/admin/media/${id}/access-tier`)
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({ tier: 'premium' })
+        .expect(HttpStatus.OK);
+
+      const body = response.body as AdminMediaDto;
+      expect(body.accessTierOverride).toBe('premium');
+      expect(body.accessTier).toBe('premium');
+    });
+
+    it('admin PATCH access-tier changes the subsequent PUBLIC GET /videos/:id accessTier value', async () => {
+      const id = await createFixture(`${accessTierSeriesId}-public-effect`);
+
+      const before = await request(app.getHttpServer())
+        .get(`/videos/${id}`)
+        .expect(HttpStatus.OK);
+      expect((before.body as { accessTier: string }).accessTier).toBe('free');
+
+      await request(app.getHttpServer())
+        .patch(`/admin/media/${id}/access-tier`)
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({ tier: 'premium' })
+        .expect(HttpStatus.OK);
+
+      const after = await request(app.getHttpServer())
+        .get(`/videos/${id}`)
+        .expect(HttpStatus.OK);
+      expect((after.body as { accessTier: string }).accessTier).toBe('premium');
+
+      // Clearing the override restores the default public accessTier too.
+      await request(app.getHttpServer())
+        .patch(`/admin/media/${id}/access-tier`)
+        .set('Authorization', `Bearer ${adminAccessToken}`)
+        .send({ tier: null })
+        .expect(HttpStatus.OK);
+
+      const reverted = await request(app.getHttpServer())
+        .get(`/videos/${id}`)
+        .expect(HttpStatus.OK);
+      expect((reverted.body as { accessTier: string }).accessTier).toBe('free');
     });
   });
 });

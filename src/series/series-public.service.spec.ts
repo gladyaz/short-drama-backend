@@ -379,5 +379,43 @@ describe('PublicSeriesService', () => {
         code: AppErrorCode.SERIES_NOT_FOUND,
       });
     });
+
+    /**
+     * Work unit "Episode Access-Tier + Category Contract Hardening":
+     * per-episode `accessTier` (on each embedded `VideoResponseDto`) must
+     * agree with the series-level `hasPremiumEpisodes` aggregate — both are
+     * computed from the SAME `resolveAccessTier` rule, so an early episode
+     * explicitly overridden premium must show up as `accessTier: 'premium'`
+     * on its own DTO AND flip the series aggregate to `true`; a late episode
+     * explicitly overridden free must show `accessTier: 'free'` and, if it
+     * is the only episode, leave the aggregate `false`.
+     */
+    it('an early episode overridden premium: its own accessTier is "premium" and hasPremiumEpisodes is true', async () => {
+      const seriesId = `${testIdPrefix}-detail-early-premium-override`;
+      await createSeriesFixture(seriesId);
+      await createVideoFixture(`${seriesId}-ep1`, seriesId, {
+        episodeNumber: 1,
+        accessTierOverride: 'premium',
+      });
+
+      const detail = await service.findById(seriesId);
+
+      expect(detail.episodes[0].accessTier).toBe('premium');
+      expect(detail.hasPremiumEpisodes).toBe(true);
+    });
+
+    it('a late episode overridden free: its own accessTier is "free" and hasPremiumEpisodes stays false', async () => {
+      const seriesId = `${testIdPrefix}-detail-late-free-override`;
+      await createSeriesFixture(seriesId);
+      await createVideoFixture(`${seriesId}-ep1`, seriesId, {
+        episodeNumber: 6,
+        accessTierOverride: 'free',
+      });
+
+      const detail = await service.findById(seriesId);
+
+      expect(detail.episodes[0].accessTier).toBe('free');
+      expect(detail.hasPremiumEpisodes).toBe(false);
+    });
   });
 });

@@ -2,6 +2,7 @@ import { HttpStatus, Injectable } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { AppErrorCode } from '../common/errors/app-error-code';
 import { AppException } from '../common/errors/app.exception';
+import { resolveAccessTier } from './entitlement.constants';
 import { EntitlementStatusDto } from './entitlement.types';
 
 const PREMIUM_TIER = 'premium';
@@ -56,6 +57,15 @@ export class EntitlementsService {
    * branch always returns exactly what the old default rule already
    * returned for any row that predates this work unit and was somehow left
    * `null`.
+   *
+   * Work unit "Episode Access-Tier + Category Contract Hardening": the
+   * override-vs-default decision itself now lives in ONE place,
+   * `resolveAccessTier` (`entitlement.constants.ts`) — this method delegates
+   * to it rather than re-implementing the same two-branch check inline, so
+   * this boolean gate and the new `VideoResponseDto.accessTier` field (built
+   * from the same `resolveAccessTier` call) can never disagree. Behavior is
+   * byte-identical to before this refactor (see
+   * `entitlements.service.spec.ts`, unchanged and still passing).
    */
   resolveEpisodePremium(
     input: {
@@ -64,15 +74,7 @@ export class EntitlementsService {
     },
     freeEpisodeLimit: number,
   ): boolean {
-    if (input.accessTierOverride === 'premium') {
-      return true;
-    }
-
-    if (input.accessTierOverride === 'free') {
-      return false;
-    }
-
-    return this.isEpisodePremium(input.episodeNumber, freeEpisodeLimit);
+    return resolveAccessTier(input, freeEpisodeLimit) === 'premium';
   }
 
   /**

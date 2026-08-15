@@ -282,6 +282,29 @@ Returns one video's metadata, or a structured 404:
 { "statusCode": 404, "code": "VIDEO_NOT_FOUND", "message": "Video not found" }
 ```
 
+### `VideoResponseDto.accessTier` (work unit "Episode Access-Tier + Category Contract Hardening")
+
+Every `VideoResponseDto` — on `GET /videos/feed`, `GET /videos/:id`, and each
+episode embedded in `GET /series/:id` (they share the exact same shape) —
+carries an additive `accessTier: "free" | "premium"` field: the resolved,
+effective access tier for that specific episode. `"premium"` means streaming
+or requesting a playback URL for it requires an active entitlement (see
+"Entitlements API" below); `"free"` means it does not. This is computed by
+the SAME single resolver (`resolveAccessTier`,
+`src/entitlements/entitlement.constants.ts`) that `GET /videos/:id/stream`
+and `GET /videos/:id/playback` already enforce and that
+`SeriesPublicDto.hasPremiumEpisodes` already aggregates over — the three can
+never disagree, by construction. A client no longer needs to know
+`FREE_EPISODE_LIMIT` (or any episode-number-based rule) at all: `accessTier`
+is the single source of truth for whether a given episode needs an
+entitlement.
+
+The raw admin-set `Video.accessTierOverride` column that may have produced
+this value is a SEPARATE, admin-only field — it is never included on
+`VideoResponseDto`, only on the admin-only `AdminMediaDto` (see "Admin
+content management API" below, which also exposes the same resolved
+`accessTier` next to it for convenience).
+
 ### `GET /videos/:id/stream`
 
 Streams the underlying MP4 with Range support. Responds `206 Partial Content`
@@ -436,6 +459,50 @@ comment (`prisma/migrations/20260814142551_backfill_series_metadata`) for
 the full source citation. An admin can edit a series's `title`/`sortOrder`
 any time via the existing `PATCH /admin/series/:id` (Phase 11, work unit
 11E-4).
+
+#### `Video.category` — canonical set (work unit "Episode Access-Tier + Category Contract Hardening")
+
+`category` (on `VideoResponseDto`, and on `SeriesPublicDto`/`SeriesDetailPublicDto`
+as the shared-or-null aggregate described above) is one of exactly four
+values: **`action`, `comedy`, `drama`, `romance`** (`VIDEO_CATEGORIES`,
+`src/videos/video-category.constants.ts`) — lowercase, matching every real
+category this backend has ever documented or seeded. This set was derived
+from an audit of this backend's own actual data (`src/videos/videos.data.ts`,
+the verified seed source for all 40 real episodes — one category per series
+— and a read-only inspection of `short_drama_dev`), not copied from the
+mobile app's own broader, differently-cased `VideoCategory` type (which
+includes values like `Revenge`/`Family`/`CEO`/`Historical` this backend has
+never sent).
+
+Every write path that can put a value in `Video.category` now validates
+against this closed set and rejects an unrecognised value with a clean
+`400`: `POST /admin/media` and `PATCH /admin/media/:id` (both documented
+under "Admin content management API" below), and the bulk importer
+(`MediaImporterService`, work unit 11D-1). This is enforced entirely in
+application code (`class-validator @IsIn(VIDEO_CATEGORIES)` on the two admin
+DTOs; a plain `isValidVideoCategory` guard in the importer) — `Video.category`
+itself is unchanged, still a plain `String` column, matching this schema's
+existing `lifecycleState`/`contentKind`/`Entitlement.tier` precedent of
+"closed set enforced in code, not a DB enum/migration."
+
+**This is a forward-looking, write-time-only guarantee.** No existing row was
+rewritten: a read-only audit of `short_drama_dev` found the 40 real episodes
+already using exactly these four lowercase values, plus exactly one
+non-canonical outlier — `"Drama"` (capital D) — on the known QA fixture
+`media-11rqa-8ac6a7f3` (a `contentKind: "qa_fixture"` row, never part of the
+real catalog or any public `Series`). That one row is left untouched and is
+still served exactly as persisted; nothing added by this work unit reads or
+narrows `Video.category` on the way out.
+
+**Known consequence for that one fixture row (independent-review finding,
+2026-08-15):** the Admin Dashboard's episode-metadata form submits ALL
+fields as a full replacement, pre-filled from the read response — so ANY
+metadata edit to `media-11rqa-8ac6a7f3` via that form (even a title typo
+fix) will now be rejected with 400 (`category must be one of ...`) until
+the operator retypes the category field to a canonical lowercase value
+(e.g. `drama`). This is the closed-set validation working as designed, not
+a defect; it is recorded here so it does not surprise anyone while that QA
+fixture is still alive for 11R device QA.
 
 **Cover art upload (work unit "SERIES COVER UPLOAD BACKEND CONTRACT",
 2026-08-14 — a real, verified path for admins to upload the poster art
@@ -1751,7 +1818,10 @@ already applies:
 
 - `title` (string, 1–200 chars)
 - `caption` (string, 1–2000 chars)
-- `category` (string, 1–100 chars)
+- `category` (one of the four canonical values — see "`Video.category` —
+  canonical set" above; work unit "Episode Access-Tier + Category Contract
+  Hardening" narrowed this from freeform 1–100 chars to a closed `@IsIn`
+  set — an unrecognised value now returns a clean `400`)
 - `channelName` (string, 1–200 chars)
 - `sourceLanguage` (string, 1–20 chars)
 - `episodeNumber` (integer, `>= 1`)
@@ -1798,7 +1868,13 @@ with no drop/default/backfill/data change). An invalid/missing `tier`,
 or any non-whitelisted extra field, returns a clean `400`; an unknown
 `id` returns `404 VIDEO_NOT_FOUND`. Returns `200` with the updated
 `AdminMediaDto` — `accessTierOverride` is exposed only on this
-admin-only DTO, never on the public `VideoResponseDto`.
+admin-only DTO, never on the public `VideoResponseDto`. A PATCH here is
+immediately reflected on `AdminMediaDto.accessTier` (this route's own
+response) **and** on the public `VideoResponseDto.accessTier` field
+(`GET /videos/feed`/`GET /videos/:id`/`GET /series/:id`) the very next
+time that episode is read — both are computed by the same
+`resolveAccessTier` function, so there is no propagation delay or
+separate cache to invalidate.
 
 **Explicit DB-backed access tier (work unit 11F-4).** Every `Video` row
 now carries an explicit `"free"` or `"premium"` value in this column,

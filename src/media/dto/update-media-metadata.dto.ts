@@ -1,4 +1,6 @@
 import { VideoContentKind } from '../../videos/video-content-kind.types';
+import { VIDEO_CATEGORIES } from '../../videos/video-category.constants';
+import type { VideoCategory } from '../../videos/video-category.constants';
 import {
   IsBoolean,
   IsIn,
@@ -45,10 +47,14 @@ export class UpdateMediaMetadataDto {
   @Length(1, 2000)
   caption?: string;
 
+  /**
+   * Work unit "Episode Access-Tier + Category Contract Hardening": narrowed
+   * from freeform to a closed set, mirroring `CreateMediaUploadDto.category`
+   * — see that field's doc comment.
+   */
   @IsOptional()
-  @IsString()
-  @Length(1, 100)
-  category?: string;
+  @IsIn(VIDEO_CATEGORIES)
+  category?: VideoCategory;
 
   @IsOptional()
   @IsString()

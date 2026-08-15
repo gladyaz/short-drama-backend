@@ -25,6 +25,18 @@ export interface VideoRecord {
    * optional so every construction site has to declare it.
    */
   contentKind: VideoContentKind;
+  /**
+   * Work unit "Episode Access-Tier + Category Contract Hardening": the raw
+   * `Video.accessTierOverride` column value, carried on the internal record
+   * ONLY so `toVideoResponseDto` can resolve the public `accessTier` field
+   * from it (via `resolveAccessTier`) — never copied onto `VideoResponseDto`
+   * itself (see that DTO's `accessTier` field doc comment for why). Optional
+   * because `src/videos/videos.data.ts`'s hardcoded seed-source array (also
+   * typed `VideoRecord[]`) predates this column and never sets it; every
+   * REAL construction site (`toVideoRecord`, fed by a live `Video` row)
+   * always supplies it.
+   */
+  accessTierOverride?: string | null;
 }
 
 export interface VideoResponseDto {
@@ -52,6 +64,28 @@ export interface VideoResponseDto {
    * optional so every construction site has to declare it.
    */
   contentKind: VideoContentKind;
+  /**
+   * Work unit "Episode Access-Tier + Category Contract Hardening": the
+   * resolved (effective) access tier for THIS episode — `"premium"` if
+   * streaming/playback requires an active entitlement, `"free"` if it does
+   * not. Computed by `toVideoResponseDto` via the single authoritative
+   * `resolveAccessTier` function (`entitlements/entitlement.constants.ts`)
+   * — the EXACT SAME rule `VideosController#enforceEntitlementGate` already
+   * enforces at `/stream`/`/playback` request time (via
+   * `EntitlementsService.resolveEpisodePremium`, which now delegates to the
+   * same function), and the same rule `SeriesPublicDto.hasPremiumEpisodes`
+   * aggregates over — so this field can never disagree with the real
+   * authorization decision or with the series-level aggregate.
+   *
+   * ADDITIVE: present on every `VideoResponseDto` (`/videos/feed`,
+   * `/videos/:id`, and `/series/:id`'s embedded episodes, since all three
+   * are built from this same shared shape) — existing consumers that only
+   * read the previously-existing fields are unaffected. The raw admin-set
+   * override that may have produced this value (`Video.accessTierOverride`)
+   * is deliberately NEVER exposed here — see `AdminMediaDto
+   * .accessTierOverride` (`media.types.ts`) for its only intended exposure.
+   */
+  accessTier: 'free' | 'premium';
 }
 
 /**

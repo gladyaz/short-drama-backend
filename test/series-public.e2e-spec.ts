@@ -246,6 +246,33 @@ describe('Public series catalog (e2e)', () => {
       );
     });
 
+    /**
+     * Work unit "Episode Access-Tier + Category Contract Hardening": every
+     * embedded episode carries the ADDITIVE `accessTier` field, and the
+     * series-level `hasPremiumEpisodes` aggregate agrees with it — proven
+     * here against the REAL seeded `series-104` (episodes 1-5 free, 6-10
+     * premium, per the 11F-4 backfill).
+     */
+    it('embedded episodes carry accessTier, agreeing with the series-level hasPremiumEpisodes aggregate', async () => {
+      const response = await request(app.getHttpServer())
+        .get('/series/series-104')
+        .expect(HttpStatus.OK);
+
+      const body = response.body as SeriesDetailPublicDto;
+      expect(body.hasPremiumEpisodes).toBe(true);
+
+      const byEpisodeNumber = new Map(
+        body.episodes.map((e) => [e.episodeNumber, e.accessTier]),
+      );
+      expect(byEpisodeNumber.get(1)).toBe('free');
+      expect(byEpisodeNumber.get(5)).toBe('free');
+      expect(byEpisodeNumber.get(6)).toBe('premium');
+      expect(byEpisodeNumber.get(10)).toBe('premium');
+      expect(body.episodes.some((e) => e.accessTier === 'premium')).toBe(
+        body.hasPremiumEpisodes,
+      );
+    });
+
     it('returns 404 SERIES_NOT_FOUND for an unknown id', async () => {
       const response = await request(app.getHttpServer())
         .get(`/series/${idPrefix}-does-not-exist`)

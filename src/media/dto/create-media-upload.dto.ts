@@ -1,4 +1,6 @@
 import { VideoContentKind } from '../../videos/video-content-kind.types';
+import { VIDEO_CATEGORIES } from '../../videos/video-category.constants';
+import type { VideoCategory } from '../../videos/video-category.constants';
 import {
   IsBoolean,
   IsIn,
@@ -61,9 +63,15 @@ export class CreateMediaUploadDto {
   @Length(1, 2000)
   caption!: string;
 
-  @IsString()
-  @Length(1, 100)
-  category!: string;
+  /**
+   * Work unit "Episode Access-Tier + Category Contract Hardening": narrowed
+   * from freeform (`@IsString() @Length(1, 100)`) to a closed set —
+   * `VIDEO_CATEGORIES` (`videos/video-category.constants.ts`), this
+   * backend's own audited canonical categories. An unrecognised value is now
+   * rejected with a clean `400` instead of silently entering the database.
+   */
+  @IsIn(VIDEO_CATEGORIES)
+  category!: VideoCategory;
 
   @IsString()
   @Length(1, 20)

@@ -100,6 +100,35 @@ entry and the error-codes table below for the full updated behavior. Every
 other 2026-08-14 behavior (replace semantics, idempotency on the
 already-live key, the four independent verification checks) is unchanged.
 
+**Re-freeze, 2026-08-15 (work unit "Episode Access-Tier + Category Contract
+Hardening", approved in the control workspace's `DECISIONS.md` "2026-08-15
+— EPISODE ACCESS-TIER + CATEGORY CONTRACT HARDENING APPROVED..." entry,
+baseline `3190d93`):** two additive changes to this admin surface, both
+already authorized by that approval ("the current approval covers additive
+DTO exposure" — no separate re-freeze approval round-trip was required):
+
+1. **New field:** `AdminMediaDto.accessTier` (`"free"` \| `"premium"`) — the
+   resolved/effective tier, additive alongside the pre-existing raw
+   `accessTierOverride`. Returned by every route that already returns
+   `AdminMediaDto` (`POST /admin/media`, `GET /admin/media`,
+   `PATCH /admin/media/:id`, `PATCH /admin/media/:id/access-tier`, and the
+   asset-upload routes). See the "`AdminMediaDto`" and "Access-tier model"
+   sections below.
+2. **Narrowed validation, NOT a shape change:** `category` on
+   `POST /admin/media` and `PATCH /admin/media/:id` is no longer freeform
+   (`@IsString() @Length(1, 100)`) — it is now a closed set of four
+   canonical values (`action`\|`comedy`\|`drama`\|`romance`,
+   `VIDEO_CATEGORIES` in `src/videos/video-category.constants.ts`). Every
+   value this contract's own examples and every value this backend has ever
+   actually persisted already used this exact set, so no previously-valid
+   real request becomes invalid; only a genuinely unrecognised string (which
+   would previously have been silently accepted) now returns a clean `400`.
+
+Nothing else in this document changed. `GET /admin/media`'s `category`
+QUERY FILTER (`ListAdminMediaQueryDto.category`, an exact-match read filter,
+not a write validator) is UNCHANGED — still freeform, since an unrecognised
+filter value is harmless (it simply matches zero rows).
+
 ## Conventions
 
 - No global route prefix (e.g. `GET /health`, not `GET /api/health`).
@@ -182,7 +211,7 @@ URL. Body (`CreateMediaUploadDto`):
 | `episodeNumber` | integer | `>= 1`, required |
 | `channelName` | string | 1–200 chars, required |
 | `caption` | string | 1–2000 chars, required |
-| `category` | string | 1–100 chars, required |
+| `category` | string | one of the four canonical values (`action`\|`comedy`\|`drama`\|`romance`, `VIDEO_CATEGORIES`), required — narrowed from freeform 1–100 chars by work unit "Episode Access-Tier + Category Contract Hardening"; an unrecognised value → `400` |
 | `sourceLanguage` | string | 1–20 chars, required |
 | `hasEmbeddedIndonesianSubtitle` | boolean | required |
 | `durationSeconds` | integer | `>= 0`, optional |
@@ -254,7 +283,7 @@ route applies:
 |---|---|---|
 | `title` | string | 1–200 chars |
 | `caption` | string | 1–2000 chars |
-| `category` | string | 1–100 chars |
+| `category` | string | one of the four canonical values (`action`\|`comedy`\|`drama`\|`romance`) — same closed set as `POST /admin/media`'s `category`; an unrecognised value → `400` |
 | `channelName` | string | 1–200 chars |
 | `sourceLanguage` | string | 1–20 chars |
 | `episodeNumber` | integer | `>= 1` |
@@ -385,6 +414,7 @@ never does (`lifecycleState`, object-storage keys, `accessTierOverride`).
 | `width` | number \| null |
 | `height` | number \| null |
 | `accessTierOverride` | `"free"` \| `"premium"` \| null |
+| `accessTier` | `"free"` \| `"premium"` | ADDITIVE (work unit "Episode Access-Tier + Category Contract Hardening") — the resolved/effective tier, computed via the same `resolveAccessTier` function the public `VideoResponseDto.accessTier` field uses; always in agreement with it for the same episode |
 
 Note: `sortOrder`, `storageKey`, and `likeCount` are `Video` columns that
 exist in the database but are **not** part of `AdminMediaDto` and are not
@@ -651,6 +681,17 @@ drift.
   retained only as (a) the value the backfill/seed/create-time default
   derives from, and (b) a null-safety fallback for a row somehow still
   `null` post-backfill.
+- **Public exposure (work unit "Episode Access-Tier + Category Contract
+  Hardening").** The RESOLVED tier (never the raw override) is now also
+  additively exposed on the public `VideoResponseDto.accessTier` field
+  (`/videos/feed`, `/videos/:id`, and each episode embedded in
+  `/series/:id` — see `README.md`'s public contract section) and, for
+  convenience, alongside the raw override on this admin route's own
+  `AdminMediaDto.accessTier`. Both are computed by the exact same
+  `resolveAccessTier` function `GET /videos/:id/stream`/`/playback` already
+  enforce, so an admin PATCH here is immediately reflected on the public
+  surface the next time that episode is read, with no separate cache or
+  propagation delay.
 - **No payments.** This is a manually admin-set tier, not a payment-driven
   entitlement. Real entitlement/premium enforcement (whether a given
   *user* has an active premium entitlement) is unchanged and lives entirely

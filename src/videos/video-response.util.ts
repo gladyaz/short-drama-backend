@@ -1,4 +1,8 @@
 import { Logger } from '@nestjs/common';
+import {
+  FREE_EPISODE_LIMIT,
+  resolveAccessTier,
+} from '../entitlements/entitlement.constants';
 import { VideoContentKind } from './video-content-kind.types';
 import { VideoRecord, VideoResponseDto } from './video.types';
 
@@ -80,6 +84,7 @@ export function toVideoRecord(record: {
   width: number | null;
   height: number | null;
   contentKind: string;
+  accessTierOverride: string | null;
 }): VideoRecord {
   return {
     ...record,
@@ -123,5 +128,19 @@ export function toVideoResponseDto(
     width: record.width,
     height: record.height,
     contentKind: record.contentKind,
+    // Work unit "Episode Access-Tier + Category Contract Hardening": the
+    // SAME resolver the stream/playback authorization gate and the series
+    // `hasPremiumEpisodes` aggregate use — see `VideoResponseDto.accessTier`'s
+    // doc comment. `record.accessTierOverride` defaults to `null` (not
+    // `undefined`) here only for the seed-source array
+    // (`videos.data.ts`), which never sets this optional field; every real
+    // `Video` row always supplies it explicitly via `toVideoRecord`.
+    accessTier: resolveAccessTier(
+      {
+        accessTierOverride: record.accessTierOverride ?? null,
+        episodeNumber: record.episodeNumber,
+      },
+      FREE_EPISODE_LIMIT,
+    ),
   };
 }

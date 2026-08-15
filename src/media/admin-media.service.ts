@@ -5,7 +5,11 @@ import { AppErrorCode } from '../common/errors/app-error-code';
 import { AppException } from '../common/errors/app.exception';
 import { redactSensitiveText } from '../common/logging/redact';
 import { RootConfig } from '../config/configuration';
-import { deriveAccessTier } from '../entitlements/entitlement.constants';
+import {
+  deriveAccessTier,
+  FREE_EPISODE_LIMIT,
+  resolveAccessTier,
+} from '../entitlements/entitlement.constants';
 import { PrismaService } from '../prisma/prisma.service';
 import { StorageService } from '../storage/storage.service';
 import { TranscodeIntentService } from '../transcode/transcode-intent.service';
@@ -744,6 +748,13 @@ function toAdminMediaDto(record: VideoRow): AdminMediaDto {
     width: record.width,
     height: record.height,
     accessTierOverride: asAccessTierOverride(record.accessTierOverride),
+    accessTier: resolveAccessTier(
+      {
+        accessTierOverride: record.accessTierOverride,
+        episodeNumber: record.episodeNumber,
+      },
+      FREE_EPISODE_LIMIT,
+    ),
   };
 }
 

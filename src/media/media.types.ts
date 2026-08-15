@@ -31,6 +31,16 @@ export interface AdminMediaDto {
    * default `episodeNumber > FREE_EPISODE_LIMIT` rule".
    */
   accessTierOverride: 'free' | 'premium' | null;
+  /**
+   * Work unit "Episode Access-Tier + Category Contract Hardening":
+   * ADDITIVE — the same resolved (effective) tier the public
+   * `VideoResponseDto.accessTier` field exposes, computed via the same
+   * authoritative `resolveAccessTier` function. Lets an admin see, next to
+   * the raw `accessTierOverride`, exactly what the public catalog currently
+   * reports for this episode — always in agreement by construction, never a
+   * second/duplicated derivation.
+   */
+  accessTier: 'free' | 'premium';
 }
 
 export interface PresignedUploadDto {

@@ -1,5 +1,9 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import {
+  isValidVideoCategory,
+  VIDEO_CATEGORIES,
+} from '../videos/video-category.constants';
 import { FFPROBE_CLIENT } from './importer.types';
 import type {
   FfprobeClient,
@@ -62,6 +66,19 @@ export class MediaImporterService {
     sortOrder: number,
     maxAttempts: number,
   ): Promise<ImportItemResult> {
+    // Work unit "Episode Access-Tier + Category Contract Hardening": this
+    // importer writes `item.category` straight to `Video.category` with no
+    // DTO/`class-validator` layer in front of it (unlike the admin HTTP
+    // routes) — checked here, BEFORE any ffprobe attempt or DB read/write,
+    // so an unrecognised category never reaches `prisma.video.upsert` and is
+    // never retried (a bad category is not a transient failure, unlike an
+    // ffprobe hiccup).
+    if (!isValidVideoCategory(item.category)) {
+      const error = `Unrecognised category ${JSON.stringify(item.category)} — must be one of: ${VIDEO_CATEGORIES.join(', ')}`;
+      this.logger.warn(`Rejected media "${item.id}": ${error}`);
+      return { id: item.id, status: 'failed', attempts: 0, error };
+    }
+
     let lastError: unknown;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {

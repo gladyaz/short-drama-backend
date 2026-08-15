@@ -327,6 +327,7 @@ export class VideosService {
     width: number | null;
     height: number | null;
     contentKind: string;
+    accessTierOverride: string | null;
   }): VideoRecord {
     return toVideoRecord(record);
   }

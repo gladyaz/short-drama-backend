@@ -278,4 +278,62 @@ describe('MediaImporterService', () => {
       });
     });
   });
+
+  /**
+   * Work unit "Episode Access-Tier + Category Contract Hardening": this
+   * importer writes `item.category` straight to `Video.category` with no
+   * `class-validator` DTO in front of it — closed-set validation is enforced
+   * directly in `importItem`, before any ffprobe call or DB write.
+   */
+  describe('category validation', () => {
+    it('rejects an item with an unrecognised category without probing or writing a row, but still processes the rest of the batch', async () => {
+      probeMock.mockResolvedValue(FIXTURE_METADATA);
+
+      const invalidItem = {
+        ...IMPORT_MANIFEST_FIXTURE[1],
+        category: 'thriller',
+      };
+      const result = await service.importBatch([
+        IMPORT_MANIFEST_FIXTURE[0],
+        invalidItem,
+        IMPORT_MANIFEST_FIXTURE[2],
+      ]);
+
+      expect(result.succeeded).toBe(2);
+      expect(result.failed).toBe(1);
+
+      const failure = result.results.find((r) => r.id === invalidItem.id);
+      expect(failure).toMatchObject({
+        id: invalidItem.id,
+        status: 'failed',
+        attempts: 0,
+      });
+      expect((failure as { error: string }).error).toContain('thriller');
+
+      // Never probed and never written — rejected before either happens.
+      expect(probeMock).not.toHaveBeenCalledWith(invalidItem.storageKey);
+      const row = await prisma.video.findUnique({
+        where: { id: invalidItem.id },
+      });
+      expect(row).toBeNull();
+    });
+
+    it('accepts every canonical category value', async () => {
+      probeMock.mockResolvedValue(FIXTURE_METADATA);
+
+      for (const category of ['action', 'comedy', 'drama', 'romance']) {
+        const item = {
+          ...IMPORT_MANIFEST_FIXTURE[0],
+          id: `importer-fixture-category-${category}`,
+          category,
+        };
+        const result = await service.importBatch([item]);
+        expect(result.succeeded).toBe(1);
+      }
+
+      await prisma.video.deleteMany({
+        where: { id: { startsWith: 'importer-fixture-category-' } },
+      });
+    });
+  });
 });

@@ -30,3 +30,41 @@ export function deriveAccessTier(
 ): AccessTier {
   return episodeNumber > freeEpisodeLimit ? 'premium' : 'free';
 }
+
+/**
+ * Work unit "Episode Access-Tier + Category Contract Hardening": the ONE
+ * authoritative override-vs-default resolver for an episode's effective
+ * access tier. An explicit `accessTierOverride` of `"free"` or `"premium"`
+ * always wins, regardless of `episodeNumber`; a `null`/`undefined` override
+ * (no explicit tier set) falls back to `deriveAccessTier`'s existing
+ * `episodeNumber > freeEpisodeLimit` boundary — this function never
+ * re-implements that boundary itself, it delegates to `deriveAccessTier` so
+ * the two can never drift.
+ *
+ * Every consumer that needs to know "is this episode premium" goes through
+ * THIS function (directly, or via `EntitlementsService.resolveEpisodePremium`,
+ * which now delegates here): the stream/playback authorization gate
+ * (`VideosController#enforceEntitlementGate`), the `SeriesPublicDto
+ * .hasPremiumEpisodes` aggregate (`PublicSeriesService`), and the public
+ * `VideoResponseDto.accessTier` field (`video-response.util.ts`) — so the
+ * three can never independently drift from each other. Pure (no Nest DI, no
+ * I/O), mirroring `deriveAccessTier`'s own design, specifically so it stays
+ * usable from `video-response.util.ts`, which must remain a plain
+ * synchronous module with no request-lifecycle dependency.
+ */
+export function resolveAccessTier(
+  input: {
+    accessTierOverride: string | null | undefined;
+    episodeNumber: number;
+  },
+  freeEpisodeLimit: number = FREE_EPISODE_LIMIT,
+): AccessTier {
+  if (
+    input.accessTierOverride === 'premium' ||
+    input.accessTierOverride === 'free'
+  ) {
+    return input.accessTierOverride;
+  }
+
+  return deriveAccessTier(input.episodeNumber, freeEpisodeLimit);
+}

@@ -578,6 +578,166 @@ describe('Videos (e2e)', () => {
   });
 
   /**
+   * Work unit "Episode Access-Tier + Category Contract Hardening": the
+   * ADDITIVE public `VideoResponseDto.accessTier` field, and proof that its
+   * value agrees with the REAL stream/playback authorization decision (the
+   * exact same `resolveAccessTier` rule behind
+   * `EntitlementsService.resolveEpisodePremium`).
+   */
+  describe('VideoResponseDto.accessTier (Episode Access-Tier + Category Contract Hardening)', () => {
+    const tierDtoSeriesId = `${emailPrefix}-tier-dto`;
+
+    async function createTierDtoFixture(
+      idSuffix: string,
+      episodeNumber: number,
+      accessTierOverride: string | null,
+    ): Promise<string> {
+      const id = `${tierDtoSeriesId}-${idSuffix}`;
+      await prisma.video.create({
+        data: {
+          id,
+          seriesId: tierDtoSeriesId,
+          title: `Tier DTO fixture ${id}`,
+          episodeNumber,
+          channelName: 'E2E Channel',
+          caption: 'Tier DTO fixture caption',
+          category: 'drama',
+          // Non-empty (but nonexistent-on-disk) storageKey, deliberately:
+          // `GET /videos/feed` (work unit 11G-1) excludes any published row
+          // with BOTH an empty storageKey AND no objectStorageKey, so an
+          // empty key here would silently vanish from feed-based assertions
+          // below. `/stream` still resolves to 404 MEDIA_FILE_NOT_FOUND for
+          // this nonexistent path, exactly like the empty-key fixtures used
+          // elsewhere in this file — no test here asserts 206.
+          storageKey: `tier-dto-fixtures/${id}.mp4`,
+          sourceLanguage: 'zh',
+          hasEmbeddedIndonesianSubtitle: true,
+          likeCount: 0,
+          lifecycleState: 'published',
+          accessTierOverride,
+        },
+      });
+      return id;
+    }
+
+    afterAll(async () => {
+      await prisma.video.deleteMany({ where: { seriesId: tierDtoSeriesId } });
+    });
+
+    it('GET /videos/feed and GET /videos/:id agree: free (episodeNumber <= FREE_EPISODE_LIMIT) matches the known free seed episode', async () => {
+      const feed = (
+        await request(app.getHttpServer())
+          .get('/videos/feed')
+          .expect(HttpStatus.OK)
+      ).body as VideoResponseDto[];
+      const feedItem = feed.find((v) => v.id === freeEpisodeId);
+      expect(feedItem?.accessTier).toBe('free');
+      expect(feedItem).not.toHaveProperty('accessTierOverride');
+
+      const single = (
+        await request(app.getHttpServer())
+          .get(`/videos/${freeEpisodeId}`)
+          .expect(HttpStatus.OK)
+      ).body as VideoResponseDto;
+      expect(single.accessTier).toBe('free');
+      expect(single).not.toHaveProperty('accessTierOverride');
+    });
+
+    it('GET /videos/feed and GET /videos/:id agree: premium (episodeNumber > FREE_EPISODE_LIMIT) matches the known premium seed episode', async () => {
+      const feed = (
+        await request(app.getHttpServer())
+          .get('/videos/feed')
+          .expect(HttpStatus.OK)
+      ).body as VideoResponseDto[];
+      const feedItem = feed.find((v) => v.id === premiumEpisodeId);
+      expect(feedItem?.accessTier).toBe('premium');
+
+      const single = (
+        await request(app.getHttpServer())
+          .get(`/videos/${premiumEpisodeId}`)
+          .expect(HttpStatus.OK)
+      ).body as VideoResponseDto;
+      expect(single.accessTier).toBe('premium');
+    });
+
+    it('explicit "free" override on a default-premium episode: DTO reports accessTier "free" AND is actually streamable without an entitlement', async () => {
+      const id = await createTierDtoFixture('forced-free', 6, 'free');
+
+      const single = (
+        await request(app.getHttpServer())
+          .get(`/videos/${id}`)
+          .expect(HttpStatus.OK)
+      ).body as VideoResponseDto;
+      expect(single.accessTier).toBe('free');
+
+      // The DTO's "free" claim must match reality: no entitlement, and the
+      // gate lets it through (404 MEDIA_FILE_NOT_FOUND — no real file for a
+      // synthetic fixture — never 403).
+      const streamed = await request(app.getHttpServer())
+        .get(`/videos/${id}/stream`)
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.NOT_FOUND);
+      expect((streamed.body as ErrorResponseBody).code).toBe(
+        'MEDIA_FILE_NOT_FOUND',
+      );
+    });
+
+    it('explicit "premium" override on a default-free episode: DTO reports accessTier "premium" AND actually requires an entitlement to stream', async () => {
+      const id = await createTierDtoFixture('forced-premium', 1, 'premium');
+
+      const single = (
+        await request(app.getHttpServer())
+          .get(`/videos/${id}`)
+          .expect(HttpStatus.OK)
+      ).body as VideoResponseDto;
+      expect(single.accessTier).toBe('premium');
+
+      // The DTO's "premium" claim must match reality: denied without an
+      // entitlement...
+      const denied = await request(app.getHttpServer())
+        .get(`/videos/${id}/stream`)
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.FORBIDDEN);
+      expect((denied.body as ErrorResponseBody).code).toBe(
+        'ENTITLEMENT_REQUIRED',
+      );
+
+      // ...and allowed (past the gate) once entitled.
+      await prisma.entitlement.create({
+        data: { userId, tier: 'premium', source: 'dev-grant' },
+      });
+      const allowed = await request(app.getHttpServer())
+        .get(`/videos/${id}/stream`)
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.NOT_FOUND);
+      expect((allowed.body as ErrorResponseBody).code).toBe(
+        'MEDIA_FILE_NOT_FOUND',
+      );
+      await prisma.entitlement.deleteMany({ where: { userId } });
+    });
+
+    it('the same episode reports an identical accessTier on GET /videos/feed and GET /videos/:id (no drift between the two surfaces)', async () => {
+      const id = await createTierDtoFixture('consistency', 6, null);
+
+      const feed = (
+        await request(app.getHttpServer())
+          .get('/videos/feed')
+          .expect(HttpStatus.OK)
+      ).body as VideoResponseDto[];
+      const feedItem = feed.find((v) => v.id === id);
+
+      const single = (
+        await request(app.getHttpServer())
+          .get(`/videos/${id}`)
+          .expect(HttpStatus.OK)
+      ).body as VideoResponseDto;
+
+      expect(feedItem?.accessTier).toBe('premium');
+      expect(single.accessTier).toBe(feedItem?.accessTier);
+    });
+  });
+
+  /**
    * Phase 11, work unit 11M (DECISIONS.md "Slice 11M approved..." entry,
    * Option A). `mockStorageService.createPresignedGetUrl` (declared/mocked
    * for the whole file in `beforeAll` above) is the ONLY thing standing in

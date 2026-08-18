@@ -23,7 +23,13 @@ export const AUTH_AUDIT_METADATA_ALLOWLIST = {
   /**
    * A login attempt failed (wrong password, or the email did not resolve to
    * any account). `reason` is a fixed, non-sensitive enum — never the
-   * attempted email/password.
+   * attempted email/password. Values: `user_not_found` | `invalid_password`
+   * | `credential_superseded` (Auth test-stability slice: the supplied
+   * password was correct when the request started, but a concurrent
+   * `changePassword`/`confirmPasswordReset` committed a new password before
+   * this login could create its session — see `AuthService.login`'s
+   * `FOR SHARE` guard). The client-facing response is the identical generic
+   * `INVALID_CREDENTIALS` for all three.
    */
   login_failed: ['reason'],
   /**

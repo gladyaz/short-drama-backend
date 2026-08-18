@@ -48,6 +48,21 @@ import { RegisterDto } from './dto/register.dto';
 type PrismaClientLike = PrismaService | Prisma.TransactionClient;
 
 /**
+ * Everything `issueTokensAndSession` computes BEFORE touching the database —
+ * the signed access token, the opaque refresh token and its keyed hash, and
+ * the sanitized/hashed request-context columns. Split out so `login` can do
+ * all of it outside the transaction that guards its session creation; see
+ * `AuthService.prepareTokenPair`.
+ */
+interface PreparedSessionTokens {
+  accessToken: string;
+  refreshToken: string;
+  refreshTokenHash: string;
+  ipHash: string | undefined;
+  userAgent: string | undefined;
+}
+
+/**
  * Generic, user-enumeration-safe error used for both login and refresh
  * failures (see `AppErrorCode` for the security rationale).
  */
@@ -124,6 +139,31 @@ function isSessionUserForeignKeyViolation(error: unknown): boolean {
     error.meta?.constraint === SESSION_USER_FOREIGN_KEY_CONSTRAINT
   );
 }
+
+/**
+ * Internal-only rollback signal for `AuthService.login`'s session-creation
+ * transaction (Auth test-stability slice). Thrown INSIDE the transaction so
+ * Prisma rolls it back when the account's `passwordHash` no longer matches
+ * the one this request authenticated against — i.e. a concurrent
+ * `changePassword()`/`confirmPasswordReset()` committed a new password while
+ * this login was running its (~300ms) bcrypt comparison. Never escapes
+ * `login`, which converts it into the same generic `invalidCredentials`
+ * error every other "these credentials are not valid" outcome returns; a
+ * dedicated class (rather than throwing `AppException` directly) is what
+ * lets that catch tell this signal apart from a genuine database failure it
+ * must not swallow. Mirrors `ChangePasswordRaceLost`'s existing precedent
+ * below exactly.
+ */
+class LoginCredentialSuperseded extends Error {}
+
+/**
+ * Sibling of `LoginCredentialSuperseded`: the account was DELETED (not
+ * merely re-passworded) between this login's own `User` lookup and its
+ * session creation — a concurrent `deleteAccount()`. Kept distinct purely so
+ * the audit trail stays truthful; the caller-facing result is the identical
+ * generic `invalidCredentials`.
+ */
+class LoginUserVanished extends Error {}
 
 /**
  * Internal-only rollback signal for `AuthService.changePassword`'s
@@ -259,26 +299,155 @@ export class AuthService {
       throw invalidCredentials();
     }
 
+    // Auth test-stability slice, CONFIRMED PRODUCTION RACE (regression test:
+    // `auth.service.spec.ts`, "a login() whose authenticated password was
+    // replaced by a concurrent changePassword() before its session was
+    // created"): `user.passwordHash` was read at the top of this method and
+    // the `bcrypt.compare` above takes ~300ms at `BCRYPT_COST_FACTOR = 12`,
+    // so a concurrent `changePassword()`/`confirmPasswordReset()` can commit
+    // a NEW password — revoking every session for the account as it does —
+    // in the window between that read and the `session.create` below. Before
+    // this guard, the session created here survived that revoke, because a
+    // revoke-all statement cannot possibly match a row that does not exist
+    // yet: `changePassword`'s two defensive sweeps both run strictly BEFORE
+    // this insert. The account owner's password change therefore did NOT
+    // "cut off every other session" — precisely the guarantee
+    // `changePassword` exists to provide — for anyone still holding the
+    // superseded password.
+    //
+    // The whole session creation now runs in ONE transaction that first
+    // re-reads the account's `passwordHash` `FOR SHARE`. `FOR SHARE`
+    // conflicts with the `FOR NO KEY UPDATE` lock Postgres takes for
+    // `UPDATE "User" SET "passwordHash" = ...`, which is what makes this
+    // deterministic rather than merely narrower:
+    //
+    //   - If this transaction takes the lock first, the concurrent password
+    //     change blocks on `tx.user.update` until this login commits — so
+    //     the session created here already exists when that transaction's
+    //     final pre-commit sweep runs, and is revoked by it, as intended.
+    //   - If the password change takes the lock first, this `SELECT` blocks
+    //     until it commits, then re-reads under READ COMMITTED and sees the
+    //     NEW hash — the equality predicate fails, no session is created,
+    //     and the caller gets the same generic `invalidCredentials` every
+    //     other "these credentials are not valid" outcome in this method
+    //     returns.
+    //
+    // No lock-ordering cycle is introduced: this transaction only ever takes
+    // a lock on the `User` row and then INSERTs a brand-new `Session` row
+    // (an insert conflicts with nothing), whereas `changePassword` locks
+    // existing `Session` rows and then the `User` row — it can wait on this
+    // transaction, but this transaction never waits on it.
+    // Every non-database step (JWT signing, refresh-token generation, HMACs)
+    // happens HERE, before the transaction opens, so the transaction below
+    // holds its `User` row lock across two statements and nothing else. See
+    // `prepareTokenPair`.
+    const tokens = await this.prepareTokenPair(user, context);
+
+    let response: AuthResponseDto;
+    try {
+      response = await this.prisma.$transaction(async (tx) => {
+        // Table/column identifiers verified against `prisma/schema.prisma`
+        // (no `@@map`/`@map`), matching `changePassword`'s existing raw-SQL
+        // precedent in this file. No timestamp is written or compared here, so
+        // this statement needs none of that method's `AT TIME ZONE 'UTC'`
+        // handling.
+        //
+        // `FOR SHARE` is LOAD-BEARING, not decorative, and must never be
+        // dropped: a plain `SELECT` would read this transaction's own
+        // snapshot, still see the OLD hash, and wave the login through. The
+        // row lock is what makes the reader either (a) block until the
+        // concurrent password change commits and then re-evaluate the
+        // predicate against the NEW row version, or (b) win the lock and let
+        // the password change block behind it. The predicate selects by `id`
+        // only — the hash is compared below, in JS — so a DELETED account
+        // (concurrent `deleteAccount`) is distinguishable from a CHANGED
+        // password and each gets its own truthful audit reason.
+        const [currentCredential] = await tx.$queryRaw<
+          { passwordHash: string }[]
+        >`
+          SELECT "passwordHash" FROM "User"
+          WHERE "id" = ${user.id}
+          FOR SHARE
+        `;
+
+        if (currentCredential === undefined) {
+          throw new LoginUserVanished();
+        }
+
+        if (currentCredential.passwordHash !== user.passwordHash) {
+          throw new LoginCredentialSuperseded();
+        }
+
+        // Fix cycle 1 (test-reviewer finding, follow-up to 12C-B1): explicit
+        // `invalidCredentials` (this method's own established error for every
+        // other "no valid account here" outcome above) for the narrow window
+        // where a concurrent `deleteAccount()` deletes this same `user.id`
+        // between the check above and `issueTokensAndSession`'s
+        // `session.create` — see that method's `onUserVanished` doc comment.
+        // The `FOR SHARE` above now also closes that window (a deleted `User`
+        // row matches no rows and fails the check first), but this is kept
+        // unchanged as defence in depth rather than removed.
+        return this.persistSession(user, tokens, tx, invalidCredentials);
+      });
+    } catch (error) {
+      if (error instanceof LoginUserVanished) {
+        // A concurrent `deleteAccount()` removed this account mid-flight.
+        // Deliberately NOT audited: the `userId` this row would carry no
+        // longer references a live `User`, so the insert would itself fail
+        // the `AuthAuditEvent_userId_fkey` constraint. The deletion is
+        // already recorded by `account_deletion_success`.
+        throw invalidCredentials();
+      }
+
+      if (!(error instanceof LoginCredentialSuperseded)) {
+        // An unrelated database failure still propagates unchanged (and
+        // still surfaces as a 500), exactly as before this guard existed —
+        // reinterpreting it as "invalid credentials" would trade a visible,
+        // diagnosable error for a misleading one.
+        throw error;
+      }
+
+      // Recorded as a login FAILURE, because that is what the caller gets:
+      // the credential presented was valid when this request started and is
+      // no longer valid now. `credential_superseded` is an additive value of
+      // `login_failed`'s existing `reason` enum (mirroring how
+      // `refresh_reuse_detected` distinguishes `already_rotated` from
+      // `concurrent_rotation_race`) — no new event name, no new error code,
+      // and the client-facing response is the same generic
+      // `INVALID_CREDENTIALS` every other failure branch above returns, so
+      // this remains no kind of enumeration oracle.
+      await this.authAuditService.emit('login_failed', {
+        userId: user.id,
+        ip: context.ip,
+        userAgent: context.userAgent,
+        metadata: { reason: 'credential_superseded' },
+      });
+      throw invalidCredentials();
+    }
+
+    // Both of these now run only once the session actually exists. Before the
+    // guard above, `recordSuccess` (which clears the failed-login counter)
+    // and `login_success` both fired ahead of session creation, so a request
+    // that ultimately returned 401 still reset lockout state and left a
+    // `login_success` row behind. An audit log that records a successful
+    // login which never happened is worse than one that records it a few
+    // milliseconds later.
     await this.accountLockoutService.recordSuccess(user.id);
+
+    // Emitted only once the session actually exists. It used to fire before
+    // `issueTokensAndSession`, which meant any failure creating the session
+    // (the pre-existing concurrent-`deleteAccount` case, and now the
+    // superseded-credential case above) left a `login_success` row in the
+    // audit trail for a request that returned 401. An audit log that records
+    // a successful login which never happened is worse than one that records
+    // it a few milliseconds later.
     await this.authAuditService.emit('login_success', {
       userId: user.id,
       ip: context.ip,
       userAgent: context.userAgent,
     });
-    // Fix cycle 1 (test-reviewer finding, follow-up to 12C-B1): explicit
-    // `invalidCredentials` (this method's own established error for every
-    // other "no valid account here" outcome above) for the narrow window
-    // where a concurrent `deleteAccount()` deletes this same `user.id`
-    // between the check above and `issueTokensAndSession`'s `session.create`
-    // — see that method's `onUserVanished` doc comment. This is also the
-    // default, so passing it explicitly here changes no behavior; it is
-    // spelled out because this call site is exactly what this fix is for.
-    return this.issueTokensAndSession(
-      user,
-      context,
-      this.prisma,
-      invalidCredentials,
-    );
+
+    return response;
   }
 
   async refresh(
@@ -395,14 +564,74 @@ export class AuthService {
     // (unknown token, reuse of a revoked token, expired, lost the rotation
     // race) — for the narrow window where a concurrent `deleteAccount()`
     // deletes this session's `user.id` between the existence check above and
-    // `issueTokensAndSession`'s `session.create`. See that method's
+    // `persistSession`'s `session.create`. See `issueTokensAndSession`'s
     // `onUserVanished` doc comment.
-    return this.issueTokensAndSession(
+    const tokens = await this.prepareTokenPair(user, context);
+    const response = await this.persistSession(
       user,
-      context,
+      tokens,
       this.prisma,
       invalidRefreshToken,
     );
+
+    // Auth test-stability slice, second half of the CONFIRMED PRODUCTION RACE
+    // fixed in `login()` (regression test: `auth.service.spec.ts`, "a
+    // refresh() that rotated before a concurrent changePassword() committed
+    // does not leave a surviving session").
+    //
+    // The CAS a few lines above (`count === 0`) only proves nobody else
+    // revoked the PRESENTED session first. It says nothing about a password
+    // change that commits AFTER that CAS but BEFORE the replacement row is
+    // inserted — and that window is not small: it spans a committed round
+    // trip, an `await`ed `jwtService.signAsync`, `randomBytes`, two HMACs and
+    // a second round trip. In that ordering, `changePassword`'s BOTH sweeps
+    // run while the replacement session does not yet exist, so neither can
+    // possibly match it, and the caller — including an attacker holding a
+    // stolen refresh token, which is exactly who a password change is meant
+    // to cut off — keeps a live session across the password change.
+    //
+    // This is a COMPENSATING check rather than a `FOR SHARE` guard like
+    // `login`'s, and deliberately so: `refresh` already holds/held locks on
+    // `Session` rows, so taking a `User` lock here would give this method the
+    // order `Session -> User` while `confirmPasswordReset` runs
+    // `User -> Session`, forming exactly the kind of lock-ordering cycle
+    // (Postgres `40P01`) that `changePassword` needed three fix cycles to
+    // eliminate. Re-reading AFTER the insert takes no locks at all and cannot
+    // deadlock, and it is complete rather than merely narrower: the
+    // replacement row is committed by the time this read runs, so any
+    // password change that commits later is guaranteed to see it and revoke
+    // it through its own sweeps.
+    const currentCredential = await this.prisma.user.findUnique({
+      where: { id: user.id },
+      select: { passwordHash: true },
+    });
+
+    if (currentCredential?.passwordHash !== user.passwordHash) {
+      // Revokes ONLY the row this call just created — never a blanket
+      // revoke-all. The winning `changePassword`/`confirmPasswordReset` has
+      // already issued its OWN replacement session for the legitimate caller,
+      // and sweeping that away here would reintroduce `changePassword`'s
+      // "winner killed by loser" bug.
+      await this.prisma.session.updateMany({
+        where: { refreshTokenHash: tokens.refreshTokenHash, revokedAt: null },
+        data: { revokedAt: new Date() },
+      });
+      // Same event/reason pair the `count === 0` branch above already uses:
+      // decision 7 treats every "this session was revoked out from under a
+      // concurrent caller" case identically, so this needs no new audit
+      // vocabulary. (A concurrently DELETED account also lands here, via the
+      // `?.` — the emit is internally fail-safe, so the now-dangling
+      // `userId` cannot turn this into a 500.)
+      await this.authAuditService.emit('refresh_reuse_detected', {
+        userId: session.userId,
+        ip: context.ip,
+        userAgent: context.userAgent,
+        metadata: { reason: 'concurrent_rotation_race' },
+      });
+      throw invalidRefreshToken();
+    }
+
+    return response;
   }
 
   async logout(refreshToken: string): Promise<void> {
@@ -486,6 +715,38 @@ export class AuthService {
     client: PrismaClientLike = this.prisma,
     onUserVanished: () => AppException = invalidCredentials,
   ): Promise<AuthResponseDto> {
+    return this.persistSession(
+      user,
+      await this.prepareTokenPair(user, context),
+      client,
+      onUserVanished,
+    );
+  }
+
+  /**
+   * Auth test-stability slice (review finding): the CPU/crypto half of
+   * `issueTokensAndSession`, split out so it can run OUTSIDE a transaction.
+   *
+   * `login()` now creates its session inside a `$transaction` that holds a
+   * `FOR SHARE` lock on the caller's `User` row. `jwtService.signAsync` is
+   * `await`ed, so leaving it inside that transaction would hold both a
+   * database row lock and a pooled connection across an event-loop yield —
+   * on the hottest endpoint in the app, and precisely when `bcryptjs`'s
+   * cooperative single-threaded hashing is saturating that same event loop.
+   * Prisma's default interactive-transaction budget is 5s, so a starved
+   * `signAsync` could have turned a successful login into a `P2028` 500, and
+   * every concurrent `changePassword`/`confirmPasswordReset`/`deleteAccount`
+   * would have waited on a lock held across non-database work.
+   *
+   * Splitting the method keeps every existing caller's behavior identical
+   * (`issueTokensAndSession` above is now just these two calls in sequence)
+   * while letting `login` do all crypto first and open a transaction that
+   * contains nothing but the guard `SELECT` and the `INSERT`.
+   */
+  private async prepareTokenPair(
+    user: Pick<User, 'id'>,
+    context: AuthRequestContext,
+  ): Promise<PreparedSessionTokens> {
     const authConfig = this.configService.get('auth', { infer: true })!;
 
     // Access token payload intentionally carries only the user id (`sub`) —
@@ -511,6 +772,30 @@ export class AuthService {
       context.userAgent !== undefined
         ? sanitizeUserAgent(context.userAgent)
         : undefined;
+
+    return {
+      accessToken,
+      refreshToken,
+      refreshTokenHash,
+      ipHash,
+      userAgent,
+    };
+  }
+
+  /**
+   * The database half of `issueTokensAndSession` — see `prepareTokenPair`
+   * above for why the two are separate. Contains exactly one statement, so a
+   * caller that wraps it in a transaction holds its locks for the duration
+   * of a single INSERT and nothing more.
+   */
+  private async persistSession(
+    user: Pick<User, 'id' | 'email' | 'displayName'>,
+    tokens: PreparedSessionTokens,
+    client: PrismaClientLike = this.prisma,
+    onUserVanished: () => AppException = invalidCredentials,
+  ): Promise<AuthResponseDto> {
+    const { accessToken, refreshToken, refreshTokenHash, ipHash, userAgent } =
+      tokens;
     const now = new Date();
 
     try {

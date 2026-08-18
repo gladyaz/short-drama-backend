@@ -4,6 +4,11 @@ import { JwtModule } from '@nestjs/jwt';
 import { PrismaService } from '../prisma/prisma.service';
 import { AccountLockoutService } from './account-lockout.service';
 import { AuthAuditService } from './auth-audit.service';
+import { bcryptTestBudgetMs } from '../common/testing/bcrypt-test-budget.helpers';
+import {
+  TEST_FIXTURE_NAMESPACE,
+  fixtureEmail,
+} from '../common/testing/fixture-namespace.helpers';
 import { AuthService } from './auth.service';
 
 const TEST_AUTH_CONFIG = {
@@ -47,14 +52,24 @@ const CLOCK_TOLERANCE_MS = 5_000;
  * the isolated `DATABASE_URL_TEST` database instead, per this work unit's
  * explicit requirement.
  */
+/**
+ * Auth test-stability slice: replaces Jest's inherited 5000ms default. Every
+ * test here drives REAL cost-factor-12 bcrypt hashing through the real
+ * `AuthService`; the most expensive one performs 5 such operations, which is
+ * already a large fraction of 5000ms on a busy machine. See
+ * `../common/testing/bcrypt-test-budget.helpers.ts` — a harness hang-detector
+ * budget, NOT a business-security timeout.
+ */
+jest.setTimeout(bcryptTestBudgetMs(5));
+
 describe('AuthService.changePassword — Session.revokedAt timezone correctness (Phase 12, 12D-B0)', () => {
   let service: AuthService;
   let prisma: PrismaService;
   let originalDatabaseUrl: string | undefined;
 
-  const emailPrefix = 'cp-tz+12db0';
-  const uniqueEmail = (label: string): string =>
-    `${emailPrefix}-${label}-${Date.now()}-${Math.random().toString(36).slice(2)}@example.test`;
+  // Auth test-stability slice — see `fixture-namespace.helpers.ts`.
+  const emailPrefix = TEST_FIXTURE_NAMESPACE;
+  const uniqueEmail = (label: string): string => fixtureEmail(`cptz-${label}`);
 
   beforeAll(() => {
     originalDatabaseUrl = process.env.DATABASE_URL;
@@ -97,13 +112,13 @@ describe('AuthService.changePassword — Session.revokedAt timezone correctness 
 
   afterEach(async () => {
     await prisma.authAuditEvent.deleteMany({
-      where: { user: { email: { contains: emailPrefix } } },
+      where: { user: { email: { startsWith: emailPrefix } } },
     });
     await prisma.session.deleteMany({
-      where: { user: { email: { contains: emailPrefix } } },
+      where: { user: { email: { startsWith: emailPrefix } } },
     });
     await prisma.user.deleteMany({
-      where: { email: { contains: emailPrefix } },
+      where: { email: { startsWith: emailPrefix } },
     });
     await prisma.onModuleDestroy();
   });

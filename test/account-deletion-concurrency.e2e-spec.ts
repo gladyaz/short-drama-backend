@@ -7,6 +7,24 @@ import { AppModule } from './../src/app.module';
 import { AppExceptionFilter } from './../src/common/filters/app-exception.filter';
 import { PrismaService } from './../src/prisma/prisma.service';
 import type { AuthResponseDto } from './../src/auth/auth.types';
+import { bcryptTestBudgetMs } from './../src/common/testing/bcrypt-test-budget.helpers';
+import {
+  TEST_FIXTURE_NAMESPACE,
+  fixtureEmail,
+} from './../src/common/testing/fixture-namespace.helpers';
+
+/**
+ * Auth test-stability slice: replaces Jest's inherited 5000ms default, which
+ * was never sized for a suite that drives REAL cost-factor-12 bcrypt hashing
+ * through the full HTTP stack. A single test here commonly performs 4-8 such
+ * operations (~1.8-3.5s of irreducible CPU work with the worker pool
+ * saturated) before any database or Nest overhead. See
+ * `src/common/testing/bcrypt-test-budget.helpers.ts` — a harness
+ * hang-detector budget, NOT a business-security timeout: no production
+ * timeout, token lifetime, lockout window, or throttle window is changed by
+ * this.
+ */
+jest.setTimeout(bcryptTestBudgetMs(8));
 
 interface ErrorResponseBody {
   statusCode: number;
@@ -61,9 +79,13 @@ describe('Account deletion vs login/refresh concurrency (e2e)', () => {
   // RFC 5321 64-character local-part limit — matches
   // `auth-rate-limit-lockout.e2e-spec.ts`/`account-deletion.e2e-spec.ts`'s
   // identical precedent.
-  const emailPrefix = 'ad-race-e2e+12cb1fix';
-  const uniqueEmail = (label: string): string =>
-    `${emailPrefix}-${label}-${Date.now()}-${Math.random().toString(36).slice(2)}@example.test`;
+  // Auth test-stability slice: was the hardcoded literal
+  // `'ad-race-e2e+12cb1fix'`, byte-identical in every worktree of this repo, so any
+  // two concurrent Jest runs sharing `short_drama_test` deleted each
+  // other's in-flight fixtures mid-test. See
+  // `src/common/testing/fixture-namespace.helpers.ts`.
+  const emailPrefix = TEST_FIXTURE_NAMESPACE;
+  const uniqueEmail = (label: string): string => fixtureEmail(`arc-${label}`);
 
   beforeAll(async () => {
     const moduleFixture: TestingModule = await Test.createTestingModule({
@@ -88,13 +110,13 @@ describe('Account deletion vs login/refresh concurrency (e2e)', () => {
 
   afterAll(async () => {
     await prisma.authAuditEvent.deleteMany({
-      where: { user: { email: { contains: emailPrefix } } },
+      where: { user: { email: { startsWith: emailPrefix } } },
     });
     await prisma.session.deleteMany({
-      where: { user: { email: { contains: emailPrefix } } },
+      where: { user: { email: { startsWith: emailPrefix } } },
     });
     await prisma.user.deleteMany({
-      where: { email: { contains: emailPrefix } },
+      where: { email: { startsWith: emailPrefix } },
     });
     await app.close();
   });
@@ -121,74 +143,90 @@ describe('Account deletion vs login/refresh concurrency (e2e)', () => {
     return { email, auth: response.body as AuthResponseDto };
   }
 
-  it('login() racing a concurrent deleteAccount() for the same account never returns a raw 500 (20 iterations)', async () => {
-    const password = 'correct-horse-battery';
+  it(
+    'login() racing a concurrent deleteAccount() for the same account never returns a raw 500 (20 iterations)',
+    async () => {
+      const password = 'correct-horse-battery';
 
-    for (let i = 0; i < 20; i += 1) {
-      const { email, auth } = await registerAccount(
-        `login-race-${i}`,
-        password,
-      );
-      throttlerStorage.storage.clear();
-
-      const [loginResponse, deletionResponse] = await Promise.all([
-        request(app.getHttpServer())
-          .post('/auth/login')
-          .send({ email, password }),
-        request(app.getHttpServer())
-          .post('/users/me/deletion')
-          .set('Authorization', `Bearer ${auth.accessToken}`)
-          .send({ currentPassword: password, confirmDeletion: true }),
-      ]);
-
-      const loginStatus: number = loginResponse.status;
-      expect([HttpStatus.OK, HttpStatus.UNAUTHORIZED]).toContain(loginStatus);
-      if (Number(loginStatus) === Number(HttpStatus.UNAUTHORIZED)) {
-        expect(loginResponse.body).toEqual(GENERIC_INVALID_CREDENTIALS_BODY);
-      } else {
-        expect((loginResponse.body as AuthResponseDto).accessToken).toEqual(
-          expect.any(String),
+      for (let i = 0; i < 20; i += 1) {
+        const { email, auth } = await registerAccount(
+          `login-race-${i}`,
+          password,
         );
+        throttlerStorage.storage.clear();
+
+        const [loginResponse, deletionResponse] = await Promise.all([
+          request(app.getHttpServer())
+            .post('/auth/login')
+            .send({ email, password }),
+          request(app.getHttpServer())
+            .post('/users/me/deletion')
+            .set('Authorization', `Bearer ${auth.accessToken}`)
+            .send({ currentPassword: password, confirmDeletion: true }),
+        ]);
+
+        const loginStatus: number = loginResponse.status;
+        expect([HttpStatus.OK, HttpStatus.UNAUTHORIZED]).toContain(loginStatus);
+        if (Number(loginStatus) === Number(HttpStatus.UNAUTHORIZED)) {
+          expect(loginResponse.body).toEqual(GENERIC_INVALID_CREDENTIALS_BODY);
+        } else {
+          expect((loginResponse.body as AuthResponseDto).accessToken).toEqual(
+            expect.any(String),
+          );
+        }
+
+        // Unaffected by the race either way — see this file's doc comment.
+        expect(deletionResponse.status).toBe(HttpStatus.OK);
+        expect(deletionResponse.body).toEqual({ success: true });
       }
+      // 20 iterations x 3 real cost-12 bcrypt operations (register 1, racing
+      // login 1, deleteAccount 1). At the measured saturated cost that is ~27s
+      // of pure hashing, which the previous flat 30000ms could not cover — this
+      // test failed on EVERY baseline e2e run on this hardware.
+    },
+    bcryptTestBudgetMs(20 * 3),
+  );
 
-      // Unaffected by the race either way — see this file's doc comment.
-      expect(deletionResponse.status).toBe(HttpStatus.OK);
-      expect(deletionResponse.body).toEqual({ success: true });
-    }
-  }, 30000);
+  it(
+    'refresh() racing a concurrent deleteAccount() for the same account never returns a raw 500 (30 iterations)',
+    async () => {
+      const password = 'correct-horse-battery';
 
-  it('refresh() racing a concurrent deleteAccount() for the same account never returns a raw 500 (30 iterations)', async () => {
-    const password = 'correct-horse-battery';
+      for (let i = 0; i < 30; i += 1) {
+        const { auth } = await registerAccount(`refresh-race-${i}`, password);
+        throttlerStorage.storage.clear();
 
-    for (let i = 0; i < 30; i += 1) {
-      const { auth } = await registerAccount(`refresh-race-${i}`, password);
-      throttlerStorage.storage.clear();
+        const [refreshResponse, deletionResponse] = await Promise.all([
+          request(app.getHttpServer())
+            .post('/auth/refresh')
+            .send({ refreshToken: auth.refreshToken }),
+          request(app.getHttpServer())
+            .post('/users/me/deletion')
+            .set('Authorization', `Bearer ${auth.accessToken}`)
+            .send({ currentPassword: password, confirmDeletion: true }),
+        ]);
 
-      const [refreshResponse, deletionResponse] = await Promise.all([
-        request(app.getHttpServer())
-          .post('/auth/refresh')
-          .send({ refreshToken: auth.refreshToken }),
-        request(app.getHttpServer())
-          .post('/users/me/deletion')
-          .set('Authorization', `Bearer ${auth.accessToken}`)
-          .send({ currentPassword: password, confirmDeletion: true }),
-      ]);
-
-      const refreshStatus: number = refreshResponse.status;
-      expect([HttpStatus.OK, HttpStatus.UNAUTHORIZED]).toContain(refreshStatus);
-      if (Number(refreshStatus) === Number(HttpStatus.UNAUTHORIZED)) {
-        expect(refreshResponse.body).toEqual(
-          GENERIC_INVALID_REFRESH_TOKEN_BODY,
+        const refreshStatus: number = refreshResponse.status;
+        expect([HttpStatus.OK, HttpStatus.UNAUTHORIZED]).toContain(
+          refreshStatus,
         );
-      } else {
-        expect((refreshResponse.body as AuthResponseDto).accessToken).toEqual(
-          expect.any(String),
-        );
+        if (Number(refreshStatus) === Number(HttpStatus.UNAUTHORIZED)) {
+          expect(refreshResponse.body).toEqual(
+            GENERIC_INVALID_REFRESH_TOKEN_BODY,
+          );
+        } else {
+          expect((refreshResponse.body as AuthResponseDto).accessToken).toEqual(
+            expect.any(String),
+          );
+        }
+
+        // Unaffected by the race either way — see this file's doc comment.
+        expect(deletionResponse.status).toBe(HttpStatus.OK);
+        expect(deletionResponse.body).toEqual({ success: true });
       }
-
-      // Unaffected by the race either way — see this file's doc comment.
-      expect(deletionResponse.status).toBe(HttpStatus.OK);
-      expect(deletionResponse.body).toEqual({ success: true });
-    }
-  }, 45000);
+      // 30 iterations x 2 real cost-12 bcrypt operations (register 1,
+      // deleteAccount 1 — `refresh` performs none).
+    },
+    bcryptTestBudgetMs(30 * 2),
+  );
 });

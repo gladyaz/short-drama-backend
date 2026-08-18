@@ -7,6 +7,24 @@ import { AppModule } from './../src/app.module';
 import { AppExceptionFilter } from './../src/common/filters/app-exception.filter';
 import { PrismaService } from './../src/prisma/prisma.service';
 import type { AuthResponseDto } from './../src/auth/auth.types';
+import { bcryptTestBudgetMs } from './../src/common/testing/bcrypt-test-budget.helpers';
+import {
+  TEST_FIXTURE_NAMESPACE,
+  fixtureEmail,
+} from './../src/common/testing/fixture-namespace.helpers';
+
+/**
+ * Auth test-stability slice: replaces Jest's inherited 5000ms default, which
+ * was never sized for a suite that drives REAL cost-factor-12 bcrypt hashing
+ * through the full HTTP stack. A single test here commonly performs 4-8 such
+ * operations (~1.8-3.5s of irreducible CPU work with the worker pool
+ * saturated) before any database or Nest overhead. See
+ * `src/common/testing/bcrypt-test-budget.helpers.ts` — a harness
+ * hang-detector budget, NOT a business-security timeout: no production
+ * timeout, token lifetime, lockout window, or throttle window is changed by
+ * this.
+ */
+jest.setTimeout(bcryptTestBudgetMs(8));
 
 interface ErrorResponseBody {
   statusCode: number;
@@ -38,9 +56,13 @@ describe('Auth audit logging (e2e)', () => {
   let prisma: PrismaService;
   let throttlerStorage: ThrottlerStorageService;
 
-  const emailPrefix = 'auth-audit-e2e+12ab3';
-  const uniqueEmail = (label: string): string =>
-    `${emailPrefix}-${label}-${Date.now()}-${Math.random().toString(36).slice(2)}@example.test`;
+  // Auth test-stability slice: was the hardcoded literal
+  // `'auth-audit-e2e+12ab3'`, byte-identical in every worktree of this repo, so any
+  // two concurrent Jest runs sharing `short_drama_test` deleted each
+  // other's in-flight fixtures mid-test. See
+  // `src/common/testing/fixture-namespace.helpers.ts`.
+  const emailPrefix = TEST_FIXTURE_NAMESPACE;
+  const uniqueEmail = (label: string): string => fixtureEmail(`aae-${label}`);
 
   beforeAll(async () => {
     const moduleFixture: TestingModule = await Test.createTestingModule({
@@ -65,16 +87,16 @@ describe('Auth audit logging (e2e)', () => {
 
   afterAll(async () => {
     await prisma.authAuditEvent.deleteMany({
-      where: { user: { email: { contains: emailPrefix } } },
+      where: { user: { email: { startsWith: emailPrefix } } },
     });
     await prisma.accountLockout.deleteMany({
-      where: { user: { email: { contains: emailPrefix } } },
+      where: { user: { email: { startsWith: emailPrefix } } },
     });
     await prisma.session.deleteMany({
-      where: { user: { email: { contains: emailPrefix } } },
+      where: { user: { email: { startsWith: emailPrefix } } },
     });
     await prisma.user.deleteMany({
-      where: { email: { contains: emailPrefix } },
+      where: { email: { startsWith: emailPrefix } },
     });
     await app.close();
   });

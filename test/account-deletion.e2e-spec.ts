@@ -7,6 +7,24 @@ import { AppModule } from './../src/app.module';
 import { AppExceptionFilter } from './../src/common/filters/app-exception.filter';
 import { PrismaService } from './../src/prisma/prisma.service';
 import type { AuthResponseDto } from './../src/auth/auth.types';
+import { bcryptTestBudgetMs } from './../src/common/testing/bcrypt-test-budget.helpers';
+import {
+  TEST_FIXTURE_NAMESPACE,
+  fixtureEmail,
+} from './../src/common/testing/fixture-namespace.helpers';
+
+/**
+ * Auth test-stability slice: replaces Jest's inherited 5000ms default, which
+ * was never sized for a suite that drives REAL cost-factor-12 bcrypt hashing
+ * through the full HTTP stack. A single test here commonly performs 4-8 such
+ * operations (~1.8-3.5s of irreducible CPU work with the worker pool
+ * saturated) before any database or Nest overhead. See
+ * `src/common/testing/bcrypt-test-budget.helpers.ts` — a harness
+ * hang-detector budget, NOT a business-security timeout: no production
+ * timeout, token lifetime, lockout window, or throttle window is changed by
+ * this.
+ */
+jest.setTimeout(bcryptTestBudgetMs(8));
 
 interface ErrorResponseBody {
   statusCode: number;
@@ -44,7 +62,12 @@ describe('Account deletion (e2e)', () => {
   // RFC 5321 64-character local-part limit, and this prefix is combined with
   // a label + timestamp + random suffix per generated address below (see
   // `auth-rate-limit-lockout.e2e-spec.ts`'s identical precedent).
-  const emailPrefix = 'ad-e2e+12cb1';
+  // Auth test-stability slice: was the hardcoded literal
+  // `'ad-e2e+12cb1'`, byte-identical in every worktree of this repo, so any
+  // two concurrent Jest runs sharing `short_drama_test` deleted each
+  // other's in-flight fixtures mid-test. See
+  // `src/common/testing/fixture-namespace.helpers.ts`.
+  const emailPrefix = TEST_FIXTURE_NAMESPACE;
   // `POST /users/me/deletion` succeeding deliberately emits
   // `account_deletion_success` WITHOUT a `userId` (see
   // `AuthService.deleteAccount`'s doc comment) — the resulting row cannot be
@@ -53,8 +76,7 @@ describe('Account deletion (e2e)', () => {
   // `auth-audit.e2e-spec.ts`'s identical precedent) so `afterAll` can still
   // find and remove it.
   const deletionUserAgent = `${emailPrefix}-deletion-agent`;
-  const uniqueEmail = (label: string): string =>
-    `${emailPrefix}-${label}-${Date.now()}-${Math.random().toString(36).slice(2)}@example.test`;
+  const uniqueEmail = (label: string): string => fixtureEmail(`ade-${label}`);
   // Phase 12, work unit 12E-B1 (DECISIONS.md 2026-07-30, decision 1): a
   // genuinely SCRUBBED `AuthAuditEvent` row has `userId`/`ipHash`/
   // `userAgent`/`metadata` all null by design — so, by design, it can no
@@ -92,10 +114,10 @@ describe('Account deletion (e2e)', () => {
 
   afterAll(async () => {
     await prisma.authAuditEvent.deleteMany({
-      where: { userAgent: { contains: deletionUserAgent } },
+      where: { userAgent: { startsWith: deletionUserAgent } },
     });
     await prisma.authAuditEvent.deleteMany({
-      where: { user: { email: { contains: emailPrefix } } },
+      where: { user: { email: { startsWith: emailPrefix } } },
     });
     if (scrubbedAuditEventIds.length > 0) {
       await prisma.authAuditEvent.deleteMany({
@@ -103,10 +125,10 @@ describe('Account deletion (e2e)', () => {
       });
     }
     await prisma.session.deleteMany({
-      where: { user: { email: { contains: emailPrefix } } },
+      where: { user: { email: { startsWith: emailPrefix } } },
     });
     await prisma.user.deleteMany({
-      where: { email: { contains: emailPrefix } },
+      where: { email: { startsWith: emailPrefix } },
     });
     await app.close();
     delete process.env.DEV_TOOLS_ENABLED;

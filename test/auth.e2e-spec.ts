@@ -10,6 +10,24 @@ import { AppExceptionFilter } from './../src/common/filters/app-exception.filter
 import { PrismaService } from './../src/prisma/prisma.service';
 import type { AuthResponseDto } from './../src/auth/auth.types';
 import type { RootConfig } from './../src/config/configuration';
+import { bcryptTestBudgetMs } from './../src/common/testing/bcrypt-test-budget.helpers';
+import {
+  TEST_FIXTURE_NAMESPACE,
+  fixtureEmail,
+} from './../src/common/testing/fixture-namespace.helpers';
+
+/**
+ * Auth test-stability slice: replaces Jest's inherited 5000ms default, which
+ * was never sized for a suite that drives REAL cost-factor-12 bcrypt hashing
+ * through the full HTTP stack. A single test here commonly performs 4-8 such
+ * operations (~1.8-3.5s of irreducible CPU work with the worker pool
+ * saturated) before any database or Nest overhead. See
+ * `src/common/testing/bcrypt-test-budget.helpers.ts` — a harness
+ * hang-detector budget, NOT a business-security timeout: no production
+ * timeout, token lifetime, lockout window, or throttle window is changed by
+ * this.
+ */
+jest.setTimeout(bcryptTestBudgetMs(8));
 
 interface ErrorResponseBody {
   statusCode: number;
@@ -31,9 +49,13 @@ describe('Auth (e2e)', () => {
   let configService: ConfigService<RootConfig>;
   let throttlerStorage: ThrottlerStorageService;
 
-  const emailPrefix = 'auth-e2e-spec+8b5';
-  const uniqueEmail = (label: string): string =>
-    `${emailPrefix}-${label}-${Date.now()}-${Math.random().toString(36).slice(2)}@example.test`;
+  // Auth test-stability slice: was the hardcoded literal
+  // `'auth-e2e-spec+8b5'`, byte-identical in every worktree of this repo, so any
+  // two concurrent Jest runs sharing `short_drama_test` deleted each
+  // other's in-flight fixtures mid-test. See
+  // `src/common/testing/fixture-namespace.helpers.ts`.
+  const emailPrefix = TEST_FIXTURE_NAMESPACE;
+  const uniqueEmail = (label: string): string => fixtureEmail(`ae-${label}`);
 
   beforeAll(async () => {
     const moduleFixture: TestingModule = await Test.createTestingModule({
@@ -78,10 +100,10 @@ describe('Auth (e2e)', () => {
 
   afterAll(async () => {
     await prisma.session.deleteMany({
-      where: { user: { email: { contains: emailPrefix } } },
+      where: { user: { email: { startsWith: emailPrefix } } },
     });
     await prisma.user.deleteMany({
-      where: { email: { contains: emailPrefix } },
+      where: { email: { startsWith: emailPrefix } },
     });
     await app.close();
   });
@@ -303,7 +325,12 @@ describe('Auth (e2e)', () => {
       expect((response.body as ErrorResponseBody).code).toBe(
         'INVALID_ACCESS_TOKEN',
       );
-    }, 10000);
+      // Auth test-stability slice: the explicit 10000 here was REMOVED rather
+      // than converted. It had become the tightest budget in this file — below
+      // the file-level default above — so this test now simply inherits that
+      // higher default. Its cost is a hard 1100ms token-expiry wait plus HTTP
+      // round trips, not bcrypt, so no derived budget applies.
+    });
 
     it('rejects a token with an invalid signature', async () => {
       const response = await request(app.getHttpServer())

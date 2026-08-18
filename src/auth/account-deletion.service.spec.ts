@@ -9,6 +9,11 @@ import { AppException } from '../common/errors/app.exception';
 import { PrismaService } from '../prisma/prisma.service';
 import { AccountLockoutService } from './account-lockout.service';
 import { AuthAuditService } from './auth-audit.service';
+import { bcryptTestBudgetMs } from '../common/testing/bcrypt-test-budget.helpers';
+import {
+  TEST_FIXTURE_NAMESPACE,
+  fixtureEmail,
+} from '../common/testing/fixture-namespace.helpers';
 import { AuthService } from './auth.service';
 
 const TEST_AUTH_CONFIG = {
@@ -34,6 +39,16 @@ const TEST_AUTH_CONFIG = {
  * is restored in `afterAll` so it can never leak `DATABASE_URL_TEST` into any
  * OTHER `*.spec.ts` file sharing this Jest worker process afterward.
  */
+/**
+ * Auth test-stability slice: replaces Jest's inherited 5000ms default. Every
+ * test here drives REAL cost-factor-12 bcrypt hashing through the real
+ * `AuthService`; the most expensive one performs 6 such operations, which is
+ * already a large fraction of 5000ms on a busy machine. See
+ * `../common/testing/bcrypt-test-budget.helpers.ts` — a harness hang-detector
+ * budget, NOT a business-security timeout.
+ */
+jest.setTimeout(bcryptTestBudgetMs(6));
+
 describe('AuthService.deleteAccount', () => {
   let service: AuthService;
   let prisma: PrismaService;
@@ -51,9 +66,13 @@ describe('AuthService.deleteAccount', () => {
   // RFC 5321 64-character local-part limit, and this prefix is combined with
   // a label + timestamp + random suffix per generated address below (see
   // `auth-rate-limit-lockout.e2e-spec.ts`'s identical precedent).
-  const emailPrefix = 'ad-svc+12cb1';
-  const uniqueEmail = (label: string): string =>
-    `${emailPrefix}-${label}-${Date.now()}-${Math.random().toString(36).slice(2)}@example.test`;
+  // Auth test-stability slice: was the hardcoded literal `'ad-svc+12cb1'`,
+  // identical in every worktree of this repo and therefore shared by any
+  // concurrent Jest run against the same database — see
+  // `fixture-namespace.helpers.ts`. Every `${emailPrefix}-...` marker below
+  // inherits the per-run namespace unchanged.
+  const emailPrefix = TEST_FIXTURE_NAMESPACE;
+  const uniqueEmail = (label: string): string => fixtureEmail(`ad-${label}`);
 
   beforeAll(() => {
     originalDatabaseUrl = process.env.DATABASE_URL;
@@ -102,10 +121,10 @@ describe('AuthService.deleteAccount', () => {
     // `auth.service.spec.ts`'s existing orphan-cleanup precedent, these rows
     // are found via the marker `userAgent` every test below passes.
     await prisma.authAuditEvent.deleteMany({
-      where: { userAgent: { contains: emailPrefix } },
+      where: { userAgent: { startsWith: emailPrefix } },
     });
     await prisma.authAuditEvent.deleteMany({
-      where: { user: { email: { contains: emailPrefix } } },
+      where: { user: { email: { startsWith: emailPrefix } } },
     });
     // Phase 12, work unit 12E-B1: rows a test expects to end up genuinely
     // SCRUBBED (userId/ipHash/userAgent all null) can't be found by either
@@ -116,28 +135,28 @@ describe('AuthService.deleteAccount', () => {
       });
     }
     await prisma.analyticsEvent.deleteMany({
-      where: { eventName: { contains: emailPrefix } },
+      where: { eventName: { startsWith: emailPrefix } },
     });
     await prisma.accountLockout.deleteMany({
-      where: { user: { email: { contains: emailPrefix } } },
+      where: { user: { email: { startsWith: emailPrefix } } },
     });
     await prisma.passwordResetToken.deleteMany({
-      where: { user: { email: { contains: emailPrefix } } },
+      where: { user: { email: { startsWith: emailPrefix } } },
     });
     await prisma.entitlement.deleteMany({
-      where: { user: { email: { contains: emailPrefix } } },
+      where: { user: { email: { startsWith: emailPrefix } } },
     });
     await prisma.watchProgress.deleteMany({
-      where: { user: { email: { contains: emailPrefix } } },
+      where: { user: { email: { startsWith: emailPrefix } } },
     });
     await prisma.userVideoInteraction.deleteMany({
-      where: { user: { email: { contains: emailPrefix } } },
+      where: { user: { email: { startsWith: emailPrefix } } },
     });
     await prisma.session.deleteMany({
-      where: { user: { email: { contains: emailPrefix } } },
+      where: { user: { email: { startsWith: emailPrefix } } },
     });
     await prisma.user.deleteMany({
-      where: { email: { contains: emailPrefix } },
+      where: { email: { startsWith: emailPrefix } },
     });
     await prisma.onModuleDestroy();
   });

@@ -1,5 +1,9 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { PrismaService } from '../prisma/prisma.service';
+import {
+  TEST_FIXTURE_NAMESPACE,
+  fixtureEmail,
+} from '../common/testing/fixture-namespace.helpers';
 import { AccountLockoutService } from './account-lockout.service';
 import {
   LOCKOUT_DURATION_MS,
@@ -17,7 +21,8 @@ describe('AccountLockoutService', () => {
   let service: AccountLockoutService;
   let prisma: PrismaService;
 
-  const testIdPrefix = 'account-lockout-service-spec';
+  // Auth test-stability slice — see `fixture-namespace.helpers.ts`.
+  const testIdPrefix = TEST_FIXTURE_NAMESPACE;
   let userId: string;
 
   beforeEach(async () => {
@@ -31,7 +36,7 @@ describe('AccountLockoutService', () => {
 
     const user = await prisma.user.create({
       data: {
-        email: `${testIdPrefix}-${Date.now()}-${Math.random().toString(36).slice(2)}@example.test`,
+        email: fixtureEmail('lockout'),
         passwordHash: 'irrelevant-for-this-spec',
       },
     });
@@ -40,10 +45,10 @@ describe('AccountLockoutService', () => {
 
   afterEach(async () => {
     await prisma.accountLockout.deleteMany({
-      where: { user: { email: { contains: testIdPrefix } } },
+      where: { user: { email: { startsWith: testIdPrefix } } },
     });
     await prisma.user.deleteMany({
-      where: { email: { contains: testIdPrefix } },
+      where: { email: { startsWith: testIdPrefix } },
     });
     await prisma.onModuleDestroy();
   });

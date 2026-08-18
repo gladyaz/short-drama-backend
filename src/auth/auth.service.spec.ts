@@ -3,7 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { JwtModule, JwtService } from '@nestjs/jwt';
 import { HttpStatus } from '@nestjs/common';
 import * as bcrypt from 'bcryptjs';
-import type { Session } from '@prisma/client';
+import type { Session, User } from '@prisma/client';
 import { AppErrorCode } from '../common/errors/app-error-code';
 import { AppException } from '../common/errors/app.exception';
 import { PrismaService } from '../prisma/prisma.service';
@@ -11,6 +11,11 @@ import { AccountLockoutService } from './account-lockout.service';
 import { AuthAuditService } from './auth-audit.service';
 import { MAX_USER_AGENT_LENGTH } from './auth-crypto';
 import { AuthService } from './auth.service';
+import { bcryptTestBudgetMs } from '../common/testing/bcrypt-test-budget.helpers';
+import {
+  TEST_FIXTURE_NAMESPACE,
+  fixtureEmail,
+} from '../common/testing/fixture-namespace.helpers';
 import type { AuthResponseDto } from './auth.types';
 
 const TEST_AUTH_CONFIG = {
@@ -35,15 +40,34 @@ const OTHER_SECRET = 'a-completely-different-test-secret-not-a-real-secret';
  * no residue, and a stubbed `ConfigService` (matching `videos.service.spec.ts`)
  * so the test controls the JWT secrets without touching real `.env` values.
  */
+/**
+ * Auth test-stability slice: replaces Jest's inherited 5000ms default, which
+ * was never sized for this suite. The most expensive ORDINARY test here
+ * performs 8 real cost-factor-12 bcrypt operations (`changePassword` alone is
+ * 2: a compare plus a hash) — roughly 3.5 seconds of irreducible CPU work
+ * with the worker pool saturated, i.e. ~70% of the old default consumed
+ * before a single database round trip. The four loop-driven race tests below
+ * carry their own explicitly derived budgets. See
+ * `bcrypt-test-budget.helpers.ts`: this is a harness hang-detector budget,
+ * not a business-security timeout, and no production timeout is affected.
+ */
+jest.setTimeout(bcryptTestBudgetMs(8));
+
 describe('AuthService', () => {
   let service: AuthService;
   let prisma: PrismaService;
   let jwtService: JwtService;
 
-  const emailPrefix = 'auth-service-spec+8b5';
+  // Auth test-stability slice: this used to be the hardcoded literal
+  // `'auth-service-spec+8b5'`, identical in every checkout of this repo — so
+  // two Jest runs started in two different worktrees against the same
+  // `short_drama_dev` database each deleted the other's in-flight fixtures in
+  // `afterEach`. See `fixture-namespace.helpers.ts` for the full failure
+  // signature. Every marker below is still derived from this constant, so
+  // they all inherit the per-run namespace unchanged.
+  const emailPrefix = TEST_FIXTURE_NAMESPACE;
 
-  const uniqueEmail = (label: string): string =>
-    `${emailPrefix}-${label}-${Date.now()}-${Math.random().toString(36).slice(2)}@example.test`;
+  const uniqueEmail = (label: string): string => fixtureEmail(`as-${label}`);
 
   // Fix cycle 3 (Phase 12, 12B-B1), advisory-polish item 2: the two
   // probabilistic race tests below (real bcrypt, real concurrent Promise
@@ -94,22 +118,22 @@ describe('AuthService', () => {
     // BEFORE the user row is deleted, while `userId` still links each row
     // back to this test's own prefixed accounts.
     await prisma.authAuditEvent.deleteMany({
-      where: { user: { email: { contains: emailPrefix } } },
+      where: { user: { email: { startsWith: emailPrefix } } },
     });
     // Orphaned rows with no linked user (e.g. a login attempt for an email
     // that never resolved to any account) — see the "nonexistent email"
     // login test above for the one call site that creates one.
     await prisma.authAuditEvent.deleteMany({
-      where: { userId: null, userAgent: { contains: emailPrefix } },
+      where: { userId: null, userAgent: { startsWith: emailPrefix } },
     });
     await prisma.accountLockout.deleteMany({
-      where: { user: { email: { contains: emailPrefix } } },
+      where: { user: { email: { startsWith: emailPrefix } } },
     });
     await prisma.session.deleteMany({
-      where: { user: { email: { contains: emailPrefix } } },
+      where: { user: { email: { startsWith: emailPrefix } } },
     });
     await prisma.user.deleteMany({
-      where: { email: { contains: emailPrefix } },
+      where: { email: { startsWith: emailPrefix } },
     });
     await prisma.onModuleDestroy();
   });
@@ -347,7 +371,7 @@ describe('AuthService', () => {
           // spec file that emits a `userId: null` AuthAuditEvent row (no
           // user ever resolved) — a distinctive `userAgent` marker lets
           // `afterEach` clean it up below, since it cannot be found via the
-          // usual `user: { email: { contains: emailPrefix } }` relation
+          // usual `user: { email: { startsWith: emailPrefix } }` relation
           // filter (there is no related user to filter through).
           { userAgent: `${emailPrefix}-nonexistent-email-audit-marker` },
         );
@@ -437,8 +461,14 @@ describe('AuthService', () => {
       // (observed on GitHub Actions at backend `a7cc07f`). The explicit timeout
       // buys this test the wall-clock it genuinely needs; it does NOT weaken any
       // assertion, and `BCRYPT_COST_FACTOR` stays at its production value of 12
-      // so this still exercises real production hashing cost. Same 60000 ms
-      // convention already used by the concurrency tests below.
+      // so this still exercises real production hashing cost.
+      //
+      // Auth test-stability slice: deliberately left at its original hand-set
+      // value. `bcryptTestBudgetMs(12)` would derive ~17.5 s from THIS machine's
+      // measurements, which would be a 71% CUT to a budget that was chosen in
+      // response to a real, observed CI timeout on slower hardware. A derived
+      // budget may only ever RAISE an existing explicit one — see
+      // `bcrypt-test-budget.helpers.ts`.
     }, 60000);
 
     it('allows login again once the lock window has elapsed (simulated via the stored timestamp)', async () => {
@@ -668,6 +698,102 @@ describe('AuthService', () => {
       expect(
         (auditEvents[0].metadata as { reason?: string } | null)?.reason,
       ).toBe('concurrent_rotation_race');
+    });
+
+    /**
+     * Auth test-stability slice — the `refresh()` half of the production race
+     * fixed for `login()` in the `changePassword` block below (surfaced by the
+     * independent security review of that fix).
+     *
+     * `refresh`'s conditional `updateMany` CAS proves nobody else revoked the
+     * PRESENTED session first. It says nothing about a password change that
+     * commits AFTER that CAS but BEFORE the replacement row is inserted: in
+     * that ordering `changePassword`'s two sweeps both run while the
+     * replacement does not yet exist, so neither can match it, and the caller
+     * keeps a live session across the password change. That caller is exactly
+     * who "changing your password logs out every other session" exists to cut
+     * off — someone holding a stolen refresh token.
+     *
+     * This test FORCES that interleaving rather than hoping for it: it
+     * intercepts `refresh`'s rotation CAS, lets the real statement run and
+     * commit, then runs a COMPLETE `changePassword` (against a second device's
+     * session, since the first has just been revoked by that CAS) before
+     * returning. Zero timing dependence — it fails without the compensating
+     * re-check and passes with it, on any hardware at any load.
+     */
+    it('a refresh() that rotated before a concurrent changePassword() committed does not leave a surviving session', async () => {
+      const email = uniqueEmail('refresh-superseded');
+      const oldPassword = 'correct-horse-battery';
+      const newPassword = 'brand-new-password-1';
+
+      // Two devices: `registered` is the one being refreshed; `secondDevice`
+      // gives `changePassword` a still-usable session to run against after the
+      // refresh CAS has revoked the first one.
+      const registered = await service.register({
+        email,
+        password: oldPassword,
+      });
+      const secondDevice = await service.login({
+        email,
+        password: oldPassword,
+      });
+
+      // Captured BEFORE the spy is installed so the interceptor can run the
+      // genuine statement. Explicitly typed against the spied method rather
+      // than left as the `any` that `Function.bind` yields, so the call below
+      // stays type-checked.
+      type SessionUpdateMany = typeof prisma.session.updateMany;
+      const realUpdateMany = prisma.session.updateMany.bind(
+        prisma.session,
+      ) as SessionUpdateMany;
+      let changePasswordResponse: AuthResponseDto | undefined;
+
+      const updateManySpy = jest
+        .spyOn(prisma.session, 'updateMany')
+        .mockImplementationOnce((async (
+          args: Parameters<SessionUpdateMany>[0],
+        ) => {
+          // The real rotation CAS, committed exactly as in production...
+          const result = await realUpdateMany(args);
+          // ...then a full password change commits before `refresh` gets to
+          // insert its replacement session.
+          changePasswordResponse = await service.changePassword(
+            registered.user.id,
+            {
+              currentPassword: oldPassword,
+              newPassword,
+              refreshToken: secondDevice.refreshToken,
+            },
+          );
+          return result;
+        }) as unknown as SessionUpdateMany);
+
+      try {
+        await expect(
+          service.refresh(registered.refreshToken),
+        ).rejects.toMatchObject({
+          code: AppErrorCode.INVALID_REFRESH_TOKEN,
+          status: HttpStatus.UNAUTHORIZED,
+        } as Partial<AppException>);
+      } finally {
+        updateManySpy.mockRestore();
+      }
+
+      // THE REGRESSION ASSERTION: the only active session left is the
+      // replacement `changePassword` issued. Without the compensating
+      // re-check this is 2 — the extra one being the session `refresh`
+      // inserted after the password had already changed.
+      const activeSessions = await prisma.session.findMany({
+        where: { user: { email }, revokedAt: null },
+      });
+      expect(activeSessions).toHaveLength(1);
+
+      // The legitimate caller who changed the password is untouched: the
+      // compensating revoke must remove ONLY the row `refresh` created.
+      const refreshedAgain = await service.refresh(
+        changePasswordResponse!.refreshToken,
+      );
+      expect(refreshedAgain.accessToken).toEqual(expect.any(String));
     });
   });
 
@@ -1028,93 +1154,99 @@ describe('AuthService', () => {
      * concurrency (not the deterministic single-shared-token mock above),
      * matching exactly what the reviewer reproduced.
      */
-    it('two concurrent change-password calls for two DIFFERENT active sessions of the same account do not deadlock — one succeeds, the other fails cleanly through the documented race path', async () => {
-      for (let iteration = 0; iteration < RACE_TEST_ITERATIONS; iteration++) {
-        const email = uniqueEmail(
-          `change-password-two-session-race-${iteration}`,
-        );
-        const correctPassword = 'correct-horse-battery';
-        const registered = await service.register({
-          email,
-          password: correctPassword,
-        });
-        // A genuinely independent SECOND active session for the SAME account
-        // (a real `login`, not a mock) — this is precisely the "phone +
-        // tablet" scenario decision 7's "revoke every OTHER session" exists
-        // to serve.
-        const secondDevice = await service.login({
-          email,
-          password: correctPassword,
-        });
+    it(
+      'two concurrent change-password calls for two DIFFERENT active sessions of the same account do not deadlock — one succeeds, the other fails cleanly through the documented race path',
+      async () => {
+        for (let iteration = 0; iteration < RACE_TEST_ITERATIONS; iteration++) {
+          const email = uniqueEmail(
+            `change-password-two-session-race-${iteration}`,
+          );
+          const correctPassword = 'correct-horse-battery';
+          const registered = await service.register({
+            email,
+            password: correctPassword,
+          });
+          // A genuinely independent SECOND active session for the SAME account
+          // (a real `login`, not a mock) — this is precisely the "phone +
+          // tablet" scenario decision 7's "revoke every OTHER session" exists
+          // to serve.
+          const secondDevice = await service.login({
+            email,
+            password: correctPassword,
+          });
 
-        const [resultA, resultB] = await Promise.allSettled([
-          service.changePassword(registered.user.id, {
-            currentPassword: correctPassword,
-            newPassword: 'brand-new-password-from-device-a',
-            refreshToken: registered.refreshToken,
-          }),
-          service.changePassword(registered.user.id, {
-            currentPassword: correctPassword,
-            newPassword: 'brand-new-password-from-device-b',
-            refreshToken: secondDevice.refreshToken,
-          }),
-        ]);
-        const settled = [resultA, resultB];
+          const [resultA, resultB] = await Promise.allSettled([
+            service.changePassword(registered.user.id, {
+              currentPassword: correctPassword,
+              newPassword: 'brand-new-password-from-device-a',
+              refreshToken: registered.refreshToken,
+            }),
+            service.changePassword(registered.user.id, {
+              currentPassword: correctPassword,
+              newPassword: 'brand-new-password-from-device-b',
+              refreshToken: secondDevice.refreshToken,
+            }),
+          ]);
+          const settled = [resultA, resultB];
 
-        // Neither settlement may be an unhandled/opaque failure. The deadlock
-        // bug this test guards against surfaces as a raw
-        // `PrismaClientUnknownRequestError` (Postgres `40P01`), never a clean
-        // `AppException` — so any rejection here must carry the documented
-        // `INVALID_REFRESH_TOKEN` shape, never anything else.
-        for (const result of settled) {
-          if (result.status === 'rejected') {
-            expect(result.reason).toBeInstanceOf(AppException);
-            expect((result.reason as AppException).code).toBe(
-              AppErrorCode.INVALID_REFRESH_TOKEN,
-            );
+          // Neither settlement may be an unhandled/opaque failure. The deadlock
+          // bug this test guards against surfaces as a raw
+          // `PrismaClientUnknownRequestError` (Postgres `40P01`), never a clean
+          // `AppException` — so any rejection here must carry the documented
+          // `INVALID_REFRESH_TOKEN` shape, never anything else.
+          for (const result of settled) {
+            if (result.status === 'rejected') {
+              expect(result.reason).toBeInstanceOf(AppException);
+              expect((result.reason as AppException).code).toBe(
+                AppErrorCode.INVALID_REFRESH_TOKEN,
+              );
+            }
           }
+
+          // Exactly one call wins (password changed, fresh token pair) and
+          // exactly one loses (rejected via the existing
+          // concurrent-rotation-race path) — never both succeeding (race-safety
+          // bypassed) and never both failing (account stuck, unable to change
+          // its password at all).
+          const fulfilled = settled.filter(
+            (r): r is PromiseFulfilledResult<AuthResponseDto> =>
+              r.status === 'fulfilled',
+          );
+          const rejected = settled.filter((r) => r.status === 'rejected');
+          expect(fulfilled).toHaveLength(1);
+          expect(rejected).toHaveLength(1);
+
+          // The winner's brand-new token pair actually still works afterward —
+          // proof the loser's defensive cleanup revoke never swept up the
+          // winner's freshly created replacement session.
+          const winnerResponse = fulfilled[0].value;
+          const refreshedAgain = await service.refresh(
+            winnerResponse.refreshToken,
+          );
+          expect(refreshedAgain.accessToken).toEqual(expect.any(String));
+
+          // The account is never left with zero active sessions.
+          const activeSessions = await prisma.session.findMany({
+            where: { user: { email }, revokedAt: null },
+          });
+          expect(activeSessions).toHaveLength(1);
+
+          // The loser's rejection used the SAME existing
+          // `refresh_reuse_detected` / `concurrent_rotation_race` audit path —
+          // no new error code or event type was invented for this fix.
+          const auditEvents = await prisma.authAuditEvent.findMany({
+            where: { user: { email }, event: 'refresh_reuse_detected' },
+          });
+          expect(auditEvents).toHaveLength(1);
+          expect(
+            (auditEvents[0].metadata as { reason?: string } | null)?.reason,
+          ).toBe('concurrent_rotation_race');
         }
-
-        // Exactly one call wins (password changed, fresh token pair) and
-        // exactly one loses (rejected via the existing
-        // concurrent-rotation-race path) — never both succeeding (race-safety
-        // bypassed) and never both failing (account stuck, unable to change
-        // its password at all).
-        const fulfilled = settled.filter(
-          (r): r is PromiseFulfilledResult<AuthResponseDto> =>
-            r.status === 'fulfilled',
-        );
-        const rejected = settled.filter((r) => r.status === 'rejected');
-        expect(fulfilled).toHaveLength(1);
-        expect(rejected).toHaveLength(1);
-
-        // The winner's brand-new token pair actually still works afterward —
-        // proof the loser's defensive cleanup revoke never swept up the
-        // winner's freshly created replacement session.
-        const winnerResponse = fulfilled[0].value;
-        const refreshedAgain = await service.refresh(
-          winnerResponse.refreshToken,
-        );
-        expect(refreshedAgain.accessToken).toEqual(expect.any(String));
-
-        // The account is never left with zero active sessions.
-        const activeSessions = await prisma.session.findMany({
-          where: { user: { email }, revokedAt: null },
-        });
-        expect(activeSessions).toHaveLength(1);
-
-        // The loser's rejection used the SAME existing
-        // `refresh_reuse_detected` / `concurrent_rotation_race` audit path —
-        // no new error code or event type was invented for this fix.
-        const auditEvents = await prisma.authAuditEvent.findMany({
-          where: { user: { email }, event: 'refresh_reuse_detected' },
-        });
-        expect(auditEvents).toHaveLength(1);
-        expect(
-          (auditEvents[0].metadata as { reason?: string } | null)?.reason,
-        ).toBe('concurrent_rotation_race');
-      }
-    }, 60000);
+        // 10 iterations x 6 real cost-12 bcrypt operations (register 1,
+        // second-device login 1, two changePassword calls 2 each).
+      },
+      bcryptTestBudgetMs(10 * 6),
+    );
 
     /**
      * BLOCKING CRITICAL (Phase 12, 12B-B1 fix cycle 2): reproduces, against
@@ -1154,15 +1286,41 @@ describe('AuthService', () => {
           service.login({ email, password: oldPassword }),
         ]);
 
-        // `login()` never contends for the same session row `changePassword`
-        // is rotating (it only ever creates a brand-new row of its own), so
-        // it always succeeds independently of the race outcome — asserting
-        // this keeps the test as "the exact scenario reported" rather than a
-        // degenerate run where one call trivially errors for an unrelated
-        // reason. `changePassword` also always wins here: nothing else in
-        // this test ever touches `registered`'s own session row.
-        expect(loginResult.status).toBe('fulfilled');
+        // `changePassword` always wins here: nothing else in this test ever
+        // touches `registered`'s own session row, so its id is always a
+        // member of the set its own revoke-all statement returns.
         expect(changePasswordResult.status).toBe('fulfilled');
+
+        // Auth test-stability slice: `login()` now has TWO legal outcomes,
+        // and asserting only `'fulfilled'` (as this test did before the
+        // `login()` `FOR SHARE` guard shipped) made this test fail exactly
+        // when the guard did its job — the guard's whole purpose is to refuse
+        // a login whose password was replaced mid-flight. Which outcome
+        // occurs depends on which transaction reaches the `User` row first,
+        // and this file's own production code documents that ordering as
+        // genuinely unreliable ("bcryptjs's cooperative, single-threaded
+        // chunked hashing makes 'changePassword does two bcrypt calls, login
+        // only does one' an unreliable ordering guarantee").
+        //
+        //   - login takes the `User` lock first  -> it is fulfilled, and
+        //     `changePassword`'s final pre-commit sweep revokes the session
+        //     it created.
+        //   - `changePassword` commits first     -> login's re-read sees the
+        //     new hash and is refused with the generic INVALID_CREDENTIALS.
+        //
+        // BOTH outcomes satisfy the security property this test exists to
+        // pin, which is the `toHaveLength(1)` assertion below: the account is
+        // left with exactly one active session, `changePassword`'s own
+        // replacement. Accepting both is therefore not a weakened assertion —
+        // the refusal branch is additionally pinned to the exact error code,
+        // and the deterministic sibling test below forces the refusal branch
+        // 100% of the time so it can never go silently uncovered.
+        if (loginResult.status === 'rejected') {
+          expect(loginResult.reason).toMatchObject({
+            code: AppErrorCode.INVALID_CREDENTIALS,
+            status: HttpStatus.UNAUTHORIZED,
+          } as Partial<AppException>);
+        }
 
         // The core of the CRITICAL finding: exactly ONE active session must
         // survive for the account afterward — the fresh session
@@ -1186,7 +1344,123 @@ describe('AuthService', () => {
           expect(refreshedAgain.accessToken).toEqual(expect.any(String));
         }
       }
+      // 10 iterations x 4 real cost-12 bcrypt operations (register 1,
+      // changePassword 2, racing login 1) — ~18s at the measured saturated
+      // cost. Auth test-stability slice: left at its original 60000, because
+      // `bcryptTestBudgetMs(10 * 4)` derives 54000, which would be a CUT. A
+      // derived budget may only ever RAISE an existing explicit one.
     }, 60000);
+
+    /**
+     * Auth test-stability slice — DETERMINISTIC counterpart to the
+     * probabilistic race above, and the regression test for the production
+     * defect that race intermittently exposed (`expect(activeSessions)
+     * .toHaveLength(1)` receiving 2, reproducible only when other suites
+     * were concurrently loading the same database).
+     *
+     * `login()` reads `user.passwordHash`, spends ~300ms in `bcrypt.compare`
+     * at `BCRYPT_COST_FACTOR = 12`, and only then creates its session. A
+     * `changePassword()` that commits inside that window revokes every
+     * session that EXISTS at the time it runs — it cannot revoke a row that
+     * has not been inserted yet, so both of its defensive sweeps are
+     * structurally incapable of catching this one. The login therefore used
+     * to succeed and leave a second active session behind, authenticated by
+     * a password the account owner had just replaced precisely in order to
+     * cut off exactly that kind of session.
+     *
+     * Rather than hope the scheduler produces that interleaving, this test
+     * FORCES it: it intercepts login()'s first `user.findUnique` (the read
+     * whose `passwordHash` login compares against), runs a COMPLETE
+     * `changePassword()` to commit inside the interceptor, and only then
+     * hands login the stale pre-change snapshot. That is byte-for-byte the
+     * state a real concurrent change produces, with zero timing dependence,
+     * so this test fails 100% of the time against the unfixed code and
+     * passes 100% of the time against the fixed code — on any hardware, at
+     * any load. It uses the same `mockImplementationOnce` interception
+     * technique (and the same type-cast rationale) as the two existing
+     * simulated-race tests earlier in this file.
+     */
+    it('a login() whose authenticated password was replaced by a concurrent changePassword() before its session was created is refused, leaving exactly one active session', async () => {
+      const email = uniqueEmail('change-password-login-superseded');
+      const oldPassword = 'correct-horse-battery';
+      const newPassword = 'brand-new-password-1';
+
+      const registered = await service.register({
+        email,
+        password: oldPassword,
+      });
+
+      // The pre-change snapshot login will be handed — captured BEFORE the
+      // password changes, exactly like the row a real login would already
+      // have read by the time a concurrent change commits.
+      const staleUser = await prisma.user.findUnique({ where: { email } });
+
+      let changePasswordResponse: AuthResponseDto | undefined;
+
+      const findUniqueSpy = jest
+        .spyOn(prisma.user, 'findUnique')
+        .mockImplementationOnce((async (): Promise<User | null> => {
+          // Runs to completion (and commits) before login sees anything:
+          // the password is now `newPassword` and every session that existed
+          // — including `registered`'s — has been revoked and replaced.
+          changePasswordResponse = await service.changePassword(
+            registered.user.id,
+            {
+              currentPassword: oldPassword,
+              newPassword,
+              refreshToken: registered.refreshToken,
+            },
+          );
+          return staleUser;
+        }) as unknown as typeof prisma.user.findUnique);
+
+      try {
+        // The generic, enumeration-safe error every other "these credentials
+        // are not valid" outcome in `login` returns — deliberately NOT a new
+        // code, so a caller cannot distinguish this from a plain wrong
+        // password.
+        await expect(
+          service.login({ email, password: oldPassword }),
+        ).rejects.toMatchObject({
+          code: AppErrorCode.INVALID_CREDENTIALS,
+          status: HttpStatus.UNAUTHORIZED,
+        } as Partial<AppException>);
+      } finally {
+        findUniqueSpy.mockRestore();
+      }
+
+      // THE REGRESSION ASSERTION: exactly one active session survives — the
+      // replacement `changePassword` issued. Before the fix this was 2, the
+      // extra one being the session this superseded login created.
+      const activeSessions = await prisma.session.findMany({
+        where: { user: { email }, revokedAt: null },
+      });
+      expect(activeSessions).toHaveLength(1);
+
+      // ...and it is genuinely `changePassword`'s own replacement session,
+      // still usable: the guard must refuse the superseded login WITHOUT
+      // collaterally breaking the legitimate caller who changed the
+      // password.
+      const refreshedAgain = await service.refresh(
+        changePasswordResponse!.refreshToken,
+      );
+      expect(refreshedAgain.accessToken).toEqual(expect.any(String));
+
+      // The refusal is recorded as a login FAILURE with the dedicated
+      // reason — never as `login_success`, which is what the audit trail
+      // used to contain for this path.
+      const failureEvents = await prisma.authAuditEvent.findMany({
+        where: { user: { email }, event: 'login_failed' },
+      });
+      expect(failureEvents).toHaveLength(1);
+      expect(
+        (failureEvents[0].metadata as { reason?: string } | null)?.reason,
+      ).toBe('credential_superseded');
+      const successEvents = await prisma.authAuditEvent.findMany({
+        where: { user: { email }, event: 'login_success' },
+      });
+      expect(successEvents).toHaveLength(0);
+    });
 
     /**
      * BLOCKING FINDING 2 (Phase 12, 12B-B1 fix cycle 1): mirrors
@@ -1836,7 +2110,7 @@ describe('AuthService', () => {
       // Phase 12, work unit 12A-B3's existing marker-based cleanup
       // precedent (see the "nonexistent email" login test above): a
       // `userId: null` audit row cannot be found via the usual
-      // `user: { email: { contains: emailPrefix } }` relation filter, so a
+      // `user: { email: { startsWith: emailPrefix } }` relation filter, so a
       // distinctive `userAgent` marker (itself containing `emailPrefix`,
       // matching `afterEach`'s existing orphan-cleanup query) is used
       // instead.
@@ -1978,7 +2252,7 @@ describe('AuthService', () => {
     // `!resetToken` branch (see its doc comment) emits a
     // `password_reset_confirm_failed` row with `userId: null` and no marker —
     // unreachable by the top-level `afterEach`'s existing
-    // `userId: null, userAgent: { contains: emailPrefix }` orphan-cleanup
+    // `userId: null, userAgent: { startsWith: emailPrefix }` orphan-cleanup
     // query (nothing to `contains`-match against a `null` `userAgent`).
     // Mirrors this file's existing `requestPasswordReset` marker precedent
     // (and `test/password-reset.e2e-spec.ts`'s identical pattern): a
@@ -2019,7 +2293,7 @@ describe('AuthService', () => {
       await devToolsPrisma.authAuditEvent.deleteMany({
         where: {
           userId: null,
-          userAgent: { contains: unknownTokenAuditMarker },
+          userAgent: { startsWith: unknownTokenAuditMarker },
         },
       });
       await devToolsPrisma.onModuleDestroy();
@@ -2380,53 +2654,65 @@ describe('AuthService', () => {
      * reintroduced regression, mirroring `RACE_TEST_ITERATIONS`'s existing
      * precedent above for the equivalent `changePassword` races.
      */
-    it('N concurrent confirms of TWO DIFFERENT outstanding tokens for the same account never deadlock: exactly one wins, the other fails cleanly', async () => {
-      for (
-        let iteration = 0;
-        iteration < PASSWORD_RESET_RACE_TEST_ITERATIONS;
-        iteration++
-      ) {
-        const email = uniqueEmail(`reset-confirm-two-token-race-${iteration}`);
-        await devToolsService.register({
-          email,
-          password: 'correct-horse-battery',
-        });
+    it(
+      'N concurrent confirms of TWO DIFFERENT outstanding tokens for the same account never deadlock: exactly one wins, the other fails cleanly',
+      async () => {
+        for (
+          let iteration = 0;
+          iteration < PASSWORD_RESET_RACE_TEST_ITERATIONS;
+          iteration++
+        ) {
+          const email = uniqueEmail(
+            `reset-confirm-two-token-race-${iteration}`,
+          );
+          await devToolsService.register({
+            email,
+            password: 'correct-horse-battery',
+          });
 
-        const tokenA = await requestRawToken(email);
-        const tokenB = await requestRawToken(email);
+          const tokenA = await requestRawToken(email);
+          const tokenB = await requestRawToken(email);
 
-        const settled = await Promise.allSettled([
-          devToolsService.confirmPasswordReset({
-            token: tokenA,
-            newPassword: 'password-from-attempt-a',
-          }),
-          devToolsService.confirmPasswordReset({
-            token: tokenB,
-            newPassword: 'password-from-attempt-b',
-          }),
-        ]);
+          const settled = await Promise.allSettled([
+            devToolsService.confirmPasswordReset({
+              token: tokenA,
+              newPassword: 'password-from-attempt-a',
+            }),
+            devToolsService.confirmPasswordReset({
+              token: tokenB,
+              newPassword: 'password-from-attempt-b',
+            }),
+          ]);
 
-        // Neither settlement may be an unhandled/opaque failure — the
-        // deadlock shape this guards against (Postgres `40P01`) would
-        // surface as a raw `PrismaClientUnknownRequestError`, never a clean
-        // `AppException`.
-        for (const result of settled) {
-          if (result.status === 'rejected') {
-            expect(result.reason).toBeInstanceOf(AppException);
-            expect((result.reason as AppException).code).toBe(
-              AppErrorCode.INVALID_PASSWORD_RESET_TOKEN,
-            );
+          // Neither settlement may be an unhandled/opaque failure — the
+          // deadlock shape this guards against (Postgres `40P01`) would
+          // surface as a raw `PrismaClientUnknownRequestError`, never a clean
+          // `AppException`.
+          for (const result of settled) {
+            if (result.status === 'rejected') {
+              expect(result.reason).toBeInstanceOf(AppException);
+              expect((result.reason as AppException).code).toBe(
+                AppErrorCode.INVALID_PASSWORD_RESET_TOKEN,
+              );
+            }
           }
-        }
 
-        // Exactly one call wins (password changed) and exactly one loses —
-        // never both succeeding (a double-invalidate bypass) and never both
-        // failing (a legitimate reset request stuck unusable).
-        const fulfilled = settled.filter((r) => r.status === 'fulfilled');
-        const rejected = settled.filter((r) => r.status === 'rejected');
-        expect(fulfilled).toHaveLength(1);
-        expect(rejected).toHaveLength(1);
-      }
-    }, 60000);
+          // Exactly one call wins (password changed) and exactly one loses —
+          // never both succeeding (a double-invalidate bypass) and never both
+          // failing (a legitimate reset request stuck unusable).
+          const fulfilled = settled.filter((r) => r.status === 'fulfilled');
+          const rejected = settled.filter((r) => r.status === 'rejected');
+          expect(fulfilled).toHaveLength(1);
+          expect(rejected).toHaveLength(1);
+        }
+        // 25 iterations x 3 real cost-12 bcrypt operations (register 1, two
+        // confirmPasswordReset calls hashing the new password, 1 each). At the
+        // measured saturated cost this test alone is ~34s of pure hashing — the
+        // previous flat 60000ms left it only 1.8x headroom, and it timed out on
+        // a loaded machine. The >= 25 iteration count is a standing review
+        // requirement and is deliberately UNCHANGED.
+      },
+      bcryptTestBudgetMs(25 * 3),
+    );
   });
 });

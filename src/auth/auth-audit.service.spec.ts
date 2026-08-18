@@ -1,6 +1,10 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service';
+import {
+  TEST_FIXTURE_NAMESPACE,
+  uniqueFixtureMarker,
+} from '../common/testing/fixture-namespace.helpers';
 import { AuthAuditService } from './auth-audit.service';
 import { MAX_USER_AGENT_LENGTH } from './auth-audit.types';
 
@@ -28,9 +32,12 @@ describe('AuthAuditService', () => {
   let service: AuthAuditService;
   let prisma: PrismaService;
 
-  const marker = 'auth-audit-service-spec+12a-b3';
+  // Auth test-stability slice — see `fixture-namespace.helpers.ts`. Was the
+  // hardcoded literal `'auth-audit-service-spec+12a-b3'`, shared verbatim by
+  // every concurrent Jest run against this database.
+  const marker = TEST_FIXTURE_NAMESPACE;
   const uniqueUserAgent = (label: string): string =>
-    `${marker}-${label}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    uniqueFixtureMarker(`aa-${label}`);
 
   beforeEach(async () => {
     const module: TestingModule = await Test.createTestingModule({
@@ -48,7 +55,7 @@ describe('AuthAuditService', () => {
 
   afterEach(async () => {
     await prisma.authAuditEvent.deleteMany({
-      where: { userAgent: { contains: marker } },
+      where: { userAgent: { startsWith: marker } },
     });
     await prisma.onModuleDestroy();
   });
@@ -139,7 +146,7 @@ describe('AuthAuditService', () => {
         expect(withDefaultSecret!.ipHash).not.toBe(withOtherSecret!.ipHash);
       } finally {
         await otherPrisma.authAuditEvent.deleteMany({
-          where: { userAgent: { contains: marker } },
+          where: { userAgent: { startsWith: marker } },
         });
         await otherPrisma.onModuleDestroy();
       }

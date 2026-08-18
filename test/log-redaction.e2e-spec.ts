@@ -14,6 +14,10 @@ import { AccountLockoutService } from './../src/auth/account-lockout.service';
 import { AppExceptionFilter } from './../src/common/filters/app-exception.filter';
 import { PrismaService } from './../src/prisma/prisma.service';
 import type { RootConfig } from './../src/config/configuration';
+import {
+  TEST_FIXTURE_NAMESPACE,
+  fixtureEmail,
+} from './../src/common/testing/fixture-namespace.helpers';
 
 interface ErrorResponseBody {
   statusCode: number;
@@ -47,9 +51,23 @@ describe('Secret/token log + error-response redaction (e2e)', () => {
   let accountLockoutService: AccountLockoutService;
   let throttlerStorage: ThrottlerStorageService;
 
-  const emailPrefix = 'log-redaction-e2e+12a-b4';
-  const uniqueEmail = (label: string): string =>
-    `${emailPrefix}-${label}-${Date.now()}-${Math.random().toString(36).slice(2)}@example.test`;
+  // Auth test-stability slice: was the hardcoded literal
+  // `'log-redaction-e2e+12a-b4'`. Two independent defects, one fix:
+  //  1. Byte-identical in every worktree of this repo, so any two
+  //     concurrent Jest runs sharing `short_drama_test` deleted each
+  //     other's in-flight fixtures mid-test.
+  //  2. At 24 characters, combined with this file's longest label and the
+  //     old `${Date.now()}-${Math.random().toString(36).slice(2)}` suffix,
+  //     it produced an email whose LOCAL PART exceeded the RFC 5321
+  //     64-character limit whenever `Math.random()` happened to emit a
+  //     long base-36 tail — measured at 2.4% of generations. `@IsEmail()`
+  //     then rejected it and `POST /auth/register` returned 400 instead of
+  //     201, failing this suite for a reason that had nothing to do with
+  //     log redaction. The namespaced form is fixed-width and 20+
+  //     characters shorter, so it cannot recur.
+  // See `src/common/testing/fixture-namespace.helpers.ts`.
+  const emailPrefix = TEST_FIXTURE_NAMESPACE;
+  const uniqueEmail = (label: string): string => fixtureEmail(`lr-${label}`);
 
   // The actual configured secrets for this test run — pulled from the real
   // config/env, not a fixture string, so these assertions genuinely prove
@@ -102,10 +120,10 @@ describe('Secret/token log + error-response redaction (e2e)', () => {
 
   afterAll(async () => {
     await prisma.session.deleteMany({
-      where: { user: { email: { contains: emailPrefix } } },
+      where: { user: { email: { startsWith: emailPrefix } } },
     });
     await prisma.user.deleteMany({
-      where: { email: { contains: emailPrefix } },
+      where: { email: { startsWith: emailPrefix } },
     });
     await app.close();
   });

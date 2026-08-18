@@ -15,6 +15,24 @@ import type {
   AuthResponseDto,
   PasswordResetRequestResponseDto,
 } from './../src/auth/auth.types';
+import { bcryptTestBudgetMs } from './../src/common/testing/bcrypt-test-budget.helpers';
+import {
+  TEST_FIXTURE_NAMESPACE,
+  fixtureEmail,
+} from './../src/common/testing/fixture-namespace.helpers';
+
+/**
+ * Auth test-stability slice: replaces Jest's inherited 5000ms default, which
+ * was never sized for a suite that drives REAL cost-factor-12 bcrypt hashing
+ * through the full HTTP stack. A single test here commonly performs 4-8 such
+ * operations (~1.8-3.5s of irreducible CPU work with the worker pool
+ * saturated) before any database or Nest overhead. See
+ * `src/common/testing/bcrypt-test-budget.helpers.ts` — a harness
+ * hang-detector budget, NOT a business-security timeout: no production
+ * timeout, token lifetime, lockout window, or throttle window is changed by
+ * this.
+ */
+jest.setTimeout(bcryptTestBudgetMs(8));
 
 interface ErrorResponseBody {
   statusCode: number;
@@ -46,9 +64,13 @@ describe('Auth password reset (e2e)', () => {
   // enforces the RFC 5321 64-character local-part limit, and this prefix is
   // combined with a label + timestamp + random suffix per generated address
   // below.
-  const emailPrefix = 'reset-e2e+12bb3';
-  const uniqueEmail = (label: string): string =>
-    `${emailPrefix}-${label}-${Date.now()}-${Math.random().toString(36).slice(2)}@example.test`;
+  // Auth test-stability slice: was the hardcoded literal
+  // `'reset-e2e+12bb3'`, byte-identical in every worktree of this repo, so any
+  // two concurrent Jest runs sharing `short_drama_test` deleted each
+  // other's in-flight fixtures mid-test. See
+  // `src/common/testing/fixture-namespace.helpers.ts`.
+  const emailPrefix = TEST_FIXTURE_NAMESPACE;
+  const uniqueEmail = (label: string): string => fixtureEmail(`pre-${label}`);
 
   describe('with DEV_TOOLS_ENABLED unset (production-safe posture)', () => {
     let app: INestApplication<App>;
@@ -84,7 +106,7 @@ describe('Auth password reset (e2e)', () => {
 
     afterAll(async () => {
       await prisma.authAuditEvent.deleteMany({
-        where: { user: { email: { contains: emailPrefix } } },
+        where: { user: { email: { startsWith: emailPrefix } } },
       });
       // Fix cycle 1 (finding 5): a `password_reset_requested` row for a
       // nonexistent email is created with `userId: null` (see
@@ -96,15 +118,15 @@ describe('Auth password reset (e2e)', () => {
       // set a distinctive `User-Agent` header containing `emailPrefix`
       // specifically so this query can find and remove them too.
       await prisma.authAuditEvent.deleteMany({
-        where: { userId: null, userAgent: { contains: emailPrefix } },
+        where: { userId: null, userAgent: { startsWith: emailPrefix } },
       });
       await prisma.session.deleteMany({
-        where: { user: { email: { contains: emailPrefix } } },
+        where: { user: { email: { startsWith: emailPrefix } } },
       });
       // `PasswordResetToken` cascades with its `User` (`onDelete: Cascade`),
       // so no separate cleanup is needed for it here.
       await prisma.user.deleteMany({
-        where: { email: { contains: emailPrefix } },
+        where: { email: { startsWith: emailPrefix } },
       });
       await app.close();
     });
@@ -200,7 +222,7 @@ describe('Auth password reset (e2e)', () => {
 
     afterAll(async () => {
       await prisma.authAuditEvent.deleteMany({
-        where: { user: { email: { contains: emailPrefix } } },
+        where: { user: { email: { startsWith: emailPrefix } } },
       });
       // Fix cycle 1 (finding 5): see the sibling `describe` block's
       // identical comment above — the nonexistent-email case below sets the
@@ -208,13 +230,13 @@ describe('Auth password reset (e2e)', () => {
       // audit row (otherwise unreachable via the `user` relation filter
       // above) is cleaned up too.
       await prisma.authAuditEvent.deleteMany({
-        where: { userId: null, userAgent: { contains: emailPrefix } },
+        where: { userId: null, userAgent: { startsWith: emailPrefix } },
       });
       await prisma.session.deleteMany({
-        where: { user: { email: { contains: emailPrefix } } },
+        where: { user: { email: { startsWith: emailPrefix } } },
       });
       await prisma.user.deleteMany({
-        where: { email: { contains: emailPrefix } },
+        where: { email: { startsWith: emailPrefix } },
       });
       await app.close();
       delete process.env.DEV_TOOLS_ENABLED;

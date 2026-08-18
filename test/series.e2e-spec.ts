@@ -6,6 +6,16 @@ import { AppModule } from './../src/app.module';
 import { AppExceptionFilter } from './../src/common/filters/app-exception.filter';
 import { PrismaService } from './../src/prisma/prisma.service';
 import { StorageService } from './../src/storage/storage.service';
+import { e2eSuiteBootBudgetMs } from './../src/common/testing/e2e-boot-budget.helpers';
+import {
+  TEST_FIXTURE_NAMESPACE,
+  fixtureEmail,
+} from './../src/common/testing/fixture-namespace.helpers';
+import {
+  createPresignedGetUrlMock,
+  createPresignedPutUrlMock,
+  resetPresignedGetUrlMock,
+} from './../src/common/testing/storage-mock.helpers';
 import { MAX_SERIES_COVER_UPLOAD_BYTES } from './../src/series/series-cover.constants';
 import type { AuthResponseDto } from './../src/auth/auth.types';
 import type {
@@ -22,6 +32,31 @@ interface ErrorResponseBody {
 interface CreateCoverUploadResponseBody {
   upload: { url: string; key: string; expiresAt: string };
 }
+
+/**
+ * Series test-isolation slice. This suite's `beforeAll` boots the full Nest
+ * `AppModule` and then registers TWO users through the real HTTP stack — two
+ * REAL cost-factor-12 `bcryptjs` hashes on top of module construction,
+ * `app.init()`, and database round trips. It was left at Jest's inherited
+ * 5000ms default, which was never a decision anyone made about this suite,
+ * and which measurement shows is smaller than the work itself once several
+ * Jest workers boot concurrently.
+ *
+ * It only fails when the machine is busy — i.e. during exactly the parallel
+ * full-backend gate this slice exists to make trustworthy — which is why it
+ * read as an unrelated flake. Reproduced under a controlled parallel load as
+ * `thrown: "Exceeded timeout of 5000 ms for a hook"`, failing all 88 tests
+ * in this file at once, every one of them for a reason unrelated to what it
+ * asserts; the pre-slice baseline reproduced it in 6 of 6 runs. Nothing here
+ * asserts how LONG admin bootstrap takes.
+ *
+ * `e2eSuiteBootBudgetMs(2)` — the measured cold-boot budget plus two hashes
+ * (`register` admin, `register` non-admin; `/dev/admin/grant-role` performs
+ * none). A harness hang-detector budget, NOT a business-security timeout:
+ * no production timeout, token lifetime, lockout window, or throttle window
+ * is affected. See `src/common/testing/e2e-boot-budget.helpers.ts`.
+ */
+jest.setTimeout(e2eSuiteBootBudgetMs(2));
 
 /**
  * e2e coverage for the Phase 11 (work unit 11E-4, extended in 11F-1)
@@ -52,10 +87,15 @@ describe('Series admin CRUD (e2e)', () => {
     headObject: jest.Mock;
   };
 
-  const emailPrefix = 'series-e2e-spec+11e4';
+  // Series test-isolation slice: was the hardcoded literal
+  // `'series-e2e-spec+11e4'`, byte-identical in every worktree of this repo,
+  // so any two concurrent Jest runs sharing `short_drama_test` collided on
+  // these fixture ids and deleted each other's in-flight rows mid-test —
+  // the same defect the Auth family already fixed. See
+  // `src/common/testing/fixture-namespace.helpers.ts`.
+  const emailPrefix = TEST_FIXTURE_NAMESPACE;
   const seriesIdPrefix = `${emailPrefix}-series`;
-  const uniqueEmail = (label: string): string =>
-    `${emailPrefix}-${label}-${Date.now()}-${Math.random().toString(36).slice(2)}@example.test`;
+  const uniqueEmail = (label: string): string => fixtureEmail(`se-${label}`);
 
   async function createVideoFixture(
     id: string,
@@ -83,25 +123,14 @@ describe('Series admin CRUD (e2e)', () => {
   beforeAll(async () => {
     process.env.DEV_TOOLS_ENABLED = 'true';
 
+    // Both presign mocks echo the REAL `key` argument back and derive their
+    // URL from it, exactly like the real `StorageService` methods — several
+    // tests below rely on `upload.key` in the HTTP response being the REAL
+    // server-generated key, not a canned fixture value. Shared with every
+    // other Series spec via `storage-mock.helpers.ts`.
     mockStorageService = {
-      // Echoes the real `key` argument back, exactly like the real
-      // `StorageService.createPresignedPutUrl`/`createPresignedGetUrl` do —
-      // several tests below rely on `upload.key` in the HTTP response being
-      // the REAL server-generated key, not a canned fixture value.
-      createPresignedPutUrl: jest.fn().mockImplementation((key: string) =>
-        Promise.resolve({
-          url: 'https://signed.example.test/put',
-          key,
-          expiresAt: new Date(Date.now() + 60_000),
-        }),
-      ),
-      createPresignedGetUrl: jest.fn().mockImplementation((key: string) =>
-        Promise.resolve({
-          url: `https://signed.example.test/get?key=${encodeURIComponent(key)}`,
-          key,
-          expiresAt: new Date(Date.now() + 3_600_000),
-        }),
-      ),
+      createPresignedPutUrl: createPresignedPutUrlMock(),
+      createPresignedGetUrl: createPresignedGetUrlMock(),
       headObject: jest.fn(),
     };
 
@@ -145,8 +174,14 @@ describe('Series admin CRUD (e2e)', () => {
   });
 
   afterEach(() => {
+    // This suite builds its mocks ONCE in `beforeAll`, so — unlike the unit
+    // specs, which get a fresh mock per test — overrides genuinely can leak
+    // here and must be undone. `mockClear` alone leaves an unconsumed
+    // `mockResolvedValueOnce` queued for the next test; a bare `mockReset`
+    // on the GET mock would strip its default implementation and make it
+    // return `undefined`, which is exactly the crash this slice removed.
     mockStorageService.createPresignedPutUrl.mockClear();
-    mockStorageService.createPresignedGetUrl.mockClear();
+    resetPresignedGetUrlMock(mockStorageService.createPresignedGetUrl);
     mockStorageService.headObject.mockReset();
   });
 
@@ -162,7 +197,7 @@ describe('Series admin CRUD (e2e)', () => {
       where: { id: { startsWith: seriesIdPrefix } },
     });
     await prisma.user.deleteMany({
-      where: { email: { contains: emailPrefix } },
+      where: { email: { startsWith: emailPrefix } },
     });
     await app.close();
     delete process.env.DEV_TOOLS_ENABLED;
@@ -1667,22 +1702,76 @@ describe('Series admin CRUD (e2e)', () => {
 
   /**
    * Work unit "SERIES COVER UPLOAD BACKEND CONTRACT", acceptance criterion
-   * 6: the public catalog and feed stay byte-compatible, and known-row
-   * counts are unaffected by this work unit's additive changes. Note: this
+   * 6: the public catalog and feed stay byte-compatible, and known rows are
+   * unaffected by this work unit's additive changes. Note: this
    * repository's `short_drama_test` database (used by this e2e run) seeds
    * only the 40 real drama rows (no `qa_fixture` rows) — the "42 = 40 drama
    * + 2 qa_fixture" figure describes `short_drama_dev` specifically, a
    * pre-existing difference between the two databases that predates and is
-   * unrelated to this work unit. Assertions below therefore compare
-   * BEFORE/AFTER snapshots taken within this same test run (self-contained,
-   * environment-agnostic) rather than hardcoding either database's absolute
-   * figure, matching the file's own established "no flaky global count"
-   * precedent (see the migration-additivity doc comment below).
+   * unrelated to this work unit.
+   *
+   * Series test-isolation slice — WHY THE GLOBAL COUNTS ARE GONE. This test
+   * used to snapshot `prisma.video.count()` / `prisma.series.count()` with
+   * NO `where` clause before and after the cover-upload flow and assert the
+   * totals matched. A BEFORE/AFTER pair is self-contained only with respect
+   * to the ENVIRONMENT; it is not self-contained with respect to TIME.
+   * Jest runs `.e2e-spec.ts` files in parallel worker processes against this
+   * same database, and `videos.e2e-spec.ts` / `admin-media.e2e-spec.ts`
+   * legitimately create and delete their own `Video` rows — and
+   * `series-public.e2e-spec.ts` its own `Series` rows — inside that window.
+   * Observed in a full e2e gate as `expected same count / got 101 vs 96`,
+   * roughly 1 run in 6.
+   *
+   * Reproduced deterministically before this fix, rather than waiting for a
+   * lucky interleaving: with a controlled inserter creating rows for an
+   * UNRELATED series while this test ran, `expect(afterVideoCount).toBe(
+   * beforeVideoCount)` failed `Expected: 518 / Received: 520`, and the
+   * sibling `expect(afterSeriesCount).toBe(beforeSeriesCount + 1)` failed
+   * `Expected: 158 / Received: 160` — while every scoped invariant below
+   * held throughout.
+   *
+   * "Nobody anywhere in this database created a `Video`" was never the
+   * invariant this test meant. The real invariant is narrower and true:
+   * this work unit's cover-upload flow creates exactly one `Series` row (the
+   * fixture) and creates, deletes, or mutates NO `Video` row. Both are
+   * asserted below against rows this suite OWNS.
+   *
+   * The witness row is this suite's own fixture rather than a real seed
+   * episode for the same reason: `interactions.e2e-spec.ts` legitimately
+   * likes and unlikes the seeded `video-104-01` in a parallel worker, so a
+   * field-by-field comparison of the seed rows fails on a moving
+   * `likeCount` (observed as `83` -> `82` in a full gate) — a shared-row
+   * assertion is no safer than a global count just because it is precise.
    */
   describe('regression — public catalog/feed byte-compatible; DB counts untouched', () => {
     it('GET /videos/feed and GET /series are unaffected by this work unit’s cover-upload flow', async () => {
-      const beforeVideoCount = await prisma.video.count();
-      const beforeSeriesCount = await prisma.series.count();
+      // A `Video` row this suite OWNS, used as the witness for the
+      // "no Video side effects" invariant below. It deliberately lives under
+      // a DIFFERENT namespaced series than the cover fixture, so the
+      // "never appears on the public catalog" assertion further down still
+      // describes a genuinely episode-less series.
+      const witnessSeriesId = `${seriesIdPrefix}-regression-witness`;
+      const witnessVideoId = `${witnessSeriesId}-ep1`;
+      await prisma.series.create({
+        data: { id: witnessSeriesId, title: 'Regression Witness' },
+      });
+      await createVideoFixture(witnessVideoId, witnessSeriesId, 'published');
+
+      // Scoped to rows this suite owns — never the whole table, and never a
+      // shared seed row. Both are immune to a parallel worker touching
+      // anything else.
+      const beforeOwnSeriesCount = await prisma.series.count({
+        where: { id: { startsWith: seriesIdPrefix } },
+      });
+      const beforeOwnVideoCount = await prisma.video.count({
+        where: { seriesId: { startsWith: seriesIdPrefix } },
+      });
+      // Negative side-effect proof by EXACT VALUE, not by table length: the
+      // witness row is captured field-by-field and re-read after the flow,
+      // so a mutation is caught even if the row COUNT is unchanged.
+      const witnessBefore = await prisma.video.findUniqueOrThrow({
+        where: { id: witnessVideoId },
+      });
 
       const id = `${seriesIdPrefix}-regression-cover`;
       await request(app.getHttpServer())
@@ -1724,12 +1813,23 @@ describe('Series admin CRUD (e2e)', () => {
         .expect(HttpStatus.OK);
       expect(Array.isArray(feedResponse.body)).toBe(true);
 
-      // `Series` row count grew by exactly 1 (the fixture just created);
-      // `Video` is completely untouched by anything in this describe block.
-      const afterVideoCount = await prisma.video.count();
-      const afterSeriesCount = await prisma.series.count();
-      expect(afterVideoCount).toBe(beforeVideoCount);
-      expect(afterSeriesCount).toBe(beforeSeriesCount + 1);
+      // This suite's own `Series` rows grew by exactly 1 — the cover fixture
+      // just created — and the flow created or deleted no `Video` row of
+      // this suite's.
+      const afterOwnSeriesCount = await prisma.series.count({
+        where: { id: { startsWith: seriesIdPrefix } },
+      });
+      const afterOwnVideoCount = await prisma.video.count({
+        where: { seriesId: { startsWith: seriesIdPrefix } },
+      });
+      expect(afterOwnSeriesCount).toBe(beforeOwnSeriesCount + 1);
+      expect(afterOwnVideoCount).toBe(beforeOwnVideoCount);
+
+      // ...and mutated no field of one, byte for byte.
+      const witnessAfter = await prisma.video.findUniqueOrThrow({
+        where: { id: witnessVideoId },
+      });
+      expect(witnessAfter).toEqual(witnessBefore);
     });
   });
 
@@ -1805,10 +1905,36 @@ describe('Series admin CRUD (e2e)', () => {
       expect(persisted?.archivedAt).toBeNull();
     });
 
+    /**
+     * SEED DEPENDENCY — INTENTIONAL, AND THE ONLY ONE LEFT IN THIS FILE.
+     *
+     * This assertion is a migration-additivity check: it exists precisely to
+     * prove the seeded catalog is exactly the 40 rows the seed script
+     * creates, so a data migration that silently added or dropped one would
+     * be caught. Replacing it with a locally-created fixture would delete
+     * the only thing it tests, so the prerequisite is documented and
+     * verified explicitly instead.
+     *
+     * PREREQUISITE: `short_drama_test` must be seeded (`DATABASE_URL=
+     * $DATABASE_URL_TEST npm run db:seed`). Parallel-safe: `video-` is the
+     * seed script's own id prefix and no test suite creates ids under it —
+     * every suite namespaces its `Video` fixtures (`videos.e2e-spec.ts` and
+     * `series*.e2e-spec.ts` under their per-run `TEST_FIXTURE_NAMESPACE`,
+     * `admin-media.e2e-spec.ts` under the service's `media-` prefix), so a
+     * concurrent worker cannot move this number.
+     */
     it('the 40-video seed catalog is untouched by the archivedAt migration', async () => {
       const seedVideoCount = await prisma.video.count({
         where: { id: { startsWith: 'video-' } },
       });
+
+      if (seedVideoCount === 0) {
+        throw new Error(
+          'short_drama_test contains no `video-` seed rows: this migration-' +
+            'additivity check needs the seeded catalog. Run ' +
+            '`DATABASE_URL=$DATABASE_URL_TEST npm run db:seed` and re-run.',
+        );
+      }
       expect(seedVideoCount).toBe(40);
     });
   });

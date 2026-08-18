@@ -2,6 +2,12 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
 import { AppErrorCode } from '../common/errors/app-error-code';
 import { EntitlementsService } from '../entitlements/entitlements.service';
+import { fixtureMarker } from '../common/testing/fixture-namespace.helpers';
+import {
+  createPresignedGetUrlMock,
+  signedKeysMatching,
+  syntheticSignedGetUrlFor,
+} from '../common/testing/storage-mock.helpers';
 import { DEFAULT_GET_URL_EXPIRY_SECONDS } from '../storage/storage.constants';
 import { StorageService } from '../storage/storage.service';
 import { PrismaService } from '../prisma/prisma.service';
@@ -22,13 +28,39 @@ const TEST_APP_CONFIG = {
  * `videos.service.spec.ts`). Every fixture uses `testIdPrefix`-namespaced
  * ids so this suite never touches the 40 real seed rows or the 4 real
  * backfilled `Series` rows, and self-cleans in `afterEach`.
+ *
+ * Series test-isolation slice — TWO isolation defects fixed here, both of
+ * which made this file fail deterministically once the four real curated
+ * `Series` rows in the developer database gained a non-null
+ * `coverImageKey`:
+ *
+ *  1. `PublicSeriesService.list()` reads EVERY active `Series` row, not just
+ *     this suite's fixtures. The bare `jest.fn()` mock had no default, so
+ *     signing a real row's cover returned `undefined` and
+ *     `resolveSeriesCoverUrl` threw `TypeError: Cannot read properties of
+ *     undefined (reading 'url')` — all 12 `list` tests failed, none of them
+ *     for a reason related to what it was testing. The mock now has a
+ *     deterministic default for any key (`createPresignedGetUrlMock`), so
+ *     the production "cover set -> sign it" branch stays fully exercised.
+ *
+ *  2. `testIdPrefix` was a hardcoded literal, identical in every git
+ *     worktree of this repository — and every worktree points at the same
+ *     `short_drama_dev` database. Two concurrent runs would collide on the
+ *     fixture ids and delete each other's rows mid-test. It is now derived
+ *     from the shared per-run `TEST_FIXTURE_NAMESPACE`
+ *     (`fixture-namespace.helpers.ts`), the same mechanism the Auth family
+ *     already uses.
+ *
+ * Consequently NO assertion in this file may be phrased over the whole
+ * table (`not.toHaveBeenCalled()`, a global row count, "exactly N items"):
+ * the only truthful statements are about rows this suite created.
  */
 describe('PublicSeriesService', () => {
   let service: PublicSeriesService;
   let prisma: PrismaService;
   let storageService: { createPresignedGetUrl: jest.Mock };
 
-  const testIdPrefix = 'series-public-spec';
+  const testIdPrefix = fixtureMarker('series-public-spec');
 
   async function createSeriesFixture(
     id: string,
@@ -84,7 +116,13 @@ describe('PublicSeriesService', () => {
   }
 
   beforeEach(async () => {
-    storageService = { createPresignedGetUrl: jest.fn() };
+    // Mock-override hygiene: a BRAND NEW mock per test, so a one-shot or
+    // scoped override installed by one test (see the signing-failure test
+    // below) cannot possibly leak into the next — a stronger guarantee than
+    // resetting a shared mock in `afterEach`, and the reason no reset is
+    // needed here. (The e2e suites build their mock once in `beforeAll` and
+    // therefore DO reset it per test — see `resetPresignedGetUrlMock`.)
+    storageService = { createPresignedGetUrl: createPresignedGetUrlMock() };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -251,36 +289,110 @@ describe('PublicSeriesService', () => {
       expect(item?.hasPremiumEpisodes).toBe(true);
     });
 
+    /**
+     * Deliberately NOT `mockResolvedValueOnce`. `list()` signs every active
+     * series that has a cover, and the four real curated rows sort ahead of
+     * this fixture — a one-shot value is consumed by whichever key is signed
+     * FIRST, which is not this test's. The default mock derives the URL from
+     * the key it is given, so this assertion is exact and order-independent.
+     */
     it('resolves coverUrl via a presigned GET when coverImageKey is set, using DEFAULT_GET_URL_EXPIRY_SECONDS', async () => {
       const seriesId = `${testIdPrefix}-list-cover`;
-      await createSeriesFixture(seriesId, {
-        coverImageKey: 'series/cover.jpg',
-      });
+      const coverKey = `admin-series/${seriesId}/cover/list-cover-uuid`;
+      await createSeriesFixture(seriesId, { coverImageKey: coverKey });
       await createVideoFixture(`${seriesId}-ep1`, seriesId);
-      storageService.createPresignedGetUrl.mockResolvedValueOnce({
-        url: 'https://r2.example.test/signed-cover-url',
-        key: 'series/cover.jpg',
-        expiresAt: new Date(),
-      });
 
       const { items } = await service.list();
       const item = items.find((i) => i.id === seriesId);
 
-      expect(item?.coverUrl).toBe('https://r2.example.test/signed-cover-url');
+      expect(item?.coverUrl).toBe(syntheticSignedGetUrlFor(coverKey));
       expect(storageService.createPresignedGetUrl).toHaveBeenCalledWith(
-        'series/cover.jpg',
+        coverKey,
         { expiresInSeconds: DEFAULT_GET_URL_EXPIRY_SECONDS },
       );
+      // Signed exactly once, and only for THIS fixture's key.
+      expect(
+        signedKeysMatching(storageService.createPresignedGetUrl, testIdPrefix),
+      ).toEqual([coverKey]);
     });
 
-    it('never calls createPresignedGetUrl when coverImageKey is null', async () => {
-      const seriesId = `${testIdPrefix}-list-no-cover`;
-      await createSeriesFixture(seriesId);
+    /**
+     * The narrowest truthful invariant is "no key of MINE was signed", not
+     * "the mock was never called at all". The latter was a global assertion
+     * over the whole `Series` table and started failing (`Received number of
+     * calls: 4`) the moment the four real curated rows gained covers —
+     * without any change to the behavior under test. Two fixtures in one
+     * test, one with a cover and one without, prove the branch directly:
+     * the signed set must be exactly the cover-bearing fixture's key.
+     */
+    it('signs only the cover-bearing series, never one whose coverImageKey is null', async () => {
+      const withCoverId = `${testIdPrefix}-list-with-cover`;
+      const withoutCoverId = `${testIdPrefix}-list-no-cover`;
+      const coverKey = `admin-series/${withCoverId}/cover/paired-uuid`;
+      await createSeriesFixture(withCoverId, { coverImageKey: coverKey });
+      await createVideoFixture(`${withCoverId}-ep1`, withCoverId);
+      await createSeriesFixture(withoutCoverId);
+      await createVideoFixture(`${withoutCoverId}-ep1`, withoutCoverId);
+
+      const { items } = await service.list();
+
+      expect(items.find((i) => i.id === withoutCoverId)?.coverUrl).toBeNull();
+      expect(items.find((i) => i.id === withCoverId)?.coverUrl).toBe(
+        syntheticSignedGetUrlFor(coverKey),
+      );
+      expect(
+        signedKeysMatching(storageService.createPresignedGetUrl, testIdPrefix),
+      ).toEqual([coverKey]);
+    });
+
+    /**
+     * Series test-isolation slice, documented cover-signing failure
+     * behavior: `resolveSeriesCoverUrl` does NOT swallow a storage error, so
+     * a signing failure propagates out of `list()` rather than silently
+     * degrading `coverUrl` to `null`. Recorded here so the contract is
+     * explicit and any future change to it is a deliberate, visible one.
+     */
+    it('propagates a storage signing failure rather than silently reporting coverUrl null', async () => {
+      const seriesId = `${testIdPrefix}-list-cover-signing-fails`;
+      const coverKey = `admin-series/${seriesId}/cover/failing-uuid`;
+      await createSeriesFixture(seriesId, { coverImageKey: coverKey });
+      await createVideoFixture(`${seriesId}-ep1`, seriesId);
+      // Scoped override: only THIS suite's key fails; every unrelated row
+      // still resolves through the default, so the failure under test is the
+      // only one in play.
+      storageService.createPresignedGetUrl.mockImplementation((key: string) =>
+        key === coverKey
+          ? Promise.reject(new Error('presign failed'))
+          : Promise.resolve({
+              url: syntheticSignedGetUrlFor(key),
+              key,
+              expiresAt: new Date(0),
+            }),
+      );
+
+      await expect(service.list()).rejects.toThrow('presign failed');
+    });
+
+    /**
+     * An archived series is excluded from the public catalog outright, so
+     * its cover is never signed — the archived check happens before any
+     * signing, and having a cover does not change that.
+     */
+    it('never signs the cover of an archived series (it is excluded before signing)', async () => {
+      const seriesId = `${testIdPrefix}-list-archived-with-cover`;
+      const coverKey = `admin-series/${seriesId}/cover/archived-uuid`;
+      await createSeriesFixture(seriesId, {
+        coverImageKey: coverKey,
+        archivedAt: new Date(),
+      });
       await createVideoFixture(`${seriesId}-ep1`, seriesId);
 
-      await service.list();
+      const { items } = await service.list();
 
-      expect(storageService.createPresignedGetUrl).not.toHaveBeenCalled();
+      expect(items.find((i) => i.id === seriesId)).toBeUndefined();
+      expect(
+        signedKeysMatching(storageService.createPresignedGetUrl, testIdPrefix),
+      ).toEqual([]);
     });
 
     it('orders results by sortOrder then id', async () => {

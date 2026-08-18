@@ -6,6 +6,13 @@ import { AppModule } from './../src/app.module';
 import { AppExceptionFilter } from './../src/common/filters/app-exception.filter';
 import { PrismaService } from './../src/prisma/prisma.service';
 import { StorageService } from './../src/storage/storage.service';
+import { e2eSuiteBootBudgetMs } from './../src/common/testing/e2e-boot-budget.helpers';
+import { fixtureMarker } from './../src/common/testing/fixture-namespace.helpers';
+import {
+  createPresignedGetUrlMock,
+  resetPresignedGetUrlMock,
+  syntheticSignedGetUrlFor,
+} from './../src/common/testing/storage-mock.helpers';
 import type {
   SeriesDetailPublicDto,
   SeriesListResponseDto,
@@ -19,6 +26,22 @@ interface ErrorResponseBody {
 }
 
 /**
+ * Series test-isolation slice. This suite's `beforeAll` boots the full Nest
+ * `AppModule` and does nothing else — no authentication, no bcrypt — yet it
+ * still exceeded Jest's inherited 5000ms default and failed all of its tests
+ * at once whenever another Jest worker was booting at the same time. Cold
+ * boot measures 2.6-4.3s per worker at worker-pool saturation, so a 5000ms
+ * hook budget left as little as ~700ms of headroom.
+ *
+ * `e2eSuiteBootBudgetMs()` with no argument — the measured cold-boot budget
+ * alone. A harness hang-detector budget, not a business timeout, and not a
+ * substitute for real isolation fixes: the cover-signing and fixture-
+ * namespace defects in this file were fixed at the source, not by widening a
+ * window. See `src/common/testing/e2e-boot-budget.helpers.ts`.
+ */
+jest.setTimeout(e2eSuiteBootBudgetMs());
+
+/**
  * e2e coverage for the work unit "SERIES METADATA + DISCOVER ARTWORK
  * CONTRACT" public, UNAUTHENTICATED catalog surface: `GET /series` and
  * `GET /series/:id`. Separate file from `test/series.e2e-spec.ts` (the
@@ -26,13 +49,31 @@ interface ErrorResponseBody {
  * `videos.e2e-spec.ts` (public) vs `admin-media.e2e-spec.ts` (admin) split.
  * `StorageService` is mocked (same `.overrideProvider` pattern
  * `videos.e2e-spec.ts` already uses) — no real R2/network call.
+ *
+ * Series test-isolation slice, two fixes:
+ *
+ *  1. The `StorageService` mock was a bare `jest.fn()` with no default.
+ *     `GET /series` signs the cover of EVERY active series that has one, so
+ *     any cover-bearing row this suite did not create — a real curated row
+ *     once `short_drama_test` is backfilled, or a fixture created by
+ *     `series.e2e-spec.ts` in a PARALLEL Jest worker — resolved to
+ *     `undefined` and turned the request into a 500. Latent here today only
+ *     because `short_drama_test`'s four `Series` rows still have a null
+ *     `coverImageKey`; it is the same defect that already broke
+ *     `series-public.service.spec.ts` against the developer database. The
+ *     mock now has a deterministic default for any key.
+ *
+ *  2. `idPrefix` was a hardcoded literal, identical in every worktree of
+ *     this repository, all of which share `short_drama_test` — two
+ *     concurrent runs collided on fixture ids. It is now derived from the
+ *     shared per-run `TEST_FIXTURE_NAMESPACE`.
  */
 describe('Public series catalog (e2e)', () => {
   let app: INestApplication<App>;
   let prisma: PrismaService;
   let mockStorageService: { createPresignedGetUrl: jest.Mock };
 
-  const idPrefix = 'series-public-e2e-spec';
+  const idPrefix = fixtureMarker('series-public-e2e-spec');
 
   async function createSeriesFixture(
     id: string,
@@ -83,7 +124,7 @@ describe('Public series catalog (e2e)', () => {
   }
 
   beforeAll(async () => {
-    mockStorageService = { createPresignedGetUrl: jest.fn() };
+    mockStorageService = { createPresignedGetUrl: createPresignedGetUrlMock() };
 
     const moduleFixture: TestingModule = await Test.createTestingModule({
       imports: [AppModule],
@@ -107,7 +148,12 @@ describe('Public series catalog (e2e)', () => {
   });
 
   afterEach(async () => {
-    mockStorageService.createPresignedGetUrl.mockClear();
+    // This suite builds its mock ONCE in `beforeAll`, so an override
+    // genuinely can leak into the next test. `mockClear` alone would leave
+    // an unconsumed `mockResolvedValueOnce` queued; a bare `mockReset`
+    // would strip the default implementation and make the mock return
+    // `undefined` again.
+    resetPresignedGetUrlMock(mockStorageService.createPresignedGetUrl);
     // Per-test cleanup (not just `afterAll`): several tests below create a
     // namespaced `Series`/`Video` fixture and then immediately call
     // `GET /series`, which re-evaluates EVERY active series, including any
@@ -192,17 +238,20 @@ describe('Public series catalog (e2e)', () => {
       expect(body.items.find((item) => item.id === seriesId)).toBeUndefined();
     });
 
+    /**
+     * Deliberately NOT `mockResolvedValueOnce`: `GET /series` signs every
+     * cover-bearing active series, and a one-shot value goes to whichever
+     * key is signed FIRST — which, with the real curated rows ordered ahead
+     * of this fixture (and other suites' fixtures possibly present in a
+     * parallel worker), is not necessarily this test's. The default mock
+     * derives the URL from the key, so this assertion is exact and
+     * order-independent.
+     */
     it('resolves coverUrl via a presigned GET when an admin has set coverImageKey', async () => {
       const seriesId = `${idPrefix}-list-cover`;
-      await createSeriesFixture(seriesId, {
-        coverImageKey: 'series/e2e-cover.jpg',
-      });
+      const coverKey = `admin-series/${seriesId}/cover/e2e-cover-uuid`;
+      await createSeriesFixture(seriesId, { coverImageKey: coverKey });
       await createVideoFixture(`${seriesId}-ep1`, seriesId);
-      mockStorageService.createPresignedGetUrl.mockResolvedValueOnce({
-        url: 'https://r2.example.test/e2e-signed-cover',
-        key: 'series/e2e-cover.jpg',
-        expiresAt: new Date(),
-      });
 
       const response = await request(app.getHttpServer())
         .get('/series')
@@ -210,11 +259,68 @@ describe('Public series catalog (e2e)', () => {
 
       const body = response.body as SeriesListResponseDto;
       const item = body.items.find((i) => i.id === seriesId);
-      expect(item?.coverUrl).toBe('https://r2.example.test/e2e-signed-cover');
+      expect(item?.coverUrl).toBe(syntheticSignedGetUrlFor(coverKey));
+    });
+
+    /**
+     * Series test-isolation slice: the null-cover half of the same contract,
+     * asserted on this suite's OWN fixture rather than on a global
+     * `not.toHaveBeenCalled()` — which would be a claim about every other
+     * row in the shared database, not about the behavior under test.
+     */
+    it('reports coverUrl null for a series with no coverImageKey', async () => {
+      const seriesId = `${idPrefix}-list-no-cover`;
+      await createSeriesFixture(seriesId);
+      await createVideoFixture(`${seriesId}-ep1`, seriesId);
+
+      const response = await request(app.getHttpServer())
+        .get('/series')
+        .expect(HttpStatus.OK);
+
+      const body = response.body as SeriesListResponseDto;
+      expect(body.items.find((i) => i.id === seriesId)?.coverUrl).toBeNull();
     });
   });
 
+  /**
+   * SEED DEPENDENCY — INTENTIONAL. Every test in this block asserts against
+   * the REAL seeded `series-104` and its 10 real episodes, on purpose: it is
+   * the contract test for the backfill migration's own output (canonical
+   * title, episode count and ordering, per-episode `accessTier`). A locally
+   * created fixture could not test that, so the prerequisite is documented
+   * and verified explicitly rather than engineered away.
+   *
+   * PREREQUISITE: `short_drama_test` must be seeded and the `Series`
+   * backfill migration applied (`DATABASE_URL=$DATABASE_URL_TEST npm run
+   * db:seed`). Parallel-safe: no e2e suite creates `Video` rows under
+   * `seriesId: 'series-104'` — `analytics`/`progress`/`export` reference the
+   * id only inside their own event/progress rows, and every suite that does
+   * create `Video` fixtures namespaces them under its own per-run
+   * `TEST_FIXTURE_NAMESPACE`.
+   */
   describe('GET /series/:id', () => {
+    it('the seeded series-104 fixture this whole block depends on is present', async () => {
+      const seeded = await prisma.series.findUnique({
+        where: { id: 'series-104' },
+      });
+      const episodeCount = await prisma.video.count({
+        where: {
+          seriesId: 'series-104',
+          lifecycleState: 'published',
+          contentKind: 'drama',
+        },
+      });
+
+      if (seeded === null || episodeCount === 0) {
+        throw new Error(
+          'short_drama_test is missing the seeded `series-104` catalog that ' +
+            'this block asserts against. Run ' +
+            '`DATABASE_URL=$DATABASE_URL_TEST npm run db:seed` and re-run.',
+        );
+      }
+      expect(episodeCount).toBe(10);
+    });
+
     it('requires no authentication', async () => {
       await request(app.getHttpServer())
         .get('/series/series-104')
@@ -372,10 +478,36 @@ describe('Public series catalog (e2e)', () => {
       );
     });
 
+    /**
+     * SEED DEPENDENCY — INTENTIONAL, AND THE ONLY ONE LEFT IN THIS FILE.
+     *
+     * This assertion is a migration-additivity check: it exists precisely to
+     * prove the seeded catalog is exactly the 40 rows the seed script
+     * creates, so a data migration that silently added or dropped one would
+     * be caught. Replacing it with a locally-created fixture would delete
+     * the only thing it tests, so the prerequisite is documented and
+     * verified explicitly instead.
+     *
+     * PREREQUISITE: `short_drama_test` must be seeded (`DATABASE_URL=
+     * $DATABASE_URL_TEST npm run db:seed`). Parallel-safe: `video-` is the
+     * seed script's own id prefix and no test suite creates ids under it —
+     * every suite namespaces its `Video` fixtures (`videos.e2e-spec.ts` and
+     * `series*.e2e-spec.ts` under their per-run `TEST_FIXTURE_NAMESPACE`,
+     * `admin-media.e2e-spec.ts` under the service's `media-` prefix), so a
+     * concurrent worker cannot move this number.
+     */
     it('the 40-video seed catalog is untouched by the Series backfill', async () => {
       const seedVideoCount = await prisma.video.count({
         where: { id: { startsWith: 'video-' } },
       });
+
+      if (seedVideoCount === 0) {
+        throw new Error(
+          'short_drama_test contains no `video-` seed rows: this migration-' +
+            'additivity check needs the seeded catalog. Run ' +
+            '`DATABASE_URL=$DATABASE_URL_TEST npm run db:seed` and re-run.',
+        );
+      }
       expect(seedVideoCount).toBe(40);
     });
   });

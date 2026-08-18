@@ -10,6 +10,7 @@ import type { AuthResponseDto } from './../src/auth/auth.types';
 import type { UserExportDto } from './../src/export/export.types';
 import { bcryptTestBudgetMs } from './../src/common/testing/bcrypt-test-budget.helpers';
 import { e2eSuiteBootBudgetMs } from './../src/common/testing/e2e-boot-budget.helpers';
+import { resetThrottlerStorage } from './../src/common/testing/throttler-reset.helpers';
 
 /**
  * Test-infrastructure hardening slice: replaces Jest's inherited 5000ms
@@ -90,7 +91,7 @@ describe('User data export (e2e)', () => {
   }, e2eSuiteBootBudgetMs());
 
   beforeEach(() => {
-    throttlerStorage.storage.clear();
+    resetThrottlerStorage(throttlerStorage);
   });
 
   afterAll(async () => {

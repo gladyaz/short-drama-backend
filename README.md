@@ -533,8 +533,10 @@ current live `coverImageKey` (idempotent no-op) — any other well-formed key
 is rejected with `409 SERIES_COVER_KEY_SUPERSEDED`. An explicit
 `PATCH { coverImageKey: null }` also clears the pending key. See
 `docs/admin-api-contract.md`'s 2026-08-15 re-freeze note for full detail,
-including the documented (not yet automated) orphan-cleanup and
-Content-Type/Length verification caveats for a never-completed upload.
+including the orphan-cleanup caveats (since covered by the manual,
+dry-run-first sweep — see "Series cover orphan cleanup" below and
+`docs/series-cover-orphan-cleanup.md`) and Content-Type/Length verification
+caveats for a never-completed upload.
 
 **Hardening (2026-08-18) — concurrent (not just replayed) completions
 closed.** The fix-cycle-1 currency check compares `key` against a row read
@@ -552,7 +554,8 @@ answered with the same `409 SERIES_COVER_KEY_SUPERSEDED`. Two SIMULTANEOUS
 completions of the SAME key both verify, exactly one writes, and both get the
 `200` no-op answer a sequential duplicate has always received. No schema
 migration was needed. A superseded-but-uploaded object stays in R2 as an
-orphan (deliberately — no automatic cover-object cleanup exists). Known
+orphan (deliberately — reclaimable only by the manual, dry-run-first sweep
+in "Series cover orphan cleanup" below, never scheduled/automatic). Known
 limitation, unchanged and now explicitly documented: only the `null`
 (Remove) form of `PATCH /admin/series/:id` revokes an outstanding upload
 intent — writing a `coverImageKey` string directly by hand does not, so a

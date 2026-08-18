@@ -13,11 +13,20 @@ import { StorageService } from '../../storage/storage.service';
  * The EXACT subset of `StorageService` this sweep is allowed to use.
  *
  * Derived with `Pick` from the real class rather than hand-declared, so it
- * cannot drift from the production signatures — and so the sweep provably
- * has no reach for `putObject`, `createPresignedPutUrl`, or anything else
- * that could write to, or mint credentials for, the bucket. It lists exactly
- * one read (`listObjectPageByPrefix`) and exactly one destructive call
+ * cannot drift from the production signatures. It lists exactly one read
+ * (`listObjectPageByPrefix`) and exactly one destructive call
  * (`deleteObject`, one exact key at a time — never a bulk/prefix delete).
+ *
+ * SCOPE OF THE GUARANTEE, stated precisely: `Pick` narrows at the TYPE level
+ * only. The runtime `SeriesCoverOrphanService` is constructed with the full
+ * `StorageService` (see its constructor), so this type does not make
+ * `putObject`, `createPresignedPutUrl`, or anything else structurally
+ * unreachable at runtime. What it does do: it documents and pins the
+ * intended surface, and it is the contract the test-side fake implements —
+ * every spec runs the sweep against a fake exposing ONLY these methods, so
+ * any code path reaching beyond them fails the suite. The guarantee is
+ * therefore "the sweep's code only calls these methods (enforced by the
+ * fake in every spec)", not a runtime impossibility.
  */
 export type SeriesCoverOrphanStorage = Pick<
   StorageService,

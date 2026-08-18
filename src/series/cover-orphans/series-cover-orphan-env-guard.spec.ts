@@ -61,9 +61,22 @@ describe('assertSeriesCoverOrphanApplyAllowed', () => {
 
   describe('bucket identity confirmation', () => {
     it('refuses when OBJECT_STORAGE_BUCKET is unset', () => {
-      expect(() =>
-        assertSeriesCoverOrphanApplyAllowed('development', undefined, BUCKET),
-      ).toThrow(/OBJECT_STORAGE_BUCKET is unset or empty/);
+      // Same default-parameter trap as the NODE_ENV case above: an explicit
+      // `undefined` activates `process.env.OBJECT_STORAGE_BUCKET`, which is
+      // set on a normal dev laptop and leaks into this worker whenever a
+      // sibling suite imports `dotenv/config`. Clear it so the unset branch
+      // is actually the one under test.
+      const originalBucket = process.env.OBJECT_STORAGE_BUCKET;
+
+      try {
+        delete process.env.OBJECT_STORAGE_BUCKET;
+
+        expect(() =>
+          assertSeriesCoverOrphanApplyAllowed('development', undefined, BUCKET),
+        ).toThrow(/OBJECT_STORAGE_BUCKET is unset or empty/);
+      } finally {
+        restoreEnv('OBJECT_STORAGE_BUCKET', originalBucket);
+      }
     });
 
     it('refuses when OBJECT_STORAGE_BUCKET is an empty string', () => {
@@ -74,12 +87,26 @@ describe('assertSeriesCoverOrphanApplyAllowed', () => {
 
     it('refuses when the operator confirmation variable is unset', () => {
       // The crucial case: a normal dev laptop has NODE_ENV=development and a
-      // real bucket configured. That alone must NOT be enough.
-      expect(() =>
-        assertSeriesCoverOrphanApplyAllowed('development', BUCKET, undefined),
-      ).toThrow(
-        new RegExp(`${SERIES_COVER_ORPHAN_APPLY_BUCKET_ENV} is unset or empty`),
-      );
+      // real bucket configured. That alone must NOT be enough. Cleared for
+      // the same default-parameter reason as OBJECT_STORAGE_BUCKET above,
+      // even though the standing guard at the bottom of this file asserts
+      // the variable never exists in the test environment.
+      const originalConfirmation =
+        process.env[SERIES_COVER_ORPHAN_APPLY_BUCKET_ENV];
+
+      try {
+        delete process.env[SERIES_COVER_ORPHAN_APPLY_BUCKET_ENV];
+
+        expect(() =>
+          assertSeriesCoverOrphanApplyAllowed('development', BUCKET, undefined),
+        ).toThrow(
+          new RegExp(
+            `${SERIES_COVER_ORPHAN_APPLY_BUCKET_ENV} is unset or empty`,
+          ),
+        );
+      } finally {
+        restoreEnv(SERIES_COVER_ORPHAN_APPLY_BUCKET_ENV, originalConfirmation);
+      }
     });
 
     it('refuses when the operator confirmation names a DIFFERENT bucket', () => {

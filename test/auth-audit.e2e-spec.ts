@@ -12,6 +12,7 @@ import {
   TEST_FIXTURE_NAMESPACE,
   fixtureEmail,
 } from './../src/common/testing/fixture-namespace.helpers';
+import { resetThrottlerStorage } from './../src/common/testing/throttler-reset.helpers';
 
 /**
  * Auth test-stability slice: replaces Jest's inherited 5000ms default, which
@@ -106,7 +107,7 @@ describe('Auth audit logging (e2e)', () => {
   // throttler, so this file's assertions are never affected by
   // `/auth/login`'s 5/min IP limit.
   beforeEach(() => {
-    throttlerStorage.storage.clear();
+    resetThrottlerStorage(throttlerStorage);
   });
 
   it('a successful login writes a login_success AuthAuditEvent row (not AnalyticsEvent) with no raw email/password/token, and the HTTP response is unaffected', async () => {

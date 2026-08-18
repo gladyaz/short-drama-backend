@@ -92,6 +92,11 @@ describe('MediaImporterService', () => {
         expect(row.width).toBe(FIXTURE_METADATA.width);
         expect(row.height).toBe(FIXTURE_METADATA.height);
         expect(row.likeCount).toBe(0);
+        // 11F-4 contract: the create branch stamps an explicit tier derived
+        // from `episodeNumber` via `deriveAccessTier` — fixture episodes 1-3
+        // all sit at or below `FREE_EPISODE_LIMIT` (5), so every row must be
+        // `'free'`, never `null`.
+        expect(row.accessTierOverride).toBe('free');
       }
     });
 

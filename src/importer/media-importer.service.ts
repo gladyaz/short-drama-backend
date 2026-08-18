@@ -1,4 +1,5 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
+import { deriveAccessTier } from '../entitlements/entitlement.constants';
 import { PrismaService } from '../prisma/prisma.service';
 import {
   isValidVideoCategory,
@@ -97,6 +98,16 @@ export class MediaImporterService {
             seriesId: item.seriesId,
             title: item.title,
             episodeNumber: item.episodeNumber,
+            // Work unit 11F-4 contract: every newly created `Video` row gets
+            // an explicit tier (`'free' | 'premium'`), derived from
+            // `episodeNumber` exactly like `AdminMediaService.createUpload`
+            // and `prisma/seed.ts`, so the admin `?tier=` filter (a raw-column
+            // equality — see `list-admin-media-query.dto.ts`) can rely on
+            // non-null values. Deliberately absent from the update branch
+            // below: the tier is stamped at creation only, and a later
+            // `episodeNumber` edit does not recompute it (the same contract
+            // `AdminMediaService` follows).
+            accessTierOverride: deriveAccessTier(item.episodeNumber),
             channelName: item.channelName,
             caption: item.caption,
             category: item.category,

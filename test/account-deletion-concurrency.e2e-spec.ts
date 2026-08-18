@@ -12,6 +12,7 @@ import {
   TEST_FIXTURE_NAMESPACE,
   fixtureEmail,
 } from './../src/common/testing/fixture-namespace.helpers';
+import { resetThrottlerStorage } from './../src/common/testing/throttler-reset.helpers';
 
 /**
  * Auth test-stability slice: replaces Jest's inherited 5000ms default, which
@@ -129,12 +130,16 @@ describe('Account deletion vs login/refresh concurrency (e2e)', () => {
   // account is registered sidesteps this exactly like every other e2e spec
   // in this suite that needs more attempts than the real limits allow
   // (matches `account-deletion.e2e-spec.ts`'s identical `beforeEach`
-  // precedent, just called per-iteration here instead of per-`it`).
+  // precedent, just called per-iteration here instead of per-`it`). The
+  // reset goes through `resetThrottlerStorage`, which cancels the
+  // throttler's pending TTL timers before clearing the map — see that
+  // helper's doc for the unguarded-timer crash this per-iteration
+  // clearing pattern exposed.
   async function registerAccount(
     label: string,
     password: string,
   ): Promise<{ email: string; auth: AuthResponseDto }> {
-    throttlerStorage.storage.clear();
+    resetThrottlerStorage(throttlerStorage);
     const email = uniqueEmail(label);
     const response = await request(app.getHttpServer())
       .post('/auth/register')
@@ -153,7 +158,7 @@ describe('Account deletion vs login/refresh concurrency (e2e)', () => {
           `login-race-${i}`,
           password,
         );
-        throttlerStorage.storage.clear();
+        resetThrottlerStorage(throttlerStorage);
 
         const [loginResponse, deletionResponse] = await Promise.all([
           request(app.getHttpServer())
@@ -194,7 +199,7 @@ describe('Account deletion vs login/refresh concurrency (e2e)', () => {
 
       for (let i = 0; i < 30; i += 1) {
         const { auth } = await registerAccount(`refresh-race-${i}`, password);
-        throttlerStorage.storage.clear();
+        resetThrottlerStorage(throttlerStorage);
 
         const [refreshResponse, deletionResponse] = await Promise.all([
           request(app.getHttpServer())

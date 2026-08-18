@@ -659,23 +659,25 @@ partially cleared or overwritten; a failure at check 5 or 6 ALSO leaves
 pending key without re-presigning). A successful replacement overwrites the
 pointer with the new key.
 
-**Orphan behavior (documented, not automated):** replacing a cover does
-**not** delete the previous object from R2 — `SeriesService` never calls
+**Orphan behavior (cleanup is manual, never automatic):** replacing a cover
+does **not** delete the previous object from R2 — `SeriesService` never calls
 `StorageService.deleteObject` for a cover. The old object becomes an orphan
-once nothing references it; cleaning up orphaned cover objects is not
-implemented by this work unit and would need a separate, explicit sweep
-(mirroring the existing HLS-generation janitor's pattern, `TranscodeJanitorService`,
-if ever built for covers). **A cover that is presigned but never completed
+once nothing references it. **A cover that is presigned but never completed
 (the client abandons the upload, or the object genuinely never lands in
 R2) is likewise an orphan-in-waiting**: `pendingCoverImageKey` records the
-intent server-side, but nothing in this work unit deletes the R2 object at
+intent server-side, but nothing in the cover routes deletes the R2 object at
 that key, and an abandoned/failed-completion object can sit in R2
 indefinitely (bounded only by `MAX_SERIES_COVER_UPLOAD_BYTES` per object,
 and by the fact that every presign requires an authenticated, admin-guarded,
-rate-limited (`ADMIN_MEDIA_UPLOAD_INITIATE_RATE_LIMIT`) request). As with
-the replaced-cover orphan case above, a bounded, explicit sweep (mirroring
-`TranscodeJanitorService`) is the recommended future hardening — not
-implemented here.
+rate-limited (`ADMIN_MEDIA_UPLOAD_INITIATE_RATE_LIMIT`) request). The
+bounded, explicit sweep both cases call for now exists —
+`SeriesCoverOrphanService`, invoked only via the CLI
+`npm run maintenance:series-cover-orphans`; full contract in
+`docs/series-cover-orphan-cleanup.md`. Its safety posture: a dry run that
+only reports is the default; the destructive `--apply` mode is env-gated
+(the `NODE_ENV` allowlist excludes production, and the operator must restate
+the bucket in `SERIES_COVER_ORPHAN_APPLY_BUCKET`) and manual/CLI-only —
+nothing runs it automatically.
 
 **A completion that LOSES the 2026-08-18 compare-and-set is a third orphan
 case, and is deliberately left as one:** its object was genuinely uploaded
@@ -683,8 +685,9 @@ to R2 and verified, but never became the cover. Nothing deletes it. Deleting
 it on the losing path is explicitly NOT done here — a stale, unreferenced
 object is strictly safer than deleting an object that some other in-flight
 request may still be about to reference, and the correct place to reclaim it
-is the same bounded orphan-cleanup sweep the two cases above already need.
-**No automatic cleanup of any kind exists for series cover objects today.**
+is the same bounded orphan-cleanup sweep that covers the two cases above.
+**No automatic cleanup of any kind runs for series cover objects — the sweep
+exists, but it is CLI-only, dry-run by default, and never scheduled.**
 
 ### `POST /admin/series/:id/archive`
 

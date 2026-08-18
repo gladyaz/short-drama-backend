@@ -12,6 +12,7 @@ import {
   TEST_FIXTURE_NAMESPACE,
   fixtureEmail,
 } from './../src/common/testing/fixture-namespace.helpers';
+import { resetThrottlerStorage } from './../src/common/testing/throttler-reset.helpers';
 
 /**
  * Auth test-stability slice: replaces Jest's inherited 5000ms default, which
@@ -109,7 +110,7 @@ describe('Account deletion (e2e)', () => {
   });
 
   beforeEach(() => {
-    throttlerStorage.storage.clear();
+    resetThrottlerStorage(throttlerStorage);
   });
 
   afterAll(async () => {

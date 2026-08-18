@@ -62,10 +62,12 @@ import { bcryptTestBudgetMs } from './bcrypt-test-budget.helpers';
  * to remove is confined to the HOOK — a boot Jest allows 5000ms, whose
  * overrun fails every test in the file at once, before a single assertion
  * runs. A file-level call also widens every TEST's budget, which is a weaker
- * hang detector for cases that do no booting at all. Two files do carry a
- * file-level budget as well (`export.e2e-spec.ts`,
- * `log-redaction.e2e-spec.ts`), because their individual TESTS drive real
- * bcrypt work through the HTTP stack; each states its own reason locally.
+ * hang detector for cases that do no booting at all. Four files do carry a
+ * file-level budget as well (`export.e2e-spec.ts` and
+ * `log-redaction.e2e-spec.ts`, because their individual TESTS drive real
+ * bcrypt work through the HTTP stack; `series.e2e-spec.ts` and
+ * `series-public.e2e-spec.ts`, budgeted file-level by the Series isolation
+ * slice); each states its own reason locally.
  *
  * `it(name, fn, budget)` takes the same value as a third argument, which is
  * how `dev-tools-boot-guard.e2e-spec.ts` — whose module compile happens

@@ -498,27 +498,39 @@ describe('AuthService', () => {
       expect(lockout?.lockedUntil).toBeNull();
     });
 
-    it('a successful login resets the failure count so it does not carry over toward a future lock', async () => {
-      const email = uniqueEmail('login-reset-on-success');
-      const correctPassword = 'correct-horse-battery';
-      await service.register({ email, password: correctPassword });
+    it(
+      'a successful login resets the failure count so it does not carry over toward a future lock',
+      async () => {
+        const email = uniqueEmail('login-reset-on-success');
+        const correctPassword = 'correct-horse-battery';
+        await service.register({ email, password: correctPassword });
 
-      for (let i = 0; i < 9; i += 1) {
-        await expect(
-          service.login({ email, password: 'totally-wrong-password' }),
-        ).rejects.toBeInstanceOf(AppException);
-      }
+        for (let i = 0; i < 9; i += 1) {
+          await expect(
+            service.login({ email, password: 'totally-wrong-password' }),
+          ).rejects.toBeInstanceOf(AppException);
+        }
 
-      // The 10th attempt succeeds and must reset the counter — otherwise a
-      // 10th call here would already be the lockout-triggering failure.
-      await service.login({ email, password: correctPassword });
+        // The 10th attempt succeeds and must reset the counter — otherwise a
+        // 10th call here would already be the lockout-triggering failure.
+        await service.login({ email, password: correctPassword });
 
-      const lockout = await prisma.accountLockout.findFirst({
-        where: { user: { email } },
-      });
-      expect(lockout?.failedCount).toBe(0);
-      expect(lockout?.lockedUntil).toBeNull();
-    });
+        const lockout = await prisma.accountLockout.findFirst({
+          where: { user: { email } },
+        });
+        expect(lockout?.failedCount).toBe(0);
+        expect(lockout?.lockedUntil).toBeNull();
+        // Final reconciliation: 11 real cost-12 bcrypt operations (1 register
+        // hash + 9 failed-login compares + 1 successful compare) — more than
+        // the 8 the file-level budget above is sized for, so this test rode
+        // ~2.2x headroom instead of the helper's intended 3x and overran under
+        // a fully saturated worker pool (observed once in the full unit gate).
+        // Derived per-test budget, the same mechanism every other multi-op
+        // test in this file already uses; no assertion is weakened and
+        // `BCRYPT_COST_FACTOR` stays at its production value.
+      },
+      bcryptTestBudgetMs(11),
+    );
   });
 
   describe('refresh', () => {
@@ -794,6 +806,147 @@ describe('AuthService', () => {
         changePasswordResponse!.refreshToken,
       );
       expect(refreshedAgain.accessToken).toEqual(expect.any(String));
+    });
+
+    /**
+     * The residual window of the test above (final reconciliation): there,
+     * the concurrent `changePassword` fully COMMITTED before `refresh`
+     * inserted its replacement row. Here it has only EXECUTED its sweeps —
+     * the transaction is still open when the replacement session is
+     * inserted (the session FK's `FOR KEY SHARE` does not conflict with the
+     * held `FOR NO KEY UPDATE`, so the insert is not blocked). A plain
+     * snapshot re-read then still saw the OLD hash and waved the refresh
+     * through, leaving a live session across the password change. The fix —
+     * `FOR SHARE` on the compensating re-read — must BLOCK on the open
+     * transaction and re-evaluate against the committed row.
+     *
+     * The change-password side is replayed as raw canonical-order statements
+     * held open on a barrier (`auth-lock-order.spec.ts`'s replay precedent) —
+     * a real `service.changePassword` cannot be paused mid-transaction from
+     * outside. Zero timing dependence on the fixed side: with the row lock,
+     * `refresh` CANNOT settle while the writer holds the account row.
+     */
+    it('a refresh() racing a changePassword() that is still UNCOMMITTED when the replacement session is inserted does not leave a surviving session', async () => {
+      const email = uniqueEmail('refresh-uncommitted-change');
+      const registered = await service.register({
+        email,
+        password: 'correct-horse-battery',
+      });
+      const userId = registered.user.id;
+      // Only inequality with the old hash matters; cost 4 keeps the test's
+      // own hashing negligible next to the service's real cost-12 work.
+      const newPasswordHash = await bcrypt.hash('brand-new-password-1', 4);
+
+      let sweepsRan!: () => void;
+      const sweepsRanPromise = new Promise<void>((resolve) => {
+        sweepsRan = resolve;
+      });
+      let releaseCommit!: () => void;
+      const holdOpen = new Promise<void>((resolve) => {
+        releaseCommit = resolve;
+      });
+      let changeTx: Promise<unknown> | undefined;
+
+      type SessionUpdateMany = typeof prisma.session.updateMany;
+      const realUpdateMany = prisma.session.updateMany.bind(
+        prisma.session,
+      ) as SessionUpdateMany;
+      const updateManySpy = jest
+        .spyOn(prisma.session, 'updateMany')
+        .mockImplementationOnce((async (
+          args: Parameters<SessionUpdateMany>[0],
+        ) => {
+          // The real rotation CAS, committed exactly as in production...
+          const result = await realUpdateMany(args);
+          // ...then the change-password statement sequence runs — rank-1
+          // `User` lock, new hash, session sweep — and STOPS before COMMIT.
+          changeTx = prisma.$transaction(
+            async (tx) => {
+              await tx.$queryRaw`
+                SELECT "id" FROM "User" WHERE "id" = ${userId} FOR NO KEY UPDATE
+              `;
+              await tx.user.update({
+                where: { id: userId },
+                data: { passwordHash: newPasswordHash },
+              });
+              await tx.session.updateMany({
+                where: { userId, revokedAt: null },
+                data: { revokedAt: new Date() },
+              });
+              sweepsRan();
+              await holdOpen;
+            },
+            { timeout: 20_000 },
+          );
+          await sweepsRanPromise;
+          return result;
+        }) as unknown as SessionUpdateMany);
+
+      let refreshSettled = false;
+      try {
+        const refreshPromise = service.refresh(registered.refreshToken);
+        void refreshPromise
+          .catch(() => undefined)
+          .finally(() => {
+            refreshSettled = true;
+          });
+
+        // Wait until the replacement row is COMMITTED (the insert is not
+        // blocked by the open transaction — `FOR KEY SHARE` vs `FOR NO KEY
+        // UPDATE`), i.e. `refresh` has passed its insert and reached the
+        // compensating re-read.
+        const deadline = Date.now() + 5_000;
+        for (;;) {
+          const liveSessions = await prisma.session.count({
+            where: { userId, revokedAt: null },
+          });
+          if (liveSessions === 1) {
+            break;
+          }
+          if (Date.now() > deadline) {
+            throw new Error('replacement session was never inserted');
+          }
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+
+        // Give the OLD, lock-free re-read ample time to have (wrongly)
+        // completed. With the `FOR SHARE` fix, refresh is DETERMINISTICALLY
+        // blocked on the held `User` row and cannot settle here.
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        expect(refreshSettled).toBe(false);
+
+        // Release the COMMIT; the blocked re-read re-evaluates against the
+        // committed row, sees the NEW hash, and lands in the compensating
+        // branch.
+        releaseCommit();
+        await changeTx;
+
+        await expect(refreshPromise).rejects.toMatchObject({
+          code: AppErrorCode.INVALID_REFRESH_TOKEN,
+          status: HttpStatus.UNAUTHORIZED,
+        } as Partial<AppException>);
+      } finally {
+        releaseCommit();
+        if (changeTx) {
+          await changeTx.catch(() => undefined);
+        }
+        updateManySpy.mockRestore();
+      }
+
+      // THE REGRESSION ASSERTION: no surviving session — the replacement
+      // row `refresh` inserted was compensatingly revoked (the emulated
+      // change-password creates none of its own).
+      const activeSessions = await prisma.session.findMany({
+        where: { userId, revokedAt: null },
+      });
+      expect(activeSessions).toHaveLength(0);
+
+      // The password change itself landed — proving the refresh raced a
+      // change that went on to COMMIT, not one that rolled back.
+      const storedUser = await prisma.user.findUnique({
+        where: { id: userId },
+      });
+      expect(storedUser!.passwordHash).toBe(newPasswordHash);
     });
   });
 
@@ -2714,6 +2867,100 @@ describe('AuthService', () => {
       },
       bcryptTestBudgetMs(25 * 3),
     );
+
+    /**
+     * Rollback-on-loss regression (final reconciliation): the losing side of
+     * the claim race must not COMMIT its account-scoped claim statement.
+     * That statement targets every currently-usable token for the `userId`,
+     * so in this ordering — pre-checks pass for token X, then a winner
+     * consumes X and the account owner legitimately requests a FRESH token
+     * W, then the loser's claim finally runs — the loser claims W (and only
+     * W), loses the `wonClaim` membership check, and previously COMMITTED
+     * that collateral claim: W died unrecorded, and its own confirm then
+     * failed as `already_used`. With `ConfirmPasswordResetClaimLost`
+     * forcing a rollback, W survives the lost attempt untouched.
+     */
+    it('a confirmPasswordReset that loses its claim does not burn a reset token issued after the winner', async () => {
+      const email = uniqueEmail('reset-confirm-loss-no-burn');
+      const registered = await devToolsService.register({
+        email,
+        password: 'correct-horse-battery',
+      });
+      const staleToken = await requestRawToken(email);
+
+      let freshToken: string | undefined;
+
+      // Interpose on the LOSER's pre-check read (`this.prisma`, outside the
+      // transaction — the same interception point precedent as the refresh
+      // race tests above): return the genuine, still-usable row for X, but
+      // first let a complete WINNER confirm X and the account owner request
+      // a fresh token W. The loser then hashes and enters its transaction
+      // with a stale view — exactly the production interleaving.
+      type ResetTokenFindUnique =
+        typeof devToolsPrisma.passwordResetToken.findUnique;
+      const realFindUnique = devToolsPrisma.passwordResetToken.findUnique.bind(
+        devToolsPrisma.passwordResetToken,
+      ) as ResetTokenFindUnique;
+      const findUniqueSpy = jest
+        .spyOn(devToolsPrisma.passwordResetToken, 'findUnique')
+        .mockImplementationOnce((async (
+          args: Parameters<ResetTokenFindUnique>[0],
+        ) => {
+          const staleRow = await realFindUnique(args);
+          // The WINNER: a complete, committed confirm of the same token...
+          await devToolsService.confirmPasswordReset({
+            token: staleToken,
+            newPassword: 'winner-brand-new-password-1',
+          });
+          // ...followed by a legitimately issued NEW-generation token.
+          freshToken = await requestRawToken(email);
+          return staleRow;
+        }) as unknown as ResetTokenFindUnique);
+
+      try {
+        await expect(
+          devToolsService.confirmPasswordReset({
+            token: staleToken,
+            newPassword: 'loser-stale-password-2',
+          }),
+        ).rejects.toMatchObject({
+          code: AppErrorCode.INVALID_PASSWORD_RESET_TOKEN,
+          status: HttpStatus.UNAUTHORIZED,
+        } as Partial<AppException>);
+      } finally {
+        findUniqueSpy.mockRestore();
+      }
+
+      // THE REGRESSION ASSERTION: the fresh token survives the lost claim
+      // AT REST — before the rollback fix, the loser's committed collateral
+      // claim had stamped its `usedAt`.
+      const usableTokens = await devToolsPrisma.passwordResetToken.findMany({
+        where: { userId: registered.user.id, usedAt: null },
+      });
+      expect(usableTokens).toHaveLength(1);
+
+      // And behaviorally: W still completes a reset, and the final password
+      // is W's — never the losing stale attempt's.
+      await devToolsService.confirmPasswordReset({
+        token: freshToken!,
+        newPassword: 'fresh-token-password-3',
+      });
+      const storedUser = await devToolsPrisma.user.findUnique({
+        where: { email },
+      });
+      expect(
+        await bcrypt.compare(
+          'fresh-token-password-3',
+          storedUser!.passwordHash,
+        ),
+      ).toBe(true);
+      expect(
+        await bcrypt.compare(
+          'loser-stale-password-2',
+          storedUser!.passwordHash,
+        ),
+      ).toBe(false);
+    });
   });
 
   /**

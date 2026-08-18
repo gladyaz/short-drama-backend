@@ -52,10 +52,17 @@ export class ListAdminMediaQueryDto {
 
   /**
    * Work unit 11F-2: filters on the DB-backed `Video.accessTierOverride`
-   * column directly (11F-4 backfilled every row to a non-null value, so
-   * this is a plain equality check — it does NOT re-derive the tier from
-   * `episodeNumber`). `@IsIn`, not `@IsEnum`, matching the existing
-   * `UpdateAccessTierDto` precedent for this same two-value set.
+   * column directly — a plain equality check on the STORED override, not
+   * the effective tier (it does NOT re-derive the tier from
+   * `episodeNumber`). 11F-4 backfilled every row to a non-null value and
+   * creation stamps one, but `PATCH /admin/media/:id/access-tier` accepts
+   * `tier: null` ("sets or clears"), so a row whose override an admin
+   * explicitly cleared to null is deliberately invisible to BOTH
+   * `?tier=free` and `?tier=premium` — it still appears in the unfiltered
+   * list with its effective `accessTier` (via the resolver, as on every
+   * public surface and the stream gate). `@IsIn`, not `@IsEnum`, matching
+   * the existing `UpdateAccessTierDto` precedent for this same two-value
+   * set.
    */
   @IsOptional()
   @IsIn(['free', 'premium'])

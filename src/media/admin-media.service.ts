@@ -760,10 +760,14 @@ function toAdminMediaDto(record: VideoRow): AdminMediaDto {
 
 /**
  * Narrows the DB column's plain `string | null` type to the DTO's
- * `'free' | 'premium' | null` union. Safe because `updateAccessTier` is the
- * only write path for this column (besides the additive migration, which
- * only ever produces `null`) and it is gated by `UpdateAccessTierDto`'s
- * `@IsIn(['free', 'premium', null])`.
+ * `'free' | 'premium' | null` union. Safe because every write path for this
+ * column stays inside that union: `updateAccessTier` is gated by
+ * `UpdateAccessTierDto`'s `@IsIn(['free', 'premium', null])`;
+ * `createUpload` (above), `MediaImporterService.importItem`, and
+ * `prisma/seed.ts` all stamp `deriveAccessTier`'s `'free' | 'premium'`
+ * output at creation time (11F-4); the additive migration only ever
+ * produced `null`, and its backfill companion wrote the same
+ * `episodeNumber`-derived `'free'`/`'premium'` values.
  */
 function asAccessTierOverride(value: string | null): AccessTierOverride {
   return value as AccessTierOverride;

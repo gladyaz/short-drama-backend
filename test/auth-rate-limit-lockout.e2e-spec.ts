@@ -12,6 +12,7 @@ import {
   TEST_FIXTURE_NAMESPACE,
   fixtureEmail,
 } from './../src/common/testing/fixture-namespace.helpers';
+import { resetThrottlerStorage } from './../src/common/testing/throttler-reset.helpers';
 
 /**
  * Auth test-stability slice: replaces Jest's inherited 5000ms default, which
@@ -102,7 +103,7 @@ describe('Auth rate limiting + account lockout (e2e)', () => {
   // (or is broken by) another test's requests against the shared in-memory
   // throttler storage.
   beforeEach(() => {
-    throttlerStorage.storage.clear();
+    resetThrottlerStorage(throttlerStorage);
   });
 
   describe('IP rate limiting', () => {

@@ -20,6 +20,7 @@ import {
 } from './../src/common/testing/fixture-namespace.helpers';
 import { bcryptTestBudgetMs } from './../src/common/testing/bcrypt-test-budget.helpers';
 import { e2eSuiteBootBudgetMs } from './../src/common/testing/e2e-boot-budget.helpers';
+import { resetThrottlerStorage } from './../src/common/testing/throttler-reset.helpers';
 
 /**
  * Test-infrastructure hardening slice: replaces Jest's inherited 5000ms
@@ -137,7 +138,7 @@ describe('Secret/token log + error-response redaction (e2e)', () => {
   }, e2eSuiteBootBudgetMs());
 
   afterEach(() => {
-    throttlerStorage.storage.clear();
+    resetThrottlerStorage(throttlerStorage);
   });
 
   afterAll(async () => {

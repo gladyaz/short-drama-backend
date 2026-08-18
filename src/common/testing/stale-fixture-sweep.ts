@@ -183,8 +183,12 @@ export async function sweepStaleTestFixtures(
  * left behind. `AnalyticsEvent` has no `createdAt`; its `receivedAt`
  * (`@default(now())`) is the equivalent server-side insert time.
  *
- * `Video` is absent from this list because the model carries no timestamp at
- * all, so a video can never establish its own namespace's age. Videos are
+ * `Video` is absent from this list because the model carries no USABLE age
+ * timestamp: its only `DateTime?` columns, `processingStartedAt` and
+ * `processingCompletedAt`, are transcode-attempt telemetry — `null` on
+ * ordinary fixtures and overwritten by later attempts — so they cannot
+ * establish fixture age, and a video can never establish its own
+ * namespace's age. Videos are
  * still RECLAIMED (see `sweepNamespace`) once some timestamped sibling —
  * in practice the namespaced `Series` row the spec created them under — has
  * proved the namespace abandoned. A hypothetical namespace consisting of
@@ -270,8 +274,15 @@ async function sweepNamespace(
   prisma: PrismaClient,
   namespace: string,
 ): Promise<StaleFixtureSweepCounts> {
+  // Every marker the helpers generate is `<namespace>-<suffix>` — the same
+  // trailing hyphen `TEST_FIXTURE_MARKER_PATTERN` requires — so every
+  // predicate here matches the hyphenated prefix, never the bare namespace:
+  // a stale namespace that happens to be a prefix of a live one must not
+  // match the live one's rows.
+  const markerPrefix = `${namespace}-`;
+
   const owners = await prisma.user.findMany({
-    where: { email: { startsWith: namespace } },
+    where: { email: { startsWith: markerPrefix } },
     select: { id: true },
   });
   const ownerIds = owners.map((owner) => owner.id);
@@ -280,7 +291,7 @@ async function sweepNamespace(
     where: {
       OR: [
         { userId: { in: ownerIds } },
-        { userAgent: { startsWith: namespace } },
+        { userAgent: { startsWith: markerPrefix } },
       ],
     },
   });
@@ -288,23 +299,23 @@ async function sweepNamespace(
     where: {
       OR: [
         { userId: { in: ownerIds } },
-        { eventName: { startsWith: namespace } },
+        { eventName: { startsWith: markerPrefix } },
       ],
     },
   });
   const videos = await prisma.video.deleteMany({
     where: {
       OR: [
-        { id: { startsWith: namespace } },
-        { seriesId: { startsWith: namespace } },
+        { id: { startsWith: markerPrefix } },
+        { seriesId: { startsWith: markerPrefix } },
       ],
     },
   });
   const series = await prisma.series.deleteMany({
-    where: { id: { startsWith: namespace } },
+    where: { id: { startsWith: markerPrefix } },
   });
   const users = await prisma.user.deleteMany({
-    where: { email: { startsWith: namespace } },
+    where: { email: { startsWith: markerPrefix } },
   });
 
   return {

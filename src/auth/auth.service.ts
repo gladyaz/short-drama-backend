@@ -175,6 +175,23 @@ class LoginUserVanished extends Error {}
  */
 class ChangePasswordRaceLost extends Error {}
 
+/**
+ * Internal-only rollback signal for `AuthService.confirmPasswordReset`'s
+ * transaction — thrown INSIDE the `prisma.$transaction` callback when the
+ * presented token loses the claim race, so `$transaction` rolls back the
+ * losing attempt's own account-scoped claim statement. The rollback is
+ * load-bearing, not defensive symmetry: that statement claims EVERY
+ * currently-usable token for the account, and on the losing side it can
+ * catch a token that did not exist when the race began — a fresh token
+ * `requestPasswordReset` legitimately issued AFTER the winning credential
+ * mutation committed. Committing the loss (the previous `return false`)
+ * burned that new-generation token unrecorded. Always caught inside
+ * `confirmPasswordReset` itself and never surfaces past this file; the
+ * caller-facing outcome (generic `INVALID_PASSWORD_RESET_TOKEN`, audit
+ * reason `claim_failed`) is unchanged.
+ */
+class ConfirmPasswordResetClaimLost extends Error {}
+
 /** Discriminated result of `changePassword`'s revoke-all-and-rotate transaction. */
 type ChangePasswordRotationResult =
   { wonRace: true; response: AuthResponseDto } | { wonRace: false };
@@ -211,7 +228,7 @@ type ChangePasswordRotationResult =
  * opaque `500`, not any of the clean race paths these methods carefully
  * define. `deleteAccount` x `confirmPasswordReset` forms the identical
  * cycle. BOTH were reproduced deterministically against real Postgres 16
- * (see the "lock-order" describe block in `auth.service.spec.ts`, whose
+ * (see the "lock-order" describe block in `auth-lock-order.spec.ts`, whose
  * FIRST test is a positive control that replays these pre-fix statement
  * orders at the raw-SQL level and asserts `40P01` still occurs — so the
  * post-fix tests below it cannot pass vacuously).
@@ -228,9 +245,11 @@ type ChangePasswordRotationResult =
  * re-acquiring a held lock never waits.
  *
  * WHY THE REST OF THE FILE CANNOT REOPEN A CYCLE — the only other database
- * work in this auth surface is SINGLE-statement (auto-commit) writes:
+ * work in this auth surface is SINGLE-statement (auto-commit) work:
  * `logout`/`logoutAll`/`revokeSession`/`refresh`'s CAS and sweeps (`Session`
- * only), `AccountLockoutService`'s upsert (`AccountLockout` only), and
+ * only), `refresh`'s compensating credential re-read (one `FOR SHARE`
+ * SELECT on `User` — see `refresh` for why that lock is load-bearing),
+ * `AccountLockoutService`'s upsert (`AccountLockout` only), and
  * `AuthAuditService.emit` (`AuthAuditEvent` only). A single-statement
  * transaction can block, and can be blocked, but it can never hold a lock on
  * one table while waiting on another — so it cannot supply the second edge a
@@ -736,25 +755,53 @@ export class AuthService {
     // stolen refresh token, which is exactly who a password change is meant
     // to cut off — keeps a live session across the password change.
     //
-    // This is a COMPENSATING check rather than a `FOR SHARE` guard like
-    // `login`'s, and deliberately so. `refresh` is NOT a transaction: each of
-    // its statements above is its own auto-commit write, which is precisely
-    // what keeps it outside the lock graph entirely (a single-statement
-    // transaction can never hold a lock on one table while waiting on
-    // another — see the "CANONICAL AUTH LOCK ORDER" block above this class).
-    // Taking a `User` lock here would turn this method into a multi-statement
-    // transaction running `Session -> User`, the exact inversion of the
-    // canonical order every account-mutating transaction in this file now
-    // follows — reintroducing the `40P01` cycle that block exists to remove.
-    // Re-reading AFTER the insert takes no locks at all and cannot deadlock,
-    // and it is complete rather than merely narrower: the replacement row is
-    // committed by the time this read runs, so any password change that
-    // commits later is guaranteed to see it and revoke it through its own
-    // sweeps.
-    const currentCredential = await this.prisma.user.findUnique({
-      where: { id: user.id },
-      select: { passwordHash: true },
-    });
+    // This is a COMPENSATING check rather than login's whole-transaction
+    // `FOR SHARE` guard, and deliberately so. `refresh` is NOT a
+    // transaction: each of its statements above is its own auto-commit
+    // write, which is precisely what keeps it outside the lock graph
+    // entirely (a single-statement transaction can never hold a lock on one
+    // table while waiting on another — see the "CANONICAL AUTH LOCK ORDER"
+    // block above this class). Wrapping the CAS, the insert, and this check
+    // in ONE multi-statement transaction would run `Session -> User`, the
+    // exact inversion of the canonical order every account-mutating
+    // transaction in this file now follows — reintroducing the `40P01`
+    // cycle that block exists to remove.
+    //
+    // `FOR SHARE` on this single-statement re-read is LOAD-BEARING (final
+    // reconciliation), exactly as in `login`'s guard, and closes a window a
+    // plain snapshot read left open: `changePassword`/`confirmPasswordReset`
+    // run their session sweeps BEFORE their transaction COMMITs, so the
+    // replacement row inserted above can land after a sweep already
+    // executed (the session FK's `FOR KEY SHARE` does not conflict with the
+    // held `FOR NO KEY UPDATE`) while a plain read here still saw the OLD
+    // hash — the caller, including an attacker holding a stolen refresh
+    // token, kept a live, never-revoked session across the password change.
+    // With the row lock both orders are safe:
+    //   - a credential mutator holds its rank-1 `User` lock: this read
+    //     BLOCKS until that transaction resolves, then re-evaluates against
+    //     the committed row version — a NEW hash lands in the mismatch
+    //     branch below (and a rolled-back change leaves the old hash, so
+    //     success is correct);
+    //   - nobody holds it: the replacement row above is already committed,
+    //     so any password change that STARTS later sees it and revokes it
+    //     through its own sweeps.
+    // Still a single-statement auto-commit taking only this one lock while
+    // holding no other, so it cannot deadlock — it can only wait, briefly,
+    // on an in-flight credential mutation for this same account. Table and
+    // column identifiers verified against `prisma/schema.prisma` (no
+    // `@@map`/`@map`), matching this file's existing raw-SQL precedent; no
+    // timestamp is read or written. Regression tests:
+    // `auth.service.spec.ts`, "a refresh() that rotated before a concurrent
+    // changePassword() committed..." (commit-first order) and "a refresh()
+    // racing a changePassword() that is still UNCOMMITTED..." (sweep-first
+    // order, the window described above).
+    const [currentCredential] = await this.prisma.$queryRaw<
+      { passwordHash: string }[]
+    >`
+      SELECT "passwordHash" FROM "User"
+      WHERE "id" = ${user.id}
+      FOR SHARE
+    `;
 
     if (currentCredential?.passwordHash !== user.passwordHash) {
       // Revokes ONLY the row this call just created — never a blanket
@@ -1891,9 +1938,9 @@ export class AuthService {
    * The actual fix folds "claim the presented token" and "invalidate every
    * other outstanding token" into the SAME SINGLE statement, reusing
    * `changePassword`'s `RETURNING`-based id-membership CHECK MECHANISM (see
-   * that method's doc comment) — but deliberately NOT its rollback-on-loss
-   * control flow (see the paragraph below the win/loss check for why that
-   * difference is safe here, not an oversight): one `UPDATE ... WHERE
+   * that method's doc comment) AND — since the final reconciliation — its
+   * rollback-on-loss control flow (see the paragraph below the win/loss
+   * check): one `UPDATE ... WHERE
    * "userId" = ... AND "usedAt" IS NULL AND "expiresAt" > now ... RETURNING
    * "id"`, scoped by `userId` (not by the presented token's own `id`),
    * claims EVERY currently-valid token for the account in one pass. Whether
@@ -1908,36 +1955,31 @@ export class AuthService {
    * (its own row already shows `usedAt` set) rather than deadlocking on a
    * row the first transaction is mid-way through broadly updating.
    *
-   * Unlike `changePassword`, a LOSS here does not throw a rollback signal —
-   * the transaction callback below simply `return`s `false` on a lost claim,
-   * which lets `$transaction` COMMIT (see the code below: `if (!wonClaim) {
-   * return false; }`). This is a deliberate, verified difference, not an
-   * accidental parity break with `changePassword`'s pattern, for two reasons
-   * specific to THIS method that do not hold for `changePassword`:
-   *   1. The WHERE predicate above is scoped by `userId` ALONE (never by the
-   *      presented token's own `id`), so every concurrent confirm for the
-   *      SAME account issues the textually IDENTICAL predicate. Whichever
-   *      transaction commits first claims the ENTIRE matching row set (every
-   *      currently-valid token for that `userId`); every other concurrent
-   *      transaction's identical statement then matches zero rows (nothing
-   *      left with `usedAt IS NULL`) — a genuine no-op, not a partial or
-   *      collateral write that a rollback would need to undo.
-   *   2. This transaction creates NO new row (no `issueTokensAndSession`,
-   *      unlike `changePassword`'s replacement-session creation), so a
-   *      losing transaction has nothing it could have collaterally damaged.
-   *      `changePassword` throws specifically because ITS broad,
-   *      unconditioned session-revoke predicate can, on the losing side,
-   *      match a brand-new row (the winner's freshly created replacement
-   *      session) that did not exist when the race began — rollback is what
-   *      undoes that collateral revoke. No equivalent new-row hazard exists
-   *      here: this method's WHERE clause targets only pre-existing
-   *      `PasswordResetToken` rows scoped to one `userId`, a set that cannot
-   *      grow mid-race the way `changePassword`'s session set can.
-   * Verified empirically: 30 iterations of concurrent confirm(T1) +
-   * confirm(T2) requests against the same account produced exactly one
-   * winner and zero invariant violations every time; ~280 total concurrent
-   * trials across this work unit's testing produced zero Postgres `40P01`
-   * deadlocks.
+   * A LOSS throws `ConfirmPasswordResetClaimLost` (final reconciliation) —
+   * the same rollback-on-loss control flow as `changePassword`, and for the
+   * same reason. An earlier revision let the losing callback `return false`
+   * and COMMIT, arguing the loser's statement was a guaranteed no-op: every
+   * concurrent confirm issues the textually IDENTICAL userId-scoped
+   * predicate, so the winner claims the entire matching row set and the
+   * loser finds nothing left to claim. That argument holds only for tokens
+   * that existed when the race began. The claim predicate is scoped by
+   * `userId` alone, and `requestPasswordReset` — whose rank-1 `FOR SHARE`
+   * serializes it only against the WINNER'S committed transaction; a loser
+   * mid-bcrypt holds no lock at all — can legitimately insert a brand-new
+   * token for this account inside the loser's pre-check-to-claim window.
+   * The loser's claim then catches that NEW-GENERATION token: `wonClaim` is
+   * still false (the PRESENTED token is not in the returned set), but a
+   * COMMIT would burn the user's fresh recovery token unrecorded, and its
+   * own confirm would then fail as `already_used`. Rolling back on loss
+   * erases exactly that collateral claim, mirroring how `changePassword`
+   * un-revokes the winner's replacement session on ITS losing side.
+   * Regression test: `auth.service.spec.ts`, "a confirmPasswordReset that
+   * loses its claim does not burn a reset token issued after the winner".
+   * The original concurrency validation stands unchanged for what it
+   * measured: ~280 concurrent same-account confirm trials produced exactly
+   * one winner every time and zero Postgres `40P01` deadlocks — those runs
+   * never interleaved a mid-race `requestPasswordReset`, which is the case
+   * the rollback exists for.
    *
    * The claim-and-invalidate-others statement, the password update, and the
    * `Session` revoke all run inside ONE `prisma.$transaction`, so a mid-way
@@ -1970,7 +2012,7 @@ export class AuthService {
    * held `Session` first and then waited for `User`. For a single account
    * that is a genuine Postgres `40P01` cycle, reproduced deterministically
    * against real Postgres 16 for BOTH pairings (see the "lock-order"
-   * describe block in `auth.service.spec.ts`). The fix is the `User`-row
+   * describe block in `auth-lock-order.spec.ts`). The fix is the `User`-row
    * lock this transaction now takes as its FIRST statement — see the
    * "CANONICAL AUTH LOCK ORDER" block above this class for the full
    * invariant and why locking `User` first is sufficient. The token row is
@@ -2056,72 +2098,92 @@ export class AuthService {
     // do a `Date`-valued comparison/assignment, so this fix is scoped
     // entirely to the NEW statement below, not a change to any existing
     // one.)
-    const claimed = await this.prisma.$transaction(async (tx) => {
-      // CANONICAL AUTH LOCK ORDER, step 1 (see the block above this class):
-      // take the account's `User` row lock BEFORE the `PasswordResetToken`
-      // claim below. This method already ran `User -> Session` internally,
-      // which was the opposite of `changePassword`'s and `deleteAccount`'s
-      // `Session -> User` — for one account, that pair of orderings is a
-      // genuine Postgres `40P01` cycle (both variants reproduced; see the
-      // "lock-order" describe block in `auth.service.spec.ts`). Hoisting the
-      // `User` lock to statement one makes this transaction and those two
-      // mutually exclusive per account, so neither can hold what the other
-      // waits for. `FOR NO KEY UPDATE` is exactly the lock `tx.user.update`
-      // below takes anyway.
-      //
-      // A missing row means a concurrent `deleteAccount()` removed the
-      // account. Its `onDelete: Cascade` took every `PasswordResetToken`
-      // this account owned with it, so the claim below would have found
-      // nothing to claim regardless: falling through to the SAME `return
-      // false` the lost-claim branch uses is the truthful outcome, not a
-      // special case — the caller gets the same generic
-      // `INVALID_PASSWORD_RESET_TOKEN` every other invalid-token rejection
-      // returns, with no new enumeration signal.
-      if (
-        !(await this.lockAccountRow(tx, resetToken.userId, 'no-key-update'))
-      ) {
-        return false;
-      }
+    let claimed: boolean;
+    try {
+      claimed = await this.prisma.$transaction(async (tx) => {
+        // CANONICAL AUTH LOCK ORDER, step 1 (see the block above this class):
+        // take the account's `User` row lock BEFORE the `PasswordResetToken`
+        // claim below. This method already ran `User -> Session` internally,
+        // which was the opposite of `changePassword`'s and `deleteAccount`'s
+        // `Session -> User` — for one account, that pair of orderings is a
+        // genuine Postgres `40P01` cycle (both variants reproduced; see the
+        // "lock-order" describe block in `auth-lock-order.spec.ts`). Hoisting
+        // the `User` lock to statement one makes this transaction and those
+        // two mutually exclusive per account, so neither can hold what the
+        // other waits for. `FOR NO KEY UPDATE` is exactly the lock
+        // `tx.user.update` below takes anyway.
+        //
+        // A missing row means a concurrent `deleteAccount()` removed the
+        // account. Its `onDelete: Cascade` took every `PasswordResetToken`
+        // this account owned with it, so the claim below would have found
+        // nothing to claim regardless: `return false` (nothing was written
+        // before this statement, so commit and rollback are equivalent here)
+        // reaches the SAME outcome the lost-claim branch does — the caller
+        // gets the same generic `INVALID_PASSWORD_RESET_TOKEN` every other
+        // invalid-token rejection returns, with no new enumeration signal.
+        if (
+          !(await this.lockAccountRow(tx, resetToken.userId, 'no-key-update'))
+        ) {
+          return false;
+        }
 
-      const claimedTokens = await tx.$queryRaw<{ id: string }[]>`
-        UPDATE "PasswordResetToken"
-        SET "usedAt" = ${now} AT TIME ZONE 'UTC'
-        WHERE "userId" = ${resetToken.userId} AND "usedAt" IS NULL AND ("expiresAt" AT TIME ZONE 'UTC') > ${now}
-        RETURNING "id"
-      `;
+        const claimedTokens = await tx.$queryRaw<{ id: string }[]>`
+          UPDATE "PasswordResetToken"
+          SET "usedAt" = ${now} AT TIME ZONE 'UTC'
+          WHERE "userId" = ${resetToken.userId} AND "usedAt" IS NULL AND ("expiresAt" AT TIME ZONE 'UTC') > ${now}
+          RETURNING "id"
+        `;
 
-      // Positive, collision-proof (session ids — well, token ids here — are
-      // unique `cuid`s, not 1ms-resolution `Date` objects) win/loss check:
-      // did the token actually PRESENTED in this request come back in the
-      // set this statement just claimed? If some other concurrent confirm
-      // for this account already consumed it (or it was never valid to
-      // begin with — already used/expired at the moment this statement
-      // ran), it will not appear here.
-      const wonClaim = claimedTokens.some((row) => row.id === resetToken.id);
+        // Positive, collision-proof (session ids — well, token ids here — are
+        // unique `cuid`s, not 1ms-resolution `Date` objects) win/loss check:
+        // did the token actually PRESENTED in this request come back in the
+        // set this statement just claimed? If some other concurrent confirm
+        // for this account already consumed it (or it was never valid to
+        // begin with — already used/expired at the moment this statement
+        // ran), it will not appear here.
+        const wonClaim = claimedTokens.some((row) => row.id === resetToken.id);
 
-      if (!wonClaim) {
-        return false;
-      }
+        if (!wonClaim) {
+          // Forces a ROLLBACK of the account-scoped claim above — see
+          // `ConfirmPasswordResetClaimLost`'s doc comment: the losing
+          // statement can have collaterally claimed a token issued AFTER
+          // the winner committed (a fresh `requestPasswordReset` token),
+          // and that new-generation token must survive this attempt
+          // untouched.
+          throw new ConfirmPasswordResetClaimLost();
+        }
 
-      await tx.user.update({
-        where: { id: resetToken.userId },
-        data: { passwordHash: newPasswordHash },
+        await tx.user.update({
+          where: { id: resetToken.userId },
+          data: { passwordHash: newPasswordHash },
+        });
+
+        await tx.session.updateMany({
+          where: { userId: resetToken.userId, revokedAt: null },
+          data: { revokedAt: now },
+        });
+
+        return true;
       });
-
-      await tx.session.updateMany({
-        where: { userId: resetToken.userId, revokedAt: null },
-        data: { revokedAt: now },
-      });
-
-      return true;
-    });
+    } catch (error) {
+      if (!(error instanceof ConfirmPasswordResetClaimLost)) {
+        // An unrelated database failure still propagates unchanged (and
+        // still surfaces as a 500), mirroring `changePassword`'s equivalent
+        // catch — only the internal loss signal becomes the established
+        // `claimed = false` outcome.
+        throw error;
+      }
+      claimed = false;
+    }
 
     if (!claimed) {
-      // Lost the single-use claim race: another confirm for this exact
-      // token (or its expiry, at the boundary) won between the pre-check
-      // above and this transaction's own conditional update. Nothing was
-      // written by this attempt — treated identically to any other invalid
-      // -token rejection.
+      // Lost the single-use claim race: another credential mutation won
+      // between the pre-check above and this transaction's own conditional
+      // update. The transaction ROLLED BACK, so nothing this attempt
+      // touched persists — including any collateral claim its
+      // account-scoped statement caught (see
+      // `ConfirmPasswordResetClaimLost`) — treated identically to any
+      // other invalid-token rejection.
       await this.authAuditService.emit('password_reset_confirm_failed', {
         userId: resetToken.userId,
         ip: context.ip,
@@ -2361,7 +2423,7 @@ export class AuthService {
       // This transaction used to run `Session -> ... -> User`, the exact
       // inversion of `confirmPasswordReset`'s `User -> ... -> Session`, and
       // the resulting `40P01` cycle was reproduced against real Postgres
-      // (see the "lock-order" describe block in `auth.service.spec.ts`).
+      // (see the "lock-order" describe block in `auth-lock-order.spec.ts`).
       // `FOR UPDATE` (not `FOR NO KEY UPDATE`) matches what this
       // transaction's own closing `DELETE` needs — a key-affecting lock —
       // so the row is locked once, in the right mode, at the right time.

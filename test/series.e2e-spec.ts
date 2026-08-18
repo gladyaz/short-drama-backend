@@ -1437,6 +1437,111 @@ describe('Series admin CRUD (e2e)', () => {
         expect(afterClear?.pendingCoverImageKey).toBeNull();
       });
     });
+
+    /**
+     * Slice "SERIES COVER UPLOAD CONCURRENCY / TOCTOU HARDENING"
+     * (2026-08-18): API-level proof of the semantics the service-level
+     * compare-and-set enforces. These tests deliberately do NOT attempt a
+     * real, nondeterministic HTTP race — the actual interleaving (a removal
+     * or a replacement landing WHILE a completion is inside its storage
+     * verification window) is proven deterministically in
+     * `src/series/series.service.spec.ts`'s "atomic final persistence"
+     * block. What e2e adds is that the observable, end-to-end contract
+     * matches: once a newer admin action has landed, the older pending key
+     * is refused over real HTTP with the documented status/code, and the
+     * cover state a client can read back is the newer action's, never the
+     * loser's.
+     */
+    describe('concurrency semantics: a superseded pending intent can never win (slice 2026-08-18)', () => {
+      it('an uncompleted pending key is refused 409 after Remove, and the cover stays null', async () => {
+        const id = `${completePrefix}-pending-after-remove`;
+        const key = await initUpload(id);
+
+        await request(app.getHttpServer())
+          .patch(`/admin/series/${id}`)
+          .set('Authorization', `Bearer ${adminAccessToken}`)
+          .send({ coverImageKey: null })
+          .expect(HttpStatus.OK);
+
+        const response = await request(app.getHttpServer())
+          .post(`/admin/series/${id}/cover/complete`)
+          .set('Authorization', `Bearer ${adminAccessToken}`)
+          .send({ key })
+          .expect(HttpStatus.CONFLICT);
+
+        expect((response.body as ErrorResponseBody).code).toBe(
+          'SERIES_COVER_KEY_SUPERSEDED',
+        );
+
+        const persisted = await prisma.series.findUnique({ where: { id } });
+        expect(persisted?.coverImageKey).toBeNull();
+        expect(persisted?.pendingCoverImageKey).toBeNull();
+
+        const readBack = await request(app.getHttpServer())
+          .get(`/admin/series/${id}`)
+          .set('Authorization', `Bearer ${adminAccessToken}`)
+          .expect(HttpStatus.OK);
+        expect((readBack.body as SeriesWithCoverDto).coverImageKey).toBeNull();
+        expect((readBack.body as SeriesWithCoverDto).coverUrl).toBeNull();
+      });
+
+      it('an uncompleted pending key is refused 409 once a newer presign supersedes it, leaving the live cover AND the newer pending intent intact', async () => {
+        const id = `${completePrefix}-pending-superseded-by-newer`;
+        const liveKey = await initUpload(id);
+        mockHeadObjectOnce(coverSizeBytes, coverContentType);
+        await request(app.getHttpServer())
+          .post(`/admin/series/${id}/cover/complete`)
+          .set('Authorization', `Bearer ${adminAccessToken}`)
+          .send({ key: liveKey })
+          .expect(HttpStatus.OK);
+
+        const initA = await request(app.getHttpServer())
+          .post(`/admin/series/${id}/cover`)
+          .set('Authorization', `Bearer ${adminAccessToken}`)
+          .send({ contentType: coverContentType, sizeBytes: coverSizeBytes })
+          .expect(HttpStatus.CREATED);
+        const keyA = (initA.body as CreateCoverUploadResponseBody).upload.key;
+
+        const initB = await request(app.getHttpServer())
+          .post(`/admin/series/${id}/cover`)
+          .set('Authorization', `Bearer ${adminAccessToken}`)
+          .send({ contentType: coverContentType, sizeBytes: coverSizeBytes })
+          .expect(HttpStatus.CREATED);
+        const keyB = (initB.body as CreateCoverUploadResponseBody).upload.key;
+        expect(keyB).not.toBe(keyA);
+
+        const response = await request(app.getHttpServer())
+          .post(`/admin/series/${id}/cover/complete`)
+          .set('Authorization', `Bearer ${adminAccessToken}`)
+          .send({ key: keyA })
+          .expect(HttpStatus.CONFLICT);
+
+        expect((response.body as ErrorResponseBody).code).toBe(
+          'SERIES_COVER_KEY_SUPERSEDED',
+        );
+
+        const persisted = await prisma.series.findUnique({ where: { id } });
+        // The live cover is untouched by the loser...
+        expect(persisted?.coverImageKey).toBe(liveKey);
+        // ...and so is the newer pending intent it lost to.
+        expect(persisted?.pendingCoverImageKey).toBe(keyB);
+
+        // The winner can still finish normally afterwards.
+        mockHeadObjectOnce(coverSizeBytes, coverContentType);
+        const completedB = await request(app.getHttpServer())
+          .post(`/admin/series/${id}/cover/complete`)
+          .set('Authorization', `Bearer ${adminAccessToken}`)
+          .send({ key: keyB })
+          .expect(HttpStatus.OK);
+        expect((completedB.body as SeriesWithCoverDto).coverImageKey).toBe(
+          keyB,
+        );
+
+        const afterB = await prisma.series.findUnique({ where: { id } });
+        expect(afterB?.coverImageKey).toBe(keyB);
+        expect(afterB?.pendingCoverImageKey).toBeNull();
+      });
+    });
   });
 
   /**

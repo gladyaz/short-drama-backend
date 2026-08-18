@@ -199,6 +199,18 @@ export class SeriesService {
    * rather than silently un-clearing the cover. A `coverImageKey` PATCH to a
    * non-null string, or an omitted `coverImageKey`, never touches
    * `pendingCoverImageKey` — only the explicit-`null` case does.
+   *
+   * Slice "SERIES COVER UPLOAD CONCURRENCY / TOCTOU HARDENING"
+   * (2026-08-18): both columns are cleared by ONE `UPDATE` statement (the
+   * single `prisma.series.update` below carries both fields), so there is
+   * no observable intermediate state in which the cover has been removed
+   * but an in-flight completion still holds a matching pending intent —
+   * the removal and the invalidation of outstanding upload intent commit
+   * together or not at all. Combined with `completeCoverUpload`'s
+   * compare-and-set on `pendingCoverImageKey`, this is what makes
+   * "Remove wins over an in-flight completion" deterministic: once this
+   * statement commits, every completion still verifying an older key
+   * matches 0 rows and can no longer resurrect the cover it uploaded.
    */
   async update(id: string, dto: UpdateSeriesDto): Promise<SeriesDto> {
     const data = buildUpdateData(dto);
@@ -402,10 +414,29 @@ export class SeriesService {
    *
    * Only once every check passes does this persist `Series.coverImageKey`
    * — in the SAME write, `pendingCoverImageKey` is cleared back to `null`
-   * (this generation's intent has now been fulfilled). Any failure at
-   * check 4 or 5 leaves BOTH `coverImageKey` AND `pendingCoverImageKey`
-   * untouched — the upload can still be retried against the same pending
-   * key (e.g. a slow/eventually-consistent R2 PUT) without re-presigning.
+   * (this generation's intent has now been fulfilled).
+   *
+   * Slice "SERIES COVER UPLOAD CONCURRENCY / TOCTOU HARDENING"
+   * (2026-08-18): that final write is itself CONDITIONAL — an atomic
+   * compare-and-set on `pendingCoverImageKey`, not an unconditional
+   * `update({ where: { id } })`. Check 3 above compares `dto.key` against a
+   * row read BEFORE the `headObject` round-trip, so it can only prove the
+   * intent was current at READ time; between that read and the write — a
+   * window as wide as a real network HEAD against R2 — another admin
+   * action can supersede this completion (`PATCH { coverImageKey: null }`
+   * removing the cover, or a fresh `POST .../cover` minting a replacement
+   * intent). An unconditional final update would let the now-stale
+   * completion win ANYWAY, resurrecting a just-removed cover or reverting a
+   * newer intent. Putting `pendingCoverImageKey: dto.key` in the write's
+   * own `WHERE` clause makes the database — not a JS comparison against a
+   * stale read — the authority on whether this completion still owns the
+   * current intent at the exact write moment. A completion that loses that
+   * compare-and-set writes NOTHING; see `resolveLostCoverCasOutcome`.
+   *
+   * Any failure at check 4 or 5 leaves BOTH `coverImageKey` AND
+   * `pendingCoverImageKey` untouched — the upload can still be retried
+   * against the same pending key (e.g. a slow/eventually-consistent R2
+   * PUT) without re-presigning.
    */
   async completeCoverUpload(
     id: string,
@@ -449,12 +480,75 @@ export class SeriesService {
       throw seriesCoverSizeOutOfBound(metadata.contentLength);
     }
 
-    const updated = await this.prisma.series.update({
-      where: { id },
+    // The ATOMIC compare-and-set described in this method's doc comment.
+    // `pendingCoverImageKey: dto.key` in the `WHERE` clause is what makes
+    // "this completion still owns the series' current upload intent" a
+    // condition Postgres evaluates at the instant of the write, mirroring
+    // the conditional-`updateMany` CAS precedent `AuthService.refresh`/
+    // `AuthService.revokeSession` already established for the same
+    // check-then-act problem on `Session.revokedAt`.
+    //
+    // `updateManyAndReturn` rather than `updateMany` + `count` purely
+    // because this route must RETURN the persisted row: it is the SAME
+    // single conditional `UPDATE`, with a `RETURNING` clause, so the row
+    // handed to `toSeriesWithCoverDto` below is exactly the state this
+    // statement wrote — not a follow-up read that could observe some
+    // newer, unrelated write and report it as this call's result.
+    const promoted = await this.prisma.series.updateManyAndReturn({
+      where: { id, pendingCoverImageKey: dto.key },
       data: { coverImageKey: dto.key, pendingCoverImageKey: null },
     });
 
-    return this.toSeriesWithCoverDto(updated);
+    if (promoted.length === 0) {
+      return this.resolveLostCoverCasOutcome(id, dto.key);
+    }
+
+    return this.toSeriesWithCoverDto(promoted[0]);
+  }
+
+  /**
+   * Slice "SERIES COVER UPLOAD CONCURRENCY / TOCTOU HARDENING": decides
+   * what a completion that LOST `completeCoverUpload`'s compare-and-set
+   * gets back. Zero matched rows means the series' `pendingCoverImageKey`
+   * was no longer `key` at the write moment — something superseded this
+   * completion while it was verifying: a `PATCH { coverImageKey: null }`
+   * removal, a newer `POST .../cover` intent, or a concurrent completion of
+   * this very same key. This method NEVER writes, so a loser cannot
+   * resurrect a removed cover, cannot revert a newer cover, and —
+   * critically — cannot clear the replacement intent that beat it.
+   *
+   * The disposition is deliberately the SAME rule `completeCoverUpload`'s
+   * pre-storage currency check (check 3) applies, merely re-evaluated
+   * against FRESH state, so no second, competing contract exists for one
+   * semantic state:
+   *
+   * - the series' cover is now exactly `key` → an equivalent completion
+   *   for this key already won, so this returns the same `200` no-op
+   *   success a SEQUENTIAL duplicate `complete` has always returned.
+   *   Interleaving must not change the answer to "I completed key X, and
+   *   key X is the live cover"; a client retrying an identical completion
+   *   would otherwise get a bewildering conflict for an outcome it did in
+   *   fact achieve.
+   * - anything else (cover removed, or replaced by a different/newer key)
+   *   → the superseded case, answered with the SAME
+   *   `409 SERIES_COVER_KEY_SUPERSEDED` a key already known stale BEFORE
+   *   the storage call gets.
+   *
+   * A series deleted out from under an in-flight completion surfaces as
+   * `findSeriesOrThrow`'s `404 SERIES_NOT_FOUND` — truthful for a row
+   * that no longer exists, and still not a write.
+   */
+  private async resolveLostCoverCasOutcome(
+    id: string,
+    key: string,
+  ): Promise<SeriesWithCoverDto> {
+    const current = await this.findSeriesOrThrow(id);
+
+    if (current.coverImageKey === key) {
+      return this.toSeriesWithCoverDto(current);
+    }
+
+    throw seriesCoverKeySuperseded();
   }
 
   private async findSeriesOrThrow(id: string): Promise<SeriesRow> {

@@ -536,6 +536,30 @@ is rejected with `409 SERIES_COVER_KEY_SUPERSEDED`. An explicit
 including the documented (not yet automated) orphan-cleanup and
 Content-Type/Length verification caveats for a never-completed upload.
 
+**Hardening (2026-08-18) — concurrent (not just replayed) completions
+closed.** The fix-cycle-1 currency check compares `key` against a row read
+BEFORE the storage `HEAD` round-trip, while the final write was
+unconditional — so a completion could pass the check, be superseded DURING
+verification (a `PATCH { coverImageKey: null }` removal, or a newer presign),
+and still win the write, resurrecting a removed cover or reverting a newer
+one. `complete`'s final write is now an atomic compare-and-set conditioned on
+`pendingCoverImageKey` still equalling the completing key at the instant of
+the write (same conditional-write shape `AuthService.refresh`/
+`revokeSession` already use for `Session.revokedAt`). A completion that loses
+it writes NOTHING — it cannot resurrect a removed cover, cannot revert a
+newer cover, and cannot clear the newer pending intent that beat it — and is
+answered with the same `409 SERIES_COVER_KEY_SUPERSEDED`. Two SIMULTANEOUS
+completions of the SAME key both verify, exactly one writes, and both get the
+`200` no-op answer a sequential duplicate has always received. No schema
+migration was needed. A superseded-but-uploaded object stays in R2 as an
+orphan (deliberately — no automatic cover-object cleanup exists). Known
+limitation, unchanged and now explicitly documented: only the `null`
+(Remove) form of `PATCH /admin/series/:id` revokes an outstanding upload
+intent — writing a `coverImageKey` string directly by hand does not, so a
+completion of a still-valid pending intent will legitimately replace that
+hand-written value afterwards. See `docs/admin-api-contract.md`'s
+2026-08-18 hardening note.
+
 ### What changed in Phase 8 (internal only)
 
 `/videos/feed`, `/videos/:id`, and `/videos/:id/stream` are now backed by a
@@ -1991,8 +2015,13 @@ unaffected.
   SERIES_COVER_CONTENT_TYPE_NOT_ALLOWED` otherwise); its real size is
   within bound (`409 SERIES_COVER_SIZE_OUT_OF_BOUND` otherwise). Only then
   persists `Series.coverImageKey`, clears `pendingCoverImageKey`, and
-  returns `200 SeriesWithCoverDto`. Idempotent on a repeated call with the
-  already-live key. **Replace semantics:** the OLD cover stays
+  returns `200 SeriesWithCoverDto`. **Hardening (2026-08-18):** that final
+  write is an atomic compare-and-set — it applies only while
+  `pendingCoverImageKey` still equals `key`, so a completion superseded
+  during verification writes nothing and gets the same
+  `409 SERIES_COVER_KEY_SUPERSEDED`. Idempotent on a repeated call with the
+  already-live key (including when the duplicate is simultaneous rather
+  than sequential). **Replace semantics:** the OLD cover stays
   authoritative until a NEW upload is fully verified — a failed
   verification never clears or overwrites it. **Content-Type/Length are
   not cryptographically bound by the presigned PUT itself** — a caller

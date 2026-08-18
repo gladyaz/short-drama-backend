@@ -129,6 +129,27 @@ QUERY FILTER (`ListAdminMediaQueryDto.category`, an exact-match read filter,
 not a write validator) is UNCHANGED — still freeform, since an unrecognised
 filter value is harmless (it simply matches zero rows).
 
+**Hardening, 2026-08-18 (slice "SERIES COVER UPLOAD CONCURRENCY / TOCTOU
+HARDENING", baseline `2f285d1`) — NO route, shape, status code, or error
+code changed; this is a concurrency guarantee, not a contract change.** The
+2026-08-15 currency check above closed REPLAYED completions (a stale key
+submitted after the state had already moved on), but not CONCURRENT ones: it
+compares `key` against a row read BEFORE the storage `HEAD` round-trip, while
+the final write was unconditional. A completion could therefore pass the
+currency check, be superseded DURING its verification (by a
+`PATCH { coverImageKey: null }` removal, or by a newer
+`POST /admin/series/:id/cover` intent), and still win the write —
+resurrecting a just-removed cover or reverting a newer one. The final write
+of `POST /admin/series/:id/cover/complete` is now an ATOMIC COMPARE-AND-SET
+conditioned on `pendingCoverImageKey` still equalling the completing key at
+the instant of the write; a completion that loses it writes nothing and is
+answered with the SAME `409 SERIES_COVER_KEY_SUPERSEDED` an already-stale key
+gets. No schema migration was required (the existing
+`Series.pendingCoverImageKey` column became the CAS predicate). Full
+semantics — newest-intent-wins, Remove invalidating outstanding intent,
+duplicate/simultaneous completion behavior, and orphan-object consequences —
+are documented in `POST /admin/series/:id/cover/complete`'s entry below.
+
 ## Conventions
 
 - No global route prefix (e.g. `GET /health`, not `GET /api/health`).
@@ -574,6 +595,62 @@ already-persisted `key` (i.e. `key === coverImageKey`) is a no-op success —
 unchanged from before the 2026-08-15 fix, though now implemented as an
 explicit short-circuit (check 3) rather than a harmless re-verification.
 
+**Concurrency (2026-08-18 hardening) — the final write is CONDITIONAL.**
+Checks 1–3 run against a row read BEFORE check 4's storage `HEAD`
+round-trip, so on their own they can only prove the key was current at READ
+time. The write itself therefore carries the condition: it updates the row
+only `WHERE pendingCoverImageKey = key`, i.e. only if this completion still
+owns the series' current upload intent at the exact instant of the write.
+The resulting rules:
+
+- **Newest intent wins.** A `POST /admin/series/:id/cover` that lands while
+  an older completion is verifying replaces the pending intent, and the
+  older completion then loses. The newer pending intent is left completely
+  intact by the loser and can still be completed normally afterwards.
+- **Remove invalidates outstanding upload intent.**
+  `PATCH /admin/series/:id { coverImageKey: null }` clears
+  `coverImageKey` and `pendingCoverImageKey` in ONE statement, so there is
+  no window in which the cover is removed but an in-flight completion still
+  holds a matching intent. A completion that was already verifying when the
+  removal landed loses the compare-and-set and **cannot resurrect the
+  removed poster** — the series stays coverless until a new
+  presign + completion.
+- **A losing completion writes NOTHING.** It never changes
+  `coverImageKey` (an existing cover stays authoritative) and never clears
+  another request's `pendingCoverImageKey`.
+- **Superseded response.** Losing the compare-and-set returns the SAME
+  `409 SERIES_COVER_KEY_SUPERSEDED` as a key already known stale before the
+  storage call. There is deliberately no second error code for this state.
+- **Duplicate completion.** Sequential duplicates are unchanged (`200`
+  no-op via check 3). Two SIMULTANEOUS completions of the same key both
+  verify, exactly one wins the compare-and-set, and the loser — seeing that
+  the live cover is now exactly the key it was completing — returns the
+  same `200` no-op success rather than a conflict. Interleaving never
+  changes the answer to "I completed key X and key X is the live cover";
+  only one of the two actually wrote.
+- **Series deleted mid-completion** surfaces as `404 SERIES_NOT_FOUND`
+  (still no write).
+- **KNOWN LIMITATION — a direct non-null `coverImageKey` PATCH does NOT
+  invalidate an outstanding upload intent.** Only the explicit-`null`
+  (Remove) form clears `pendingCoverImageKey`; `PATCH { coverImageKey:
+  "<some string>" }` deliberately leaves it untouched (unchanged,
+  pre-2026-08-18 behavior). So if an upload was presigned and then an admin
+  writes a cover key directly by hand, a completion of that still-valid
+  pending intent will legitimately win the compare-and-set afterwards and
+  replace the hand-written value — it has not been superseded, because
+  nothing revoked its intent. This is NOT the TOCTOU race the 2026-08-18
+  hardening closes (there is no stale read involved: the intent genuinely
+  is still current at write time); it is a consequence of the documented
+  `coverImageKey` three-state semantics above. **To invalidate an
+  in-flight upload, use the `null` (Remove) form**, which clears both
+  columns in one statement.
+
+These semantics are proven by deterministic service-level interleaving tests
+(`src/series/series.service.spec.ts`, "atomic final persistence
+(concurrency / TOCTOU hardening)" — the interfering admin action is executed
+INSIDE the mocked storage `HEAD`, never by timing/sleeps) plus API-level
+tests in `test/series.e2e-spec.ts`.
+
 **Replace semantics:** the OLD `coverImageKey` stays authoritative until a
 NEW upload is independently verified — a failed verification (any of checks
 2–6 above) leaves `Series.coverImageKey` completely untouched, never
@@ -599,6 +676,15 @@ rate-limited (`ADMIN_MEDIA_UPLOAD_INITIATE_RATE_LIMIT`) request). As with
 the replaced-cover orphan case above, a bounded, explicit sweep (mirroring
 `TranscodeJanitorService`) is the recommended future hardening — not
 implemented here.
+
+**A completion that LOSES the 2026-08-18 compare-and-set is a third orphan
+case, and is deliberately left as one:** its object was genuinely uploaded
+to R2 and verified, but never became the cover. Nothing deletes it. Deleting
+it on the losing path is explicitly NOT done here — a stale, unreferenced
+object is strictly safer than deleting an object that some other in-flight
+request may still be about to reference, and the correct place to reclaim it
+is the same bounded orphan-cleanup sweep the two cases above already need.
+**No automatic cleanup of any kind exists for series cover objects today.**
 
 ### `POST /admin/series/:id/archive`
 
@@ -784,7 +870,7 @@ caught by the filter's dedicated exposed-client-error branch and returned as
 | `SERIES_COVER_KEY_INVALID` | 400 | `POST /admin/series/:id/cover/complete`: `key` does not belong to this series' cover prefix (2026-08-14 re-freeze) |
 | `SERIES_COVER_CONTENT_TYPE_NOT_ALLOWED` | 409 | `POST /admin/series/:id/cover/complete`: the object's real `Content-Type` is not an allowed cover MIME type (2026-08-14 re-freeze) |
 | `SERIES_COVER_SIZE_OUT_OF_BOUND` | 409 | `POST /admin/series/:id/cover/complete`: the object's real size is outside `1`–`10485760` bytes (2026-08-14 re-freeze) |
-| `SERIES_COVER_KEY_SUPERSEDED` | 409 | `POST /admin/series/:id/cover/complete`: `key` is well-formed for this series but matches neither its current `pendingCoverImageKey` nor its current `coverImageKey` — a superseded/stale/replayed key (2026-08-15, fix cycle 1) |
+| `SERIES_COVER_KEY_SUPERSEDED` | 409 | `POST /admin/series/:id/cover/complete`: `key` is well-formed for this series but matches neither its current `pendingCoverImageKey` nor its current `coverImageKey` — a superseded/stale/replayed key (2026-08-15, fix cycle 1). Also returned when a completion LOSES the final atomic compare-and-set, i.e. the intent was removed or replaced while this completion was verifying the object in storage (2026-08-18 hardening) — deliberately the same code for the same semantic state |
 
 ## Explicitly still GATED (do NOT wire as real in 11F-6)
 

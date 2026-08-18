@@ -1046,5 +1046,464 @@ describe('SeriesService', () => {
         expect(afterClear?.pendingCoverImageKey).toBeNull();
       });
     });
+
+    /**
+     * Slice "SERIES COVER UPLOAD CONCURRENCY / TOCTOU HARDENING"
+     * (2026-08-18). The fix-cycle-1 currency check above closed REPLAYED
+     * completions (a stale key submitted AFTER the state already moved on),
+     * but not CONCURRENT ones: it compares `dto.key` against a row read
+     * BEFORE `headObject`, and the final write was an unconditional
+     * `update({ where: { id } })`. A completion could therefore pass the
+     * currency check, get superseded DURING its storage round-trip, and
+     * still win the write — resurrecting a just-removed cover or reverting
+     * a newer intent.
+     *
+     * Every test below drives that exact interleaving DETERMINISTICALLY:
+     * the interfering admin action is executed INSIDE the mocked
+     * `headObject`, i.e. strictly after the pre-storage currency check and
+     * strictly before the final write, which is precisely the window the
+     * compare-and-set has to close. No `setTimeout`, no sleep, no "hope the
+     * other request wins" — `completeCoverUpload` cannot proceed past the
+     * `await this.storageService.headObject(...)` until the mock resolves,
+     * so the ordering is a property of the code under test, not of the
+     * scheduler.
+     */
+    describe('atomic final persistence (concurrency / TOCTOU hardening)', () => {
+      /**
+       * Runs `interleaved` INSIDE the verification window (see this
+       * describe's doc), then resolves as a normal, fully valid HEAD — so
+       * any rejection that follows can only come from the final
+       * compare-and-set, never from a missing object or a bad
+       * MIME/size.
+       */
+      function mockHeadObjectDuringWindow(
+        key: string,
+        interleaved: () => Promise<unknown>,
+      ): void {
+        storageService.headObject.mockImplementationOnce(async () => {
+          await interleaved();
+          return {
+            key,
+            contentLength: coverSizeBytes,
+            contentType: coverContentType,
+          };
+        });
+      }
+
+      /**
+       * A deterministic N-participant barrier: every caller blocks until
+       * the Nth arrives, then all are released together. Used to hold two
+       * completions of the SAME key inside their verification windows
+       * simultaneously, so both are guaranteed to have passed the
+       * pre-storage currency check before either reaches the final write.
+       */
+      function createBarrier(participants: number): () => Promise<void> {
+        let arrived = 0;
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+
+        return async () => {
+          arrived += 1;
+          if (arrived === participants) {
+            release();
+          }
+          await gate;
+        };
+      }
+
+      /** Completes a fresh cover upload and returns the now-live key. */
+      async function completeFreshCover(id: string): Promise<string> {
+        const init = await service.createCoverUpload(id, {
+          contentType: coverContentType,
+          sizeBytes: coverSizeBytes,
+        });
+        mockHeadObjectFor(init.upload.key, coverSizeBytes);
+        await service.completeCoverUpload(id, { key: init.upload.key });
+        return init.upload.key;
+      }
+
+      it('the final write is a CONDITIONAL compare-and-set on pendingCoverImageKey, never an unconditional update by id', async () => {
+        const { id, key } = await createSeriesWithMintedKey('cover-cas-shape');
+        const casSpy = jest.spyOn(prisma.series, 'updateManyAndReturn');
+        const unconditionalUpdateSpy = jest.spyOn(prisma.series, 'update');
+        mockHeadObjectFor(key, coverSizeBytes);
+
+        await service.completeCoverUpload(id, { key });
+
+        expect(casSpy).toHaveBeenCalledTimes(1);
+        expect(casSpy.mock.calls[0][0]).toMatchObject({
+          where: { id, pendingCoverImageKey: key },
+          data: { coverImageKey: key, pendingCoverImageKey: null },
+        });
+        // An unconditional `update({ where: { id } })` is exactly the shape
+        // that preserved the race — the completion path must not use it.
+        expect(unconditionalUpdateSpy).not.toHaveBeenCalled();
+
+        const persisted = await prisma.series.findUnique({ where: { id } });
+        expect(persisted?.coverImageKey).toBe(key);
+        expect(persisted?.pendingCoverImageKey).toBeNull();
+
+        casSpy.mockRestore();
+        unconditionalUpdateSpy.mockRestore();
+      });
+
+      it('CAS matches exactly one row when the pending key still matches, and zero rows when it does not', async () => {
+        const { id, key } = await createSeriesWithMintedKey('cover-cas-count');
+
+        // Matching pending key -> exactly one row promoted.
+        const won = await prisma.series.updateManyAndReturn({
+          where: { id, pendingCoverImageKey: key },
+          data: { coverImageKey: key, pendingCoverImageKey: null },
+        });
+        expect(won).toHaveLength(1);
+
+        // Same statement replayed against the now-cleared intent -> no row,
+        // and therefore no write at all.
+        const lost = await prisma.series.updateManyAndReturn({
+          where: { id, pendingCoverImageKey: key },
+          data: { coverImageKey: key, pendingCoverImageKey: null },
+        });
+        expect(lost).toHaveLength(0);
+      });
+
+      it('REMOVE RACE: a PATCH-null removal inside the verification window wins — the completion is rejected 409 and never resurrects the cover', async () => {
+        const { id, key } =
+          await createSeriesWithMintedKey('cover-race-remove');
+        mockHeadObjectDuringWindow(key, () =>
+          service.update(id, { coverImageKey: null }),
+        );
+
+        await expect(
+          service.completeCoverUpload(id, { key }),
+        ).rejects.toMatchObject({
+          code: AppErrorCode.SERIES_COVER_KEY_SUPERSEDED,
+        });
+
+        // Proves the completion really did get past the pre-storage
+        // currency check and into the verification window — this is the
+        // interleaving the old code lost, not an early rejection.
+        expect(storageService.headObject).toHaveBeenCalledTimes(1);
+
+        const persisted = await prisma.series.findUnique({ where: { id } });
+        expect(persisted?.coverImageKey).toBeNull();
+        expect(persisted?.pendingCoverImageKey).toBeNull();
+      });
+
+      it('REMOVE RACE with an existing cover: removal still wins, and the stale completion cannot restore the removed poster', async () => {
+        const id = `${testIdPrefix}-cover-race-remove-existing`;
+        await service.create({ id, title: id });
+        const oldKey = await completeFreshCover(id);
+
+        const init = await service.createCoverUpload(id, {
+          contentType: coverContentType,
+          sizeBytes: coverSizeBytes,
+        });
+        const pendingKey = init.upload.key;
+        mockHeadObjectDuringWindow(pendingKey, () =>
+          service.update(id, { coverImageKey: null }),
+        );
+
+        await expect(
+          service.completeCoverUpload(id, { key: pendingKey }),
+        ).rejects.toMatchObject({
+          code: AppErrorCode.SERIES_COVER_KEY_SUPERSEDED,
+        });
+
+        const persisted = await prisma.series.findUnique({ where: { id } });
+        expect(persisted?.coverImageKey).toBeNull();
+        expect(persisted?.coverImageKey).not.toBe(oldKey);
+        expect(persisted?.coverImageKey).not.toBe(pendingKey);
+        expect(persisted?.pendingCoverImageKey).toBeNull();
+      });
+
+      it('REPLACE RACE: a newer presign inside the verification window supersedes the completion — the OLD cover survives and the NEW pending intent is left intact', async () => {
+        const id = `${testIdPrefix}-cover-race-replace`;
+        await service.create({ id, title: id });
+        const oldKey = await completeFreshCover(id);
+
+        const initA = await service.createCoverUpload(id, {
+          contentType: coverContentType,
+          sizeBytes: coverSizeBytes,
+        });
+        const keyA = initA.upload.key;
+
+        let keyB = '';
+        mockHeadObjectDuringWindow(keyA, async () => {
+          const initB = await service.createCoverUpload(id, {
+            contentType: coverContentType,
+            sizeBytes: coverSizeBytes,
+          });
+          keyB = initB.upload.key;
+        });
+
+        await expect(
+          service.completeCoverUpload(id, { key: keyA }),
+        ).rejects.toMatchObject({
+          code: AppErrorCode.SERIES_COVER_KEY_SUPERSEDED,
+        });
+
+        const persisted = await prisma.series.findUnique({ where: { id } });
+        // Current-cover safety: the live poster is untouched by the loser.
+        expect(persisted?.coverImageKey).toBe(oldKey);
+        expect(persisted?.coverImageKey).not.toBe(keyA);
+        // Pending-intent safety (the critical one): the loser must NOT
+        // clear the replacement intent that beat it — B has to survive, or
+        // the winning request's own completion would break.
+        expect(keyB).not.toBe(keyA);
+        expect(persisted?.pendingCoverImageKey).toBe(keyB);
+      });
+
+      it('REPLACE RACE follow-through: the newer intent B still completes normally after the stale completion A lost', async () => {
+        const id = `${testIdPrefix}-cover-race-replace-then-b`;
+        await service.create({ id, title: id });
+        const oldKey = await completeFreshCover(id);
+
+        const initA = await service.createCoverUpload(id, {
+          contentType: coverContentType,
+          sizeBytes: coverSizeBytes,
+        });
+        let keyB = '';
+        mockHeadObjectDuringWindow(initA.upload.key, async () => {
+          const initB = await service.createCoverUpload(id, {
+            contentType: coverContentType,
+            sizeBytes: coverSizeBytes,
+          });
+          keyB = initB.upload.key;
+        });
+        await expect(
+          service.completeCoverUpload(id, { key: initA.upload.key }),
+        ).rejects.toMatchObject({
+          code: AppErrorCode.SERIES_COVER_KEY_SUPERSEDED,
+        });
+
+        mockHeadObjectFor(keyB, coverSizeBytes);
+        const completed = await service.completeCoverUpload(id, { key: keyB });
+
+        expect(completed.coverImageKey).toBe(keyB);
+        const persisted = await prisma.series.findUnique({ where: { id } });
+        expect(persisted?.coverImageKey).toBe(keyB);
+        expect(persisted?.coverImageKey).not.toBe(oldKey);
+        expect(persisted?.pendingCoverImageKey).toBeNull();
+      });
+
+      it('OPPOSITE ORDER: a completion that wins the CAS first stays live, and a later presign only sets the next pending intent', async () => {
+        const id = `${testIdPrefix}-cover-race-opposite-order`;
+        await service.create({ id, title: id });
+
+        const keyA = await completeFreshCover(id);
+        const initB = await service.createCoverUpload(id, {
+          contentType: coverContentType,
+          sizeBytes: coverSizeBytes,
+        });
+
+        const persisted = await prisma.series.findUnique({ where: { id } });
+        expect(persisted?.coverImageKey).toBe(keyA);
+        expect(persisted?.pendingCoverImageKey).toBe(initB.upload.key);
+      });
+
+      it('SIMULTANEOUS SAME-KEY COMPLETES: both pass verification, exactly ONE wins the CAS, and the loser mutates nothing', async () => {
+        const { id, key } = await createSeriesWithMintedKey(
+          'cover-race-simultaneous',
+        );
+        const barrier = createBarrier(2);
+        storageService.headObject.mockImplementation(async () => {
+          // Both requests are held here until BOTH have arrived, so both
+          // are guaranteed to have passed the pre-storage currency check
+          // (each reading `pendingCoverImageKey === key`) before either
+          // reaches the final write.
+          await barrier();
+          return {
+            key,
+            contentLength: coverSizeBytes,
+            contentType: coverContentType,
+          };
+        });
+        const casSpy = jest.spyOn(prisma.series, 'updateManyAndReturn');
+
+        const outcomes = await Promise.all([
+          service.completeCoverUpload(id, { key }),
+          service.completeCoverUpload(id, { key }),
+        ]);
+
+        expect(storageService.headObject).toHaveBeenCalledTimes(2);
+        expect(casSpy).toHaveBeenCalledTimes(2);
+
+        const casRowCounts = await Promise.all(
+          casSpy.mock.results.map(
+            async (result) => ((await result.value) as unknown[]).length,
+          ),
+        );
+        // The whole point: two conditional writes ran, exactly one matched
+        // a row. The loser wrote nothing.
+        expect(casRowCounts.filter((count) => count === 1)).toHaveLength(1);
+        expect(casRowCounts.filter((count) => count === 0)).toHaveLength(1);
+
+        // A simultaneous duplicate of the SAME key resolves the same way a
+        // sequential duplicate always has: both callers are told the cover
+        // they completed is live. Interleaving does not change the answer.
+        expect(outcomes.map((outcome) => outcome.coverImageKey)).toEqual([
+          key,
+          key,
+        ]);
+
+        const persisted = await prisma.series.findUnique({ where: { id } });
+        expect(persisted?.coverImageKey).toBe(key);
+        expect(persisted?.pendingCoverImageKey).toBeNull();
+
+        casSpy.mockRestore();
+      });
+
+      it('DUPLICATE COMPLETE: a second sequential complete of the live key performs no second mutation', async () => {
+        const { id, key } = await createSeriesWithMintedKey(
+          'cover-race-duplicate',
+        );
+        mockHeadObjectFor(key, coverSizeBytes);
+        await service.completeCoverUpload(id, { key });
+        const afterFirst = await prisma.series.findUnique({ where: { id } });
+
+        const casSpy = jest.spyOn(prisma.series, 'updateManyAndReturn');
+        const updateSpy = jest.spyOn(prisma.series, 'update');
+        const second = await service.completeCoverUpload(id, { key });
+
+        expect(second.coverImageKey).toBe(key);
+        // Short-circuited before storage AND before any write: no CAS, no
+        // update, and therefore no `updatedAt` drift on repeated calls.
+        expect(storageService.headObject).toHaveBeenCalledTimes(1);
+        expect(casSpy).not.toHaveBeenCalled();
+        expect(updateSpy).not.toHaveBeenCalled();
+
+        const afterSecond = await prisma.series.findUnique({ where: { id } });
+        expect(afterSecond?.updatedAt.getTime()).toBe(
+          afterFirst?.updatedAt.getTime(),
+        );
+
+        casSpy.mockRestore();
+        updateSpy.mockRestore();
+      });
+
+      it('a failed verification leaves the pending intent intact, so the SAME key can still be retried without re-presigning', async () => {
+        const { id, key } = await createSeriesWithMintedKey(
+          'cover-race-retry-after-failed-head',
+        );
+        storageService.headObject.mockResolvedValueOnce(null);
+
+        await expect(
+          service.completeCoverUpload(id, { key }),
+        ).rejects.toMatchObject({ code: AppErrorCode.MEDIA_FILE_NOT_FOUND });
+
+        const afterFailure = await prisma.series.findUnique({ where: { id } });
+        expect(afterFailure?.coverImageKey).toBeNull();
+        expect(afterFailure?.pendingCoverImageKey).toBe(key);
+
+        mockHeadObjectFor(key, coverSizeBytes);
+        const retried = await service.completeCoverUpload(id, { key });
+
+        expect(retried.coverImageKey).toBe(key);
+        const afterRetry = await prisma.series.findUnique({ where: { id } });
+        expect(afterRetry?.coverImageKey).toBe(key);
+        expect(afterRetry?.pendingCoverImageKey).toBeNull();
+      });
+
+      it('a series deleted inside the verification window surfaces as 404 SERIES_NOT_FOUND, still writing nothing', async () => {
+        const { id, key } = await createSeriesWithMintedKey(
+          'cover-race-series-deleted',
+        );
+        mockHeadObjectDuringWindow(key, () =>
+          prisma.series.delete({ where: { id } }),
+        );
+
+        await expect(
+          service.completeCoverUpload(id, { key }),
+        ).rejects.toMatchObject({ code: AppErrorCode.SERIES_NOT_FOUND });
+
+        const persisted = await prisma.series.findUnique({ where: { id } });
+        expect(persisted).toBeNull();
+      });
+
+      /**
+       * CHARACTERIZATION of a DELIBERATE, pre-existing limitation (surfaced
+       * by this slice's concurrency reviewer, and unchanged by it): only the
+       * explicit-`null` (Remove) form of `PATCH /admin/series/:id` clears
+       * `pendingCoverImageKey`. Writing a cover key directly by hand does
+       * NOT revoke an outstanding upload intent, so a completion of that
+       * intent legitimately still owns the CAS predicate afterwards and
+       * wins. That is not the TOCTOU race this slice closes — no stale read
+       * is involved, the intent really is current at write time — it is the
+       * documented `coverImageKey` three-state contract (see
+       * `docs/admin-api-contract.md`). Locked down here so the behavior
+       * cannot drift silently: changing it is a contract decision, not an
+       * implementation detail.
+       */
+      it('a direct NON-NULL coverImageKey PATCH does not revoke a pending intent, so a later completion of that intent still wins (documented limitation — use null to invalidate)', async () => {
+        const { id, key } = await createSeriesWithMintedKey(
+          'cover-nonnull-patch-does-not-revoke',
+        );
+
+        await service.update(id, { coverImageKey: 'manually-set-cover-key' });
+        const afterPatch = await prisma.series.findUnique({ where: { id } });
+        expect(afterPatch?.coverImageKey).toBe('manually-set-cover-key');
+        // The intent was NOT revoked by a non-null PATCH — this is the
+        // documented behavior the completion below then acts on.
+        expect(afterPatch?.pendingCoverImageKey).toBe(key);
+
+        mockHeadObjectFor(key, coverSizeBytes);
+        const completed = await service.completeCoverUpload(id, { key });
+
+        expect(completed.coverImageKey).toBe(key);
+        const persisted = await prisma.series.findUnique({ where: { id } });
+        expect(persisted?.coverImageKey).toBe(key);
+        expect(persisted?.pendingCoverImageKey).toBeNull();
+      });
+
+      /**
+       * The counterpart to the characterization test above: the `null`
+       * (Remove) form DOES revoke the intent, which is the supported way to
+       * invalidate an in-flight upload.
+       */
+      it('the NULL (Remove) form does revoke the pending intent, so the same later completion is refused', async () => {
+        const { id, key } = await createSeriesWithMintedKey(
+          'cover-null-patch-does-revoke',
+        );
+
+        await service.update(id, { coverImageKey: null });
+
+        await expect(
+          service.completeCoverUpload(id, { key }),
+        ).rejects.toMatchObject({
+          code: AppErrorCode.SERIES_COVER_KEY_SUPERSEDED,
+        });
+
+        const persisted = await prisma.series.findUnique({ where: { id } });
+        expect(persisted?.coverImageKey).toBeNull();
+        expect(persisted?.pendingCoverImageKey).toBeNull();
+      });
+
+      it('a disallowed MIME discovered in the window still fails BEFORE persistence, writing nothing', async () => {
+        const { id, key } = await createSeriesWithMintedKey(
+          'cover-race-bad-mime-no-write',
+        );
+        const casSpy = jest.spyOn(prisma.series, 'updateManyAndReturn');
+        storageService.headObject.mockResolvedValueOnce({
+          key,
+          contentLength: coverSizeBytes,
+          contentType: 'image/svg+xml',
+        });
+
+        await expect(
+          service.completeCoverUpload(id, { key }),
+        ).rejects.toMatchObject({
+          code: AppErrorCode.SERIES_COVER_CONTENT_TYPE_NOT_ALLOWED,
+        });
+
+        expect(casSpy).not.toHaveBeenCalled();
+        const persisted = await prisma.series.findUnique({ where: { id } });
+        expect(persisted?.coverImageKey).toBeNull();
+        expect(persisted?.pendingCoverImageKey).toBe(key);
+
+        casSpy.mockRestore();
+      });
+    });
   });
 });

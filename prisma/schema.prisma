@@ -542,6 +542,22 @@ model Series {
   /// with an old, already-superseded key can never again revert a
   /// since-replaced cover, and can never again "un-clear" a cover that was
   /// explicitly PATCHed to `null`.
+  ///
+  /// Slice "SERIES COVER UPLOAD CONCURRENCY / TOCTOU HARDENING" (2026-08-18):
+  /// this column is ALSO the compare-and-set predicate of
+  /// `completeCoverUpload`'s FINAL write. That write is a conditional
+  /// `updateManyAndReturn` whose `WHERE` clause requires
+  /// `pendingCoverImageKey` to STILL equal the completing key at the exact
+  /// moment the row is updated — matching 0 rows (someone removed the cover
+  /// or minted a replacement intent while this completion was verifying the
+  /// object in storage) means the completion writes NOTHING and is answered
+  /// `409 SERIES_COVER_KEY_SUPERSEDED`. The pre-storage check described
+  /// above compares against a row read BEFORE a network HEAD round-trip, so
+  /// it alone cannot decide currency at write time; this column being part
+  /// of the write predicate is what makes "newest intent wins" a database
+  /// guarantee rather than a check-then-act hope. Same conditional-write CAS
+  /// shape `Session.revokedAt` already uses in `AuthService.refresh`/
+  /// `AuthService.revokeSession`.
   pendingCoverImageKey String?
 
   @@index([sortOrder])

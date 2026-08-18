@@ -3,6 +3,7 @@ import { HttpStatus, INestApplication } from '@nestjs/common';
 import request from 'supertest';
 import { App } from 'supertest/types';
 import { AppModule } from './../src/app.module';
+import { e2eSuiteBootBudgetMs } from './../src/common/testing/e2e-boot-budget.helpers';
 
 interface AdsConfigBody {
   enabled: boolean;
@@ -55,7 +56,7 @@ describe('Ads config (e2e)', () => {
 
     app = moduleFixture.createNestApplication();
     await app.init();
-  });
+  }, e2eSuiteBootBudgetMs());
 
   afterAll(async () => {
     try {

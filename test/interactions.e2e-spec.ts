@@ -11,6 +11,8 @@ import type {
   SaveResponseDto,
   UserInteractionDto,
 } from './../src/interactions/interaction.types';
+import { e2eSuiteBootBudgetMs } from './../src/common/testing/e2e-boot-budget.helpers';
+import { fixtureMarker } from './../src/common/testing/fixture-namespace.helpers';
 
 interface ErrorResponseBody {
   statusCode: number;
@@ -34,6 +36,29 @@ describe('Interactions (e2e)', () => {
 
   const emailPrefix = 'interactions-e2e-spec+9b2';
   const seededVideoId = 'video-104-01';
+
+  /**
+   * A video this suite OWNS, for the one test that asserts an absolute
+   * `likeCount`.
+   *
+   * Test-infrastructure hardening slice. That test used to read
+   * `video-104-01`'s count and then assert `initialLikeCount + 1`, which is
+   * only sound while nothing else likes that row. `export.e2e-spec.ts` uses
+   * the same seeded episode and likes it six times, in a different Jest
+   * worker, against the same `short_drama_test` database — so the count
+   * moved between the read and the assertion and the test failed with
+   * `likeCount: 82` where it expected `83`. Reproduced 3 times in 10 runs of
+   * the two suites together, on the pre-slice baseline, so this is a
+   * pre-existing shared-row race that a parallel gate exposes.
+   *
+   * Fixed by giving the counting test its own row, NOT by loosening the
+   * assertion: an exact count on a row nobody else can touch is a stronger
+   * check than a tolerance on a shared one. Every other test in this file
+   * keeps using the seeded episode, because none of them assert on a value
+   * another worker can change. Same remedy the Series test-isolation slice
+   * applied to its own global-count assertions.
+   */
+  const countedVideoId = fixtureMarker('interactions-e2e-like-count');
   const uniqueEmail = (label: string): string =>
     `${emailPrefix}-${label}-${Date.now()}-${Math.random().toString(36).slice(2)}@example.test`;
 
@@ -72,9 +97,33 @@ describe('Interactions (e2e)', () => {
     const otherBody = otherRegisterResponse.body as AuthResponseDto;
     otherAccessToken = otherBody.accessToken;
     otherUserId = otherBody.user.id;
-  });
+
+    // See `countedVideoId` above. Created directly via Prisma, mirroring
+    // `videos.e2e-spec.ts`'s existing fixture pattern; `storageKey` is a
+    // synthetic path, never a real R2 object.
+    await prisma.video.create({
+      data: {
+        id: countedVideoId,
+        seriesId: countedVideoId,
+        title: 'Interactions like-count fixture',
+        episodeNumber: 1,
+        channelName: 'E2E Channel',
+        caption: 'Owned by interactions.e2e-spec.ts',
+        category: 'drama',
+        storageKey: 'e2e/interactions/like-count.mp4',
+        sourceLanguage: 'zh',
+        hasEmbeddedIndonesianSubtitle: true,
+        likeCount: 0,
+        lifecycleState: 'published',
+      },
+    });
+  }, e2eSuiteBootBudgetMs(2));
 
   afterAll(async () => {
+    await prisma.userVideoInteraction.deleteMany({
+      where: { videoId: countedVideoId },
+    });
+    await prisma.video.deleteMany({ where: { id: countedVideoId } });
     await prisma.userVideoInteraction.deleteMany({ where: { userId } });
     await prisma.userVideoInteraction.deleteMany({
       where: { userId: otherUserId },
@@ -113,31 +162,32 @@ describe('Interactions (e2e)', () => {
 
   describe('like/unlike', () => {
     it('likes a video, incrementing likeCount, then unlikes it back down', async () => {
+      // `countedVideoId`, not the seeded episode — see its declaration.
       const before = await request(app.getHttpServer())
-        .get(`/videos/${seededVideoId}`)
+        .get(`/videos/${countedVideoId}`)
         .expect(HttpStatus.OK);
       const initialLikeCount = (before.body as { likeCount: number }).likeCount;
 
       const likeResponse = await request(app.getHttpServer())
-        .post(`/videos/${seededVideoId}/like`)
+        .post(`/videos/${countedVideoId}/like`)
         .set('Authorization', `Bearer ${accessToken}`)
         .expect(HttpStatus.CREATED);
 
       const likeBody = likeResponse.body as LikeResponseDto;
       expect(likeBody).toEqual({
-        videoId: seededVideoId,
+        videoId: countedVideoId,
         isLiked: true,
         likeCount: initialLikeCount + 1,
       });
 
       const unlikeResponse = await request(app.getHttpServer())
-        .delete(`/videos/${seededVideoId}/like`)
+        .delete(`/videos/${countedVideoId}/like`)
         .set('Authorization', `Bearer ${accessToken}`)
         .expect(HttpStatus.OK);
 
       const unlikeBody = unlikeResponse.body as LikeResponseDto;
       expect(unlikeBody).toEqual({
-        videoId: seededVideoId,
+        videoId: countedVideoId,
         isLiked: false,
         likeCount: initialLikeCount,
       });

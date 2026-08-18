@@ -7,6 +7,7 @@ import { AppModule } from './../src/app.module';
 import { AppExceptionFilter } from './../src/common/filters/app-exception.filter';
 import { PrismaService } from './../src/prisma/prisma.service';
 import type { AuthResponseDto } from './../src/auth/auth.types';
+import { e2eSuiteBootBudgetMs } from './../src/common/testing/e2e-boot-budget.helpers';
 
 /**
  * e2e coverage for Phase 12, work unit 12A-B2 (DECISIONS.md decision 8):
@@ -65,7 +66,7 @@ describe('Security headers + JSON body limit (e2e)', () => {
     const body = registerResponse.body as AuthResponseDto;
     accessToken = body.accessToken;
     userId = body.user.id;
-  });
+  }, e2eSuiteBootBudgetMs(1));
 
   afterAll(async () => {
     await prisma.analyticsEvent.deleteMany({ where: { userId } });

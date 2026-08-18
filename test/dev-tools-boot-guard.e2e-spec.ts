@@ -24,6 +24,7 @@ delete process.env.NODE_ENV;
 
 import { Test } from '@nestjs/testing';
 import { AppModule } from './../src/app.module';
+import { e2eSuiteBootBudgetMs } from './../src/common/testing/e2e-boot-budget.helpers';
 
 /**
  * Proves the privilege-escalation path the 12D-B2 fix closes is actually
@@ -56,9 +57,13 @@ describe('AppModule boot guard — DEV_TOOLS_ENABLED=true with a misconfigured N
     }
   });
 
-  it('refuses to compile AppModule at all, closing /dev/admin/* and /dev/entitlements/* together (no server ever exists to reach either)', async () => {
-    await expect(
-      Test.createTestingModule({ imports: [AppModule] }).compile(),
-    ).rejects.toThrow(/Refusing to boot with DEV_TOOLS_ENABLED=true/);
-  });
+  it(
+    'refuses to compile AppModule at all, closing /dev/admin/* and /dev/entitlements/* together (no server ever exists to reach either)',
+    async () => {
+      await expect(
+        Test.createTestingModule({ imports: [AppModule] }).compile(),
+      ).rejects.toThrow(/Refusing to boot with DEV_TOOLS_ENABLED=true/);
+    },
+    e2eSuiteBootBudgetMs(),
+  );
 });

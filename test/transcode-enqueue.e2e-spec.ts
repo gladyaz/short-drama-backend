@@ -8,6 +8,7 @@ import { PrismaService } from './../src/prisma/prisma.service';
 import { StorageService } from './../src/storage/storage.service';
 import { TRANSCODE_QUEUE } from './../src/transcode/transcode.types';
 import type { AuthResponseDto } from './../src/auth/auth.types';
+import { e2eSuiteBootBudgetMs } from './../src/common/testing/e2e-boot-budget.helpers';
 
 interface CreateUploadResponseBody {
   media: { id: string; lifecycleState: string };
@@ -122,7 +123,7 @@ describe('Slice 11N — transcode enqueue on complete-upload (e2e)', () => {
         }),
       );
       await app.init();
-    });
+    }, e2eSuiteBootBudgetMs());
 
     afterAll(async () => {
       const prisma = app.get<PrismaService>(PrismaService);
@@ -197,7 +198,7 @@ describe('Slice 11N — transcode enqueue on complete-upload (e2e)', () => {
         }),
       );
       await app.init();
-    });
+    }, e2eSuiteBootBudgetMs());
 
     afterAll(async () => {
       const prisma = app.get<PrismaService>(PrismaService);
@@ -281,7 +282,7 @@ describe('Slice 11N — transcode enqueue on complete-upload (e2e)', () => {
         }),
       );
       await app.init();
-    });
+    }, e2eSuiteBootBudgetMs());
 
     afterAll(async () => {
       const prisma = app.get<PrismaService>(PrismaService);

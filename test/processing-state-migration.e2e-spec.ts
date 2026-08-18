@@ -4,6 +4,7 @@ import request from 'supertest';
 import { App } from 'supertest/types';
 import { AppModule } from './../src/app.module';
 import { PrismaService } from './../src/prisma/prisma.service';
+import { e2eSuiteBootBudgetMs } from './../src/common/testing/e2e-boot-budget.helpers';
 
 /**
  * Slice 11N, proof 2: "Existing media rows remain valid" — the additive
@@ -29,7 +30,7 @@ describe('Slice 11N — processing-state migration safety (e2e)', () => {
     await app.init();
 
     prisma = moduleFixture.get<PrismaService>(PrismaService);
-  });
+  }, e2eSuiteBootBudgetMs());
 
   afterAll(async () => {
     await app.close();

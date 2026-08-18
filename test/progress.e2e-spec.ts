@@ -7,6 +7,7 @@ import { AppExceptionFilter } from './../src/common/filters/app-exception.filter
 import { PrismaService } from './../src/prisma/prisma.service';
 import type { AuthResponseDto } from './../src/auth/auth.types';
 import type { ProgressResponseDto } from './../src/progress/progress.types';
+import { e2eSuiteBootBudgetMs } from './../src/common/testing/e2e-boot-budget.helpers';
 
 interface ErrorResponseBody {
   statusCode: number;
@@ -69,7 +70,7 @@ describe('Progress (e2e)', () => {
     const otherBody = otherRegisterResponse.body as AuthResponseDto;
     otherAccessToken = otherBody.accessToken;
     otherUserId = otherBody.user.id;
-  });
+  }, e2eSuiteBootBudgetMs(2));
 
   afterAll(async () => {
     await prisma.watchProgress.deleteMany({ where: { userId } });

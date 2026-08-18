@@ -81,6 +81,8 @@
     ],
     "rootDir": "src",
     "testRegex": ".*\\.spec\\.ts$",
+    "globalSetup": "<rootDir>/common/testing/jest-global-setup.ts",
+    "globalTeardown": "<rootDir>/common/testing/jest-global-teardown.ts",
     "transform": {
       "^.+\\.(t|j)s$": "ts-jest"
     },

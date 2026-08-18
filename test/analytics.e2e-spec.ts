@@ -6,6 +6,7 @@ import { AppModule } from './../src/app.module';
 import { AppExceptionFilter } from './../src/common/filters/app-exception.filter';
 import { PrismaService } from './../src/prisma/prisma.service';
 import type { AuthResponseDto } from './../src/auth/auth.types';
+import { e2eSuiteBootBudgetMs } from './../src/common/testing/e2e-boot-budget.helpers';
 
 /**
  * e2e coverage for Phase 11 (work units 11-B3/11-B5/11-B6): analytics
@@ -51,7 +52,7 @@ describe('Analytics (e2e)', () => {
     const body = registerResponse.body as AuthResponseDto;
     accessToken = body.accessToken;
     userId = body.user.id;
-  });
+  }, e2eSuiteBootBudgetMs(1));
 
   afterAll(async () => {
     await prisma.analyticsEvent.deleteMany({ where: { userId } });

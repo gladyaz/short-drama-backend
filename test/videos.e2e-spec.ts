@@ -19,6 +19,7 @@ import type {
   VideoResponseDto,
 } from './../src/videos/video.types';
 import * as hlsPlaybackTokenUtil from './../src/transcode/hls/hls-playback-token.util';
+import { e2eSuiteBootBudgetMs } from './../src/common/testing/e2e-boot-budget.helpers';
 
 interface ErrorResponseBody {
   statusCode: number;
@@ -96,7 +97,7 @@ describe('Videos (e2e)', () => {
     const body = registerResponse.body as AuthResponseDto;
     accessToken = body.accessToken;
     userId = body.user.id;
-  });
+  }, e2eSuiteBootBudgetMs(1));
 
   beforeEach(() => {
     mockStorageService.createPresignedGetUrl.mockClear();

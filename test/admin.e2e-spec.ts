@@ -7,6 +7,7 @@ import { AppExceptionFilter } from './../src/common/filters/app-exception.filter
 import { PrismaService } from './../src/prisma/prisma.service';
 import type { AuthResponseDto } from './../src/auth/auth.types';
 import type { AdminRoleStatusDto } from './../src/admin/admin.types';
+import { e2eSuiteBootBudgetMs } from './../src/common/testing/e2e-boot-budget.helpers';
 
 interface ErrorResponseBody {
   statusCode: number;
@@ -62,7 +63,7 @@ describe('Admin (e2e)', () => {
 
       const body = registerResponse.body as AuthResponseDto;
       accessToken = body.accessToken;
-    });
+    }, e2eSuiteBootBudgetMs(1));
 
     afterAll(async () => {
       await prisma.user.deleteMany({
@@ -157,7 +158,7 @@ describe('Admin (e2e)', () => {
       const otherBody = otherRegisterResponse.body as AuthResponseDto;
       otherAccessToken = otherBody.accessToken;
       otherUserId = otherBody.user.id;
-    });
+    }, e2eSuiteBootBudgetMs(2));
 
     afterAll(async () => {
       await prisma.user.deleteMany({

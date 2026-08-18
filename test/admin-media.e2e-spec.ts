@@ -11,6 +11,7 @@ import type {
   AdminMediaDto,
   AdminMediaListResponseDto,
 } from './../src/media/media.types';
+import { e2eSuiteBootBudgetMs } from './../src/common/testing/e2e-boot-budget.helpers';
 
 interface ErrorResponseBody {
   statusCode: number;
@@ -128,7 +129,7 @@ describe('Admin Media (e2e)', () => {
       .send({ email: uniqueEmail('user'), password: 'correct-horse-battery' })
       .expect(HttpStatus.CREATED);
     nonAdminAccessToken = (userRegister.body as AuthResponseDto).accessToken;
-  });
+  }, e2eSuiteBootBudgetMs(2));
 
   afterAll(async () => {
     // `startsWith`, not an exact match: the work unit 11E-1 `list` tests

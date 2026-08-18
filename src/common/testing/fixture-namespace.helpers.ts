@@ -1,4 +1,5 @@
 import { randomBytes } from 'node:crypto';
+import { registerTestFixtureNamespace } from './fixture-namespace-registry';
 
 /**
  * Width of the zero-padded base-36 process id inside `TEST_FIXTURE_NAMESPACE`.
@@ -76,10 +77,93 @@ const PID_RADIX36_WIDTH = 5;
  * sweeps `@example.test` rows older than a day; it is deliberately NOT done
  * here because a sweep wide enough to be useful is also wide enough to need
  * its own careful review.
+ *
+ * RESOLVED (Test-infrastructure hardening slice): that follow-up is now
+ * `stale-fixture-sweep.ts`, run from `globalSetup`/`globalTeardown`. It is
+ * narrower than the sketch above — it reclaims rows by NAMESPACE SHAPE
+ * (`TEST_FIXTURE_NAMESPACE_PATTERN` below) rather than by email domain, so
+ * it cannot touch a developer's QA account, and it requires the namespace to
+ * have been silent for hours, so it cannot touch a run still in flight.
  */
 export const TEST_FIXTURE_NAMESPACE = `t${process.pid
   .toString(36)
   .padStart(PID_RADIX36_WIDTH, '0')}${randomBytes(3).toString('hex')}`;
+
+/**
+ * The SHAPE of a generated namespace: the literal `t`, up to
+ * `PID_RADIX36_WIDTH` base-36 digits of a process id, then six hex digits
+ * from `randomBytes(3)`.
+ *
+ * This is the ownership test the stale-fixture sweep applies before deleting
+ * anything (`stale-fixture-sweep.ts`), so it lives HERE, beside the
+ * construction it describes, rather than being restated at the point of use.
+ * A pattern that drifted from the generator would either orphan rows forever
+ * or — far worse — start matching rows nobody generated;
+ * `fixture-namespace.helpers.spec.ts` asserts the two agree.
+ *
+ * `{1,PID_RADIX36_WIDTH}` rather than an exact width, deliberately: the pid
+ * segment has only been zero-padded since the Auth test-stability slice
+ * added `padStart`, and developer databases still hold rows from before that
+ * change whose pid segment is three or four characters
+ * (`t7u0ba830e-...`, `tn7se2b179-...`). Those are abandoned fixtures from
+ * this same generator and there is no reason to orphan them permanently. A
+ * base-36 pid cannot exceed five digits on any platform this repo runs on
+ * (Linux's 4,194,304 ceiling is `2gosw`), so the range covers every
+ * namespace this repository has ever produced and nothing wider.
+ *
+ * Deliberately not a global regex: `exec` on a `/g` pattern carries
+ * `lastIndex` between calls, which would make a shared module-level constant
+ * return different answers for the same input depending on call order.
+ */
+export const TEST_FIXTURE_NAMESPACE_PATTERN = new RegExp(
+  `^t[0-9a-z]{1,${PID_RADIX36_WIDTH}}[0-9a-f]{6}$`,
+);
+
+/**
+ * How a namespace appears at the START of a fixture marker, capturing the
+ * namespace itself.
+ *
+ * The trailing hyphen is load-bearing, not decoration. Every generator below
+ * emits `<namespace>-<something>` (`fixtureEmail`, `fixtureMarker`,
+ * `uniqueFixtureMarker`), and requiring it here buys two things at once:
+ *
+ *  - It removes the only ambiguity a variable-width pid segment could
+ *    introduce. Without a fixed right-hand boundary, `t7u0ba830e-...` could
+ *    be read as a 2-digit pid plus `0ba830` OR a 3-digit pid plus `ba830e`,
+ *    and a `startsWith` delete built from the shorter reading would reach
+ *    beyond the namespace that actually owns the row.
+ *  - It narrows what can be claimed as a fixture at all. A marker must be a
+ *    namespace FOLLOWED BY a hyphen — so a name that merely happens to open
+ *    with the right letters (`tester123abc@example.test`) is not a
+ *    candidate.
+ */
+export const TEST_FIXTURE_MARKER_PATTERN = new RegExp(
+  `^(t[0-9a-z]{1,${PID_RADIX36_WIDTH}}[0-9a-f]{6})-`,
+);
+
+/**
+ * The domain every fixture address is generated under. `.test` is an
+ * IANA-reserved TLD (RFC 6761) that can never resolve, so a fixture address
+ * can never reach a real mailbox — and, for the stale-fixture sweep, an
+ * address outside this domain is never a `User` cleanup candidate no matter
+ * what its local part looks like.
+ */
+export const TEST_FIXTURE_EMAIL_DOMAIN = '@example.test';
+
+/**
+ * Announces this worker's namespace to the run that forked it, so
+ * `globalTeardown` can reclaim its rows even if a suite's own `afterAll`
+ * never ran (it threw, or the database was briefly unreachable while it
+ * ran). The main Jest process cannot derive this value for itself — the
+ * namespace is a function of the WORKER's pid — which is the whole reason
+ * the registry exists; see `fixture-namespace-registry.ts`.
+ *
+ * A module-level side effect is unusual, and is justified here by being the
+ * only point at which the value exists in the process that owns it. It is
+ * inert unless a `globalSetup` published a registry directory, it writes one
+ * empty file, and it cannot throw.
+ */
+registerTestFixtureNamespace(TEST_FIXTURE_NAMESPACE);
 
 /**
  * Monotonic within one worker process. Replaces the previous
@@ -103,7 +187,7 @@ let fixtureSequence = 0;
  */
 export function fixtureEmail(label: string): string {
   fixtureSequence += 1;
-  return `${TEST_FIXTURE_NAMESPACE}-${fixtureSequence}-${label}@example.test`;
+  return `${TEST_FIXTURE_NAMESPACE}-${fixtureSequence}-${label}${TEST_FIXTURE_EMAIL_DOMAIN}`;
 }
 
 /**

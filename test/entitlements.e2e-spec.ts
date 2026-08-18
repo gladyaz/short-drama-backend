@@ -7,6 +7,7 @@ import { AppExceptionFilter } from './../src/common/filters/app-exception.filter
 import { PrismaService } from './../src/prisma/prisma.service';
 import type { AuthResponseDto } from './../src/auth/auth.types';
 import type { EntitlementStatusDto } from './../src/entitlements/entitlement.types';
+import { e2eSuiteBootBudgetMs } from './../src/common/testing/e2e-boot-budget.helpers';
 
 interface ErrorResponseBody {
   statusCode: number;
@@ -65,7 +66,7 @@ describe('Entitlements (e2e)', () => {
       const body = registerResponse.body as AuthResponseDto;
       accessToken = body.accessToken;
       userId = body.user.id;
-    });
+    }, e2eSuiteBootBudgetMs(1));
 
     afterAll(async () => {
       await prisma.entitlement.deleteMany({ where: { userId } });
@@ -163,7 +164,7 @@ describe('Entitlements (e2e)', () => {
       const otherBody = otherRegisterResponse.body as AuthResponseDto;
       otherAccessToken = otherBody.accessToken;
       otherUserId = otherBody.user.id;
-    });
+    }, e2eSuiteBootBudgetMs(2));
 
     afterAll(async () => {
       await prisma.entitlement.deleteMany({ where: { userId } });

@@ -4,6 +4,7 @@ import request from 'supertest';
 import { App } from 'supertest/types';
 import { AppModule } from './../src/app.module';
 import { TRANSCODE_QUEUE } from './../src/transcode/transcode.types';
+import { e2eSuiteBootBudgetMs } from './../src/common/testing/e2e-boot-budget.helpers';
 
 interface ErrorResponseBody {
   statusCode: number;
@@ -84,7 +85,7 @@ describe('Health storage-readiness (e2e)', () => {
 
       app = moduleFixture.createNestApplication();
       await app.init();
-    });
+    }, e2eSuiteBootBudgetMs());
 
     afterAll(async () => {
       await app.close();
@@ -123,7 +124,7 @@ describe('Health storage-readiness (e2e)', () => {
 
       app = moduleFixture.createNestApplication();
       await app.init();
-    });
+    }, e2eSuiteBootBudgetMs());
 
     afterAll(async () => {
       await app.close();
@@ -213,7 +214,7 @@ describe('Health storage-readiness (e2e)', () => {
 
       app = moduleFixture.createNestApplication();
       await app.init();
-    });
+    }, e2eSuiteBootBudgetMs());
 
     afterAll(async () => {
       try {
@@ -280,7 +281,7 @@ describe('Health storage-readiness (e2e)', () => {
 
       app = moduleFixture.createNestApplication();
       await app.init();
-    });
+    }, e2eSuiteBootBudgetMs());
 
     afterAll(async () => {
       try {

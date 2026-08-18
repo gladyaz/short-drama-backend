@@ -46,6 +46,55 @@ import { bcryptTestBudgetMs } from './bcrypt-test-budget.helpers';
  * RULE FOR USING THIS: a derived budget may only ever RAISE an existing
  * explicit timeout, never lower it. A hand-set value chosen in response to a
  * real observed failure carries information this derivation does not.
+ *
+ * ---------------------------------------------------------------------
+ * HOW TO APPLY IT (Test-infrastructure hardening slice)
+ * ---------------------------------------------------------------------
+ *
+ * Prefer the PER-HOOK form, passing the budget as the hook's second
+ * argument:
+ *
+ *   beforeAll(async () => {
+ *     ...boot AppModule, register fixtures...
+ *   }, e2eSuiteBootBudgetMs(2));
+ *
+ * rather than a file-level `jest.setTimeout`. The defect this budget exists
+ * to remove is confined to the HOOK — a boot Jest allows 5000ms, whose
+ * overrun fails every test in the file at once, before a single assertion
+ * runs. A file-level call also widens every TEST's budget, which is a weaker
+ * hang detector for cases that do no booting at all. Two files do carry a
+ * file-level budget as well (`export.e2e-spec.ts`,
+ * `log-redaction.e2e-spec.ts`), because their individual TESTS drive real
+ * bcrypt work through the HTTP stack; each states its own reason locally.
+ *
+ * `it(name, fn, budget)` takes the same value as a third argument, which is
+ * how `dev-tools-boot-guard.e2e-spec.ts` — whose module compile happens
+ * inside the test rather than a hook — is covered.
+ *
+ * COUNTING THE ARGUMENT. Count real cost-factor-12 operations in the HOOK
+ * BODY, not in the file: `POST /auth/register` = 1 hash, `POST /auth/login`
+ * = 1 compare, `POST /dev/admin/grant-role` = 0 (it only updates a column).
+ * A hook that merely boots passes no argument at all.
+ *
+ * WHAT WAS RE-MEASURED FOR THIS SLICE. `MEASURED_COLD_APP_BOOT_MS` below is
+ * deliberately LEFT ALONE. Instrumenting the boot as its own spec file,
+ * replicated across eight workers inside a real full e2e gate on the same
+ * 8-core hardware, put `compile()` + `createNestApplication()` + `init()` at
+ * 470-814ms, and 1,387ms worst case with a full unit gate running
+ * concurrently — comfortably under the 4,400ms figure. The constant is not
+ * lowered to match, for the reason stated in the RULE above: a derived
+ * budget may only rise. The newer numbers are recorded here as
+ * corroboration that the existing budget has ample headroom, not as a
+ * reason to shrink it.
+ *
+ * NOT COVERED, deliberately. Suites that already carry an explicit
+ * `bcryptTestBudgetMs(8)` file-level budget (the auth family) are untouched:
+ * 10,800ms is roughly eight times their measured hook cost, so their hooks
+ * are not the inherited-default defect this slice fixes, and raising them to
+ * 13,200ms would be churn without evidence. The unit project's module-
+ * compiling `beforeEach` hooks are likewise out of scope here; several were
+ * observed timing out under the same deliberately overloaded reproduction,
+ * and that remains open.
  */
 
 /**

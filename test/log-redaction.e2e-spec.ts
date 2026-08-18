@@ -18,6 +18,28 @@ import {
   TEST_FIXTURE_NAMESPACE,
   fixtureEmail,
 } from './../src/common/testing/fixture-namespace.helpers';
+import { bcryptTestBudgetMs } from './../src/common/testing/bcrypt-test-budget.helpers';
+import { e2eSuiteBootBudgetMs } from './../src/common/testing/e2e-boot-budget.helpers';
+
+/**
+ * Test-infrastructure hardening slice: replaces Jest's inherited 5000ms
+ * default for the TESTS in this file, which was never sized for a suite
+ * whose cases register and log in through the real HTTP stack and therefore
+ * perform REAL cost-factor-12 bcrypt hashing. Unlike `export.e2e-spec.ts`,
+ * this suite was NOT observed failing in this slice's contention
+ * reproduction — it is budgeted because it has the same exposure (two real
+ * hashes per case, against Jest's 5000ms default), not because a failure was
+ * measured here.
+ *
+ * `bcryptTestBudgetMs(2)` — the most any single test here performs is a
+ * register plus a login — which lands on that helper's 10,000ms floor. See
+ * `src/common/testing/bcrypt-test-budget.helpers.ts`: a harness
+ * hang-detector budget, NOT a business-security timeout. No production
+ * timeout, token lifetime, lockout window, or throttle window is changed by
+ * this, and it is not a retry — a test that fails still fails, exactly once.
+ * The `beforeAll` below carries its own, separately derived boot budget.
+ */
+jest.setTimeout(bcryptTestBudgetMs(2));
 
 interface ErrorResponseBody {
   statusCode: number;
@@ -112,7 +134,7 @@ describe('Secret/token log + error-response redaction (e2e)', () => {
       // contract requires never leaks — check it directly against the env.
       process.env.DATABASE_URL ?? '',
     ].filter((value) => value.length > 0);
-  });
+  }, e2eSuiteBootBudgetMs());
 
   afterEach(() => {
     throttlerStorage.storage.clear();

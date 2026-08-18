@@ -8,6 +8,28 @@ import { AppExceptionFilter } from './../src/common/filters/app-exception.filter
 import { PrismaService } from './../src/prisma/prisma.service';
 import type { AuthResponseDto } from './../src/auth/auth.types';
 import type { UserExportDto } from './../src/export/export.types';
+import { bcryptTestBudgetMs } from './../src/common/testing/bcrypt-test-budget.helpers';
+import { e2eSuiteBootBudgetMs } from './../src/common/testing/e2e-boot-budget.helpers';
+
+/**
+ * Test-infrastructure hardening slice: replaces Jest's inherited 5000ms
+ * default for the TESTS in this file, which was never sized for a suite
+ * whose cases register accounts through the real HTTP stack and therefore
+ * perform REAL cost-factor-12 bcrypt hashing. Reproduced on this slice's
+ * baseline under a deliberately overloaded machine (a full unit gate and a
+ * full e2e gate running concurrently on 8 cores): four of its nine cases
+ * failed together with `Exceeded timeout of 5000 ms for a test`, none of
+ * them for a reason connected to what they assert.
+ *
+ * `bcryptTestBudgetMs(2)` — the most any single test here performs is a
+ * register plus a login — which lands on that helper's 10,000ms floor. See
+ * `src/common/testing/bcrypt-test-budget.helpers.ts`: a harness
+ * hang-detector budget, NOT a business-security timeout. No production
+ * timeout, token lifetime, lockout window, or throttle window is changed by
+ * this, and it is not a retry — a test that fails still fails, exactly once.
+ * The `beforeAll` below carries its own, separately derived boot budget.
+ */
+jest.setTimeout(bcryptTestBudgetMs(2));
 
 interface ErrorResponseBody {
   statusCode: number;
@@ -65,7 +87,7 @@ describe('User data export (e2e)', () => {
     prisma = moduleFixture.get<PrismaService>(PrismaService);
     throttlerStorage =
       moduleFixture.get<ThrottlerStorageService>(getStorageToken());
-  });
+  }, e2eSuiteBootBudgetMs());
 
   beforeEach(() => {
     throttlerStorage.storage.clear();

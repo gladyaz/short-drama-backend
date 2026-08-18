@@ -179,6 +179,83 @@ class ChangePasswordRaceLost extends Error {}
 type ChangePasswordRotationResult =
   { wonRace: true; response: AuthResponseDto } | { wonRace: false };
 
+/**
+ * CANONICAL AUTH LOCK ORDER (Auth lock-order hardening slice).
+ * ====================================================================
+ *
+ * THE INVARIANT — every multi-statement `prisma.$transaction` in this file
+ * that mutates account-scoped state MUST acquire a conflicting ROW LOCK on
+ * that account's `User` row as its FIRST database statement (see
+ * `AuthService.lockAccountRow`), and may only then touch the account's other
+ * tables, in this rank:
+ *
+ *     1. `User`
+ *     2. `PasswordResetToken`
+ *     3. `Session`
+ *     4. `AuthAuditEvent`
+ *
+ * WHY IT EXISTS — before this slice, the three account-mutating transactions
+ * disagreed about which resource they took first, and two of the resulting
+ * orderings were exact inversions of each other:
+ *
+ *     changePassword        Session -> User            (revoke-all, then set hash)
+ *     deleteAccount         Session -> User            (revoke-all, then delete row)
+ *     confirmPasswordReset  PasswordResetToken -> User -> Session
+ *
+ * `changePassword`'s `Session -> User` against `confirmPasswordReset`'s
+ * `User -> Session`, for the SAME account, is a textbook lock cycle: T1
+ * holds every `Session` row and waits for `User`; T2 holds `User` and waits
+ * for those `Session` rows. Postgres breaks it by killing one transaction
+ * with `40P01 deadlock detected`, which Prisma surfaces as a
+ * `PrismaClientUnknownRequestError` that nothing in this file catches — an
+ * opaque `500`, not any of the clean race paths these methods carefully
+ * define. `deleteAccount` x `confirmPasswordReset` forms the identical
+ * cycle. BOTH were reproduced deterministically against real Postgres 16
+ * (see the "lock-order" describe block in `auth.service.spec.ts`, whose
+ * FIRST test is a positive control that replays these pre-fix statement
+ * orders at the raw-SQL level and asserts `40P01` still occurs — so the
+ * post-fix tests below it cannot pass vacuously).
+ *
+ * WHY LOCKING `User` FIRST IS SUFFICIENT — the rank above is not enforced
+ * statement-by-statement, and does not need to be. Taking a conflicting
+ * `User`-row lock as statement one gives every account-mutating transaction
+ * MUTUAL EXCLUSION per account: at most one of them is ever past its first
+ * statement for a given `userId`, so two of them can never hold resources
+ * the other wants, so no cycle among them can form regardless of what they
+ * do afterwards. That is why `deleteAccount`'s closing `DELETE` (which
+ * re-touches rank 1 after ranks 3 and 4, and cascades back into ranks 2/3)
+ * is safe: every lock it needs is already held by the same transaction, and
+ * re-acquiring a held lock never waits.
+ *
+ * WHY THE REST OF THE FILE CANNOT REOPEN A CYCLE — the only other database
+ * work in this auth surface is SINGLE-statement (auto-commit) writes:
+ * `logout`/`logoutAll`/`revokeSession`/`refresh`'s CAS and sweeps (`Session`
+ * only), `requestPasswordReset` (`PasswordResetToken` only),
+ * `AccountLockoutService`'s upsert (`AccountLockout` only), and
+ * `AuthAuditService.emit` (`AuthAuditEvent` only). A single-statement
+ * transaction can block, and can be blocked, but it can never hold a lock on
+ * one table while waiting on another — so it cannot supply the second edge a
+ * cycle needs. `login` is the one other multi-statement transaction here and
+ * it already complies: it takes `User` (`FOR SHARE`) first, then `Session`.
+ *
+ * LOCK MODE — `FOR NO KEY UPDATE` is what `UPDATE "User" SET "passwordHash"`
+ * itself takes, so `changePassword`/`confirmPasswordReset` acquire exactly
+ * the lock they were going to need anyway, just earlier; it conflicts with
+ * `login`'s `FOR SHARE` (the existing, load-bearing superseded-credential
+ * guard) and with itself, but NOT with the `FOR KEY SHARE` that a concurrent
+ * `Session` INSERT takes for its foreign key — so no unrelated login/refresh
+ * is newly blocked. `deleteAccount` uses `FOR UPDATE` instead, matching what
+ * its own closing `DELETE` needs; that one does conflict with `FOR KEY
+ * SHARE`, which is correct and desirable (a concurrent session INSERT for an
+ * account being deleted now waits and then fails cleanly on the foreign key
+ * via `isSessionUserForeignKeyViolation`, instead of racing the delete).
+ *
+ * NO RETRY POLICY IS INTRODUCED. This slice removes the cycle; it
+ * deliberately does NOT add a `40P01` retry wrapper, and must not — a retry
+ * would hide a reintroduced inversion instead of failing loudly on it.
+ */
+type AccountRowLockMode = 'no-key-update' | 'update';
+
 @Injectable()
 export class AuthService {
   constructor(
@@ -188,6 +265,43 @@ export class AuthService {
     private readonly accountLockoutService: AccountLockoutService,
     private readonly authAuditService: AuthAuditService,
   ) {}
+
+  /**
+   * Acquires the canonical `User`-row lock that every account-mutating
+   * transaction in this file must take FIRST — see the "CANONICAL AUTH LOCK
+   * ORDER" block above this class for the full rationale and the deadlock it
+   * removes.
+   *
+   * Raw SQL because Prisma's typed client has no way to express a bare
+   * `SELECT ... FOR NO KEY UPDATE` / `FOR UPDATE` row lock. The lock clause
+   * is chosen by a closed union (never string-interpolated from input) and
+   * `userId` is a bound parameter, so this is not an injection surface.
+   * Identifiers are verified against `prisma/schema.prisma` (no
+   * `@@map`/`@map`), matching this file's existing `$queryRaw` precedent. No
+   * timestamp is read or written, so none of the `AT TIME ZONE 'UTC'`
+   * handling the other raw statements need applies here.
+   *
+   * Returns `false` when the row does not exist — a concurrent
+   * `deleteAccount()` removed the account. Every caller maps that to its own
+   * already-established "this account is gone" outcome rather than letting a
+   * later statement fail with an opaque error.
+   */
+  private async lockAccountRow(
+    tx: Prisma.TransactionClient,
+    userId: string,
+    mode: AccountRowLockMode,
+  ): Promise<boolean> {
+    const rows =
+      mode === 'update'
+        ? await tx.$queryRaw<{ id: string }[]>`
+            SELECT "id" FROM "User" WHERE "id" = ${userId} FOR UPDATE
+          `
+        : await tx.$queryRaw<{ id: string }[]>`
+            SELECT "id" FROM "User" WHERE "id" = ${userId} FOR NO KEY UPDATE
+          `;
+
+    return rows.length > 0;
+  }
 
   async register(
     dto: RegisterDto,
@@ -591,16 +705,20 @@ export class AuthService {
     // to cut off — keeps a live session across the password change.
     //
     // This is a COMPENSATING check rather than a `FOR SHARE` guard like
-    // `login`'s, and deliberately so: `refresh` already holds/held locks on
-    // `Session` rows, so taking a `User` lock here would give this method the
-    // order `Session -> User` while `confirmPasswordReset` runs
-    // `User -> Session`, forming exactly the kind of lock-ordering cycle
-    // (Postgres `40P01`) that `changePassword` needed three fix cycles to
-    // eliminate. Re-reading AFTER the insert takes no locks at all and cannot
-    // deadlock, and it is complete rather than merely narrower: the
-    // replacement row is committed by the time this read runs, so any
-    // password change that commits later is guaranteed to see it and revoke
-    // it through its own sweeps.
+    // `login`'s, and deliberately so. `refresh` is NOT a transaction: each of
+    // its statements above is its own auto-commit write, which is precisely
+    // what keeps it outside the lock graph entirely (a single-statement
+    // transaction can never hold a lock on one table while waiting on
+    // another — see the "CANONICAL AUTH LOCK ORDER" block above this class).
+    // Taking a `User` lock here would turn this method into a multi-statement
+    // transaction running `Session -> User`, the exact inversion of the
+    // canonical order every account-mutating transaction in this file now
+    // follows — reintroducing the `40P01` cycle that block exists to remove.
+    // Re-reading AFTER the insert takes no locks at all and cannot deadlock,
+    // and it is complete rather than merely narrower: the replacement row is
+    // committed by the time this read runs, so any password change that
+    // commits later is guaranteed to see it and revoke it through its own
+    // sweeps.
     const currentCredential = await this.prisma.user.findUnique({
       where: { id: user.id },
       select: { passwordHash: true },
@@ -1070,9 +1188,47 @@ export class AuthService {
       BCRYPT_COST_FACTOR,
     );
 
+    // Auth lock-order hardening slice: the replacement session's access
+    // token (`jwtService.signAsync`, an `await`ed, event-loop-yielding call),
+    // its refresh token (`randomBytes`) and both HMACs are computed HERE,
+    // BEFORE the transaction opens — mirroring what `login()` already does
+    // for the identical reason (see `prepareTokenPair`). Previously this
+    // whole block ran INSIDE the transaction via `issueTokensAndSession`,
+    // which was already undesirable (a `Session` row lock held across
+    // non-database work, on a path where `bcryptjs` is saturating the same
+    // single-threaded event loop) and becomes unacceptable now that the
+    // transaction below opens by locking the account's `User` row: every
+    // concurrent `confirmPasswordReset`/`deleteAccount`/`login` for this
+    // account would queue behind a JWT signature. The transaction is now
+    // pure database work, start to finish.
+    const tokens = await this.prepareTokenPair(user, context);
+
     let rotation: ChangePasswordRotationResult;
     try {
       rotation = await this.prisma.$transaction(async (tx) => {
+        // CANONICAL AUTH LOCK ORDER, step 1 (see the block above this class):
+        // take the account's `User` row lock BEFORE touching `Session`. This
+        // is the whole fix for the `changePassword` x `confirmPasswordReset`
+        // `40P01` cycle: this method used to run `Session -> User` while
+        // `confirmPasswordReset` ran `User -> Session`, so for one account
+        // each transaction could end up holding exactly what the other was
+        // waiting for. `FOR NO KEY UPDATE` is the same lock `tx.user.update`
+        // a few statements below takes anyway — acquiring it up front costs
+        // nothing extra and makes at most one account-mutating transaction
+        // per account able to proceed past this line.
+        if (!(await this.lockAccountRow(tx, userId, 'no-key-update'))) {
+          // A concurrent `deleteAccount()` removed the account between this
+          // method's own `findUnique` above and this lock. Same error the
+          // top of this method already throws for "the token verified but
+          // its `sub` no longer resolves to a real user" — not a new
+          // outcome, just the same one reached a few statements later.
+          throw new AppException(
+            AppErrorCode.INVALID_ACCESS_TOKEN,
+            'Invalid or expired access token',
+            HttpStatus.UNAUTHORIZED,
+          );
+        }
+
         // SINGLE raw-SQL statement revoking every non-revoked session for the
         // account, INCLUDING the current one — see this method's doc comment
         // for why this must be one statement (not a CAS-on-current followed
@@ -1168,7 +1324,7 @@ export class AuthService {
         // create. Passes `context` through (Phase 12, work unit 12B-B2) so
         // the replacement session's `userAgent`/`ipHash`/`lastUsedAt` are
         // populated exactly like any other freshly issued session.
-        const response = await this.issueTokensAndSession(user, context, tx);
+        const response = await this.persistSession(user, tokens, tx);
 
         // Final defensive sweep, still inside the SAME (winning) transaction,
         // immediately before it commits: catches the narrow remaining window
@@ -1184,17 +1340,16 @@ export class AuthService {
         // either order). This sweep uses the SAME unconditioned `revokedAt
         // IS NULL` predicate (no `createdAt` bound — the CRITICAL this
         // method's doc comment describes), excluding only the replacement
-        // session just created above (by its `refreshTokenHash`, computed
-        // locally — no extra round trip needed to look its id up). It is
-        // NOT a second win/loss check (that was already decided above); it
-        // is purely additive cleanup, so its `count` is intentionally
-        // ignored.
-        const newSessionHash = this.hashRefreshToken(response.refreshToken);
+        // session just created above (by the `refreshTokenHash` already
+        // computed outside this transaction — no extra round trip needed to
+        // look its id up). It is NOT a second win/loss check (that was
+        // already decided above); it is purely additive cleanup, so its
+        // `count` is intentionally ignored.
         await tx.session.updateMany({
           where: {
             userId,
             revokedAt: null,
-            refreshTokenHash: { not: newSessionHash },
+            refreshTokenHash: { not: tokens.refreshTokenHash },
           },
           data: { revokedAt: new Date() },
         });
@@ -1625,19 +1780,25 @@ export class AuthService {
    * The claim-and-invalidate-others statement, the password update, and the
    * `Session` revoke all run inside ONE `prisma.$transaction`, so a mid-way
    * failure cannot leave tokens consumed without the password having
-   * actually changed, or vice versa. Lock ordering against the `Session`
-   * revoke: that statement touches a completely different table, runs
-   * strictly after the `PasswordResetToken` statement has already fully
-   * executed (Prisma's interactive transaction callback awaits each
-   * statement in turn — this transaction never holds a partial lock on one
-   * table while blocked waiting on the other), and is itself the SAME
-   * single-unconditioned-by-id shape `AuthService.logoutAll` already uses
-   * safely for the identical reason documented there. A cross-table deadlock
-   * requires a CYCLE where each of two transactions holds a lock the other
-   * is waiting on; since neither statement here ever waits on a `Session`
-   * lock while holding a `PasswordResetToken` lock (or vice versa) — each
-   * table's statement completes before the next one starts — no such cycle
-   * can form. The token row is looked up and pre-validated
+   * actually changed, or vice versa.
+   *
+   * LOCK ORDERING (Auth lock-order hardening slice — this replaces an
+   * earlier, INCOMPLETE analysis that lived here). The earlier reasoning
+   * argued no cross-table cycle could form because this transaction never
+   * waits on a `Session` lock while holding a `PasswordResetToken` lock:
+   * each statement completes before the next begins. That is true and still
+   * is — but it only rules out a cycle between two copies of THIS method. It
+   * said nothing about the other direction, and that is where the real bug
+   * was: this transaction holds `User` (statement 2) and then waits for
+   * `Session` (statement 3), while `changePassword` and `deleteAccount` both
+   * held `Session` first and then waited for `User`. For a single account
+   * that is a genuine Postgres `40P01` cycle, reproduced deterministically
+   * against real Postgres 16 for BOTH pairings (see the "lock-order"
+   * describe block in `auth.service.spec.ts`). The fix is the `User`-row
+   * lock this transaction now takes as its FIRST statement — see the
+   * "CANONICAL AUTH LOCK ORDER" block above this class for the full
+   * invariant and why locking `User` first is sufficient. The token row is
+   * looked up and pre-validated
    * (existence/used/expiry) OUTSIDE the transaction purely to choose a
    * precise audit `reason` for the common case; the transaction's own
    * statement (which re-checks `usedAt IS NULL AND expiresAt > now` at the
@@ -1720,6 +1881,32 @@ export class AuthService {
     // entirely to the NEW statement below, not a change to any existing
     // one.)
     const claimed = await this.prisma.$transaction(async (tx) => {
+      // CANONICAL AUTH LOCK ORDER, step 1 (see the block above this class):
+      // take the account's `User` row lock BEFORE the `PasswordResetToken`
+      // claim below. This method already ran `User -> Session` internally,
+      // which was the opposite of `changePassword`'s and `deleteAccount`'s
+      // `Session -> User` — for one account, that pair of orderings is a
+      // genuine Postgres `40P01` cycle (both variants reproduced; see the
+      // "lock-order" describe block in `auth.service.spec.ts`). Hoisting the
+      // `User` lock to statement one makes this transaction and those two
+      // mutually exclusive per account, so neither can hold what the other
+      // waits for. `FOR NO KEY UPDATE` is exactly the lock `tx.user.update`
+      // below takes anyway.
+      //
+      // A missing row means a concurrent `deleteAccount()` removed the
+      // account. Its `onDelete: Cascade` took every `PasswordResetToken`
+      // this account owned with it, so the claim below would have found
+      // nothing to claim regardless: falling through to the SAME `return
+      // false` the lost-claim branch uses is the truthful outcome, not a
+      // special case — the caller gets the same generic
+      // `INVALID_PASSWORD_RESET_TOKEN` every other invalid-token rejection
+      // returns, with no new enumeration signal.
+      if (
+        !(await this.lockAccountRow(tx, resetToken.userId, 'no-key-update'))
+      ) {
+        return false;
+      }
+
       const claimedTokens = await tx.$queryRaw<{ id: string }[]>`
         UPDATE "PasswordResetToken"
         SET "usedAt" = ${now} AT TIME ZONE 'UTC'
@@ -1993,6 +2180,24 @@ export class AuthService {
 
     const now = new Date();
     await this.prisma.$transaction(async (tx) => {
+      // CANONICAL AUTH LOCK ORDER, step 1 (see the block above this class):
+      // take the account's `User` row lock BEFORE the session revoke below.
+      // This transaction used to run `Session -> ... -> User`, the exact
+      // inversion of `confirmPasswordReset`'s `User -> ... -> Session`, and
+      // the resulting `40P01` cycle was reproduced against real Postgres
+      // (see the "lock-order" describe block in `auth.service.spec.ts`).
+      // `FOR UPDATE` (not `FOR NO KEY UPDATE`) matches what this
+      // transaction's own closing `DELETE` needs — a key-affecting lock —
+      // so the row is locked once, in the right mode, at the right time.
+      //
+      // The return value is deliberately not branched on: a missing row
+      // means a concurrent `deleteAccount()` already removed this account,
+      // and every statement below is already a no-op-safe `updateMany` /
+      // `deleteMany` for that case. That is this method's documented
+      // idempotency contract ("by the time either caller's transaction
+      // returns, the account IS deleted either way"), unchanged.
+      await this.lockAccountRow(tx, userId, 'update');
+
       await tx.session.updateMany({
         where: { userId, revokedAt: null },
         data: { revokedAt: now },

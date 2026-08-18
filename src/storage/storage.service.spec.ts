@@ -421,6 +421,123 @@ describe('StorageService', () => {
         { key: 'admin-media/x/hls/v1/master.m3u8', lastModified: undefined },
       ]);
     });
+
+    it('never asks for a continuation token, so its single-page contract is unchanged', async () => {
+      mockClient.send.mockResolvedValue({
+        Contents: [{ Key: 'admin-media/x/hls/v1/master.m3u8' }],
+        IsTruncated: true,
+        NextContinuationToken: 'more-pages-exist',
+      });
+
+      // Even against a TRUNCATED response, this method still issues exactly
+      // one request and simply returns that page's entries — the behavior
+      // `TranscodeJanitorService` has always relied on.
+      const result = await service.listObjectKeysByPrefix('admin-media/x/hls/');
+
+      expect(result).toHaveLength(1);
+      expect(mockClient.send).toHaveBeenCalledTimes(1);
+      const command = mockClient.send.mock.calls[0][0] as ListObjectsV2Command;
+      expect(command.input.ContinuationToken).toBeUndefined();
+    });
+  });
+
+  describe('listObjectPageByPrefix (Series cover orphan cleanup slice)', () => {
+    it('passes the caller-supplied continuation token straight through', async () => {
+      mockClient.send.mockResolvedValue({ Contents: [] });
+
+      await service.listObjectPageByPrefix('admin-series/', {
+        maxKeys: 250,
+        continuationToken: 'opaque-token',
+      });
+
+      const command = mockClient.send.mock.calls[0][0] as ListObjectsV2Command;
+      expect(command).toBeInstanceOf(ListObjectsV2Command);
+      expect(command.input).toEqual({
+        Bucket: 'mock-bucket',
+        Prefix: 'admin-series/',
+        MaxKeys: 250,
+        ContinuationToken: 'opaque-token',
+      });
+    });
+
+    it('defaults MaxKeys and omits the token on a first page', async () => {
+      mockClient.send.mockResolvedValue({ Contents: [] });
+
+      await service.listObjectPageByPrefix('admin-series/');
+
+      const command = mockClient.send.mock.calls[0][0] as ListObjectsV2Command;
+      expect(command.input.MaxKeys).toBe(DEFAULT_LIST_MAX_KEYS);
+      expect(command.input.ContinuationToken).toBeUndefined();
+    });
+
+    it('returns the next token when the response is truncated', async () => {
+      const lastModified = new Date('2026-01-01T00:00:00.000Z');
+      mockClient.send.mockResolvedValue({
+        Contents: [
+          { Key: 'admin-series/a/cover/uuid', LastModified: lastModified },
+        ],
+        IsTruncated: true,
+        NextContinuationToken: 'page-2',
+      });
+
+      expect(await service.listObjectPageByPrefix('admin-series/')).toEqual({
+        entries: [{ key: 'admin-series/a/cover/uuid', lastModified }],
+        nextContinuationToken: 'page-2',
+      });
+    });
+
+    it('returns NO token on the final page, which is what terminates a paging loop', async () => {
+      mockClient.send.mockResolvedValue({
+        Contents: [{ Key: 'admin-series/a/cover/uuid' }],
+        IsTruncated: false,
+        NextContinuationToken: 'stale-token-that-must-be-ignored',
+      });
+
+      const page = await service.listObjectPageByPrefix('admin-series/');
+
+      expect(page.nextContinuationToken).toBeUndefined();
+    });
+
+    it.each([
+      ['a truncated response carrying no token at all', { IsTruncated: true }],
+      [
+        'a truncated response carrying an empty token',
+        { IsTruncated: true, NextContinuationToken: '' },
+      ],
+    ])(
+      'returns no token for %s, so a paging loop terminates instead of repeating',
+      async (_label, response) => {
+        mockClient.send.mockResolvedValue({ Contents: [], ...response });
+
+        const page = await service.listObjectPageByPrefix('admin-series/');
+
+        expect(page.nextContinuationToken).toBeUndefined();
+      },
+    );
+
+    it('returns an empty page when Contents is absent', async () => {
+      mockClient.send.mockResolvedValue({});
+
+      expect(await service.listObjectPageByPrefix('admin-series/')).toEqual({
+        entries: [],
+        nextContinuationToken: undefined,
+      });
+    });
+
+    it('filters out entries with no Key', async () => {
+      mockClient.send.mockResolvedValue({
+        Contents: [
+          { LastModified: new Date() },
+          { Key: 'admin-series/a/cover/uuid' },
+        ],
+      });
+
+      const page = await service.listObjectPageByPrefix('admin-series/');
+
+      expect(page.entries).toEqual([
+        { key: 'admin-series/a/cover/uuid', lastModified: undefined },
+      ]);
+    });
   });
 
   describe('buildPublicUrl', () => {

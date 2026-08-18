@@ -21,7 +21,9 @@ import {
 import {
   CreatePresignedGetUrlOptions,
   CreatePresignedPutUrlOptions,
+  ListObjectPageOptions,
   ObjectListEntry,
+  ObjectListPage,
   PresignedUrlResult,
   StorageObjectMetadata,
 } from './storage.types';
@@ -227,22 +229,69 @@ export class StorageService {
     prefix: string,
     maxKeys: number = DEFAULT_LIST_MAX_KEYS,
   ): Promise<ObjectListEntry[]> {
+    const page = await this.listObjectPageByPrefix(prefix, { maxKeys });
+    return page.entries;
+  }
+
+  /**
+   * Slice "SERIES COVER ORPHAN CLEANUP LIFECYCLE": the paginated form of
+   * `listObjectKeysByPrefix` above — ONE bounded `ListObjectsV2` page plus,
+   * when the provider says more remain, the opaque token needed to ask for
+   * the next one. `listObjectKeysByPrefix` is now a thin single-page wrapper
+   * over THIS method (one `ListObjectsV2Command` construction site, not two),
+   * so its behavior — including `TranscodeJanitorService`'s use of it — is
+   * byte-for-byte unchanged: it simply never passes or reads a token.
+   *
+   * WHY THIS EXISTS. The single-page-only shape is a correct bound for the
+   * janitor, whose enumeration is scoped to ONE media row's own
+   * `admin-media/<id>/hls/` prefix (tens of objects). The Series-cover orphan
+   * sweep enumerates the WHOLE `admin-series/` namespace instead — it MUST,
+   * because a hard-deleted `Series` row leaves cover objects behind with no
+   * row left to drive a per-series enumeration from — and that namespace
+   * grows with every cover upload ever made. Silently seeing only the first
+   * `maxKeys` objects of it would be an invisible coverage hole, so the
+   * caller is given a real token to page with, and its own explicit page
+   * ceiling to stop at.
+   *
+   * `nextContinuationToken` is returned ONLY when the response is BOTH
+   * `IsTruncated` AND carries a non-empty `NextContinuationToken`. A
+   * truncated response with no usable token (which a well-behaved S3/R2
+   * endpoint never sends) resolves to `undefined` rather than to the token
+   * we were already given — a caller looping "while a token is present"
+   * therefore terminates instead of re-requesting the same page forever.
+   */
+  async listObjectPageByPrefix(
+    prefix: string,
+    options?: ListObjectPageOptions,
+  ): Promise<ObjectListPage> {
     const result = (await this.client.send(
       new ListObjectsV2Command({
         Bucket: this.storageConfig.bucket,
         Prefix: prefix,
-        MaxKeys: maxKeys,
+        MaxKeys: options?.maxKeys ?? DEFAULT_LIST_MAX_KEYS,
+        ContinuationToken: options?.continuationToken,
       }),
     )) as {
       Contents?: { Key?: string; LastModified?: Date }[];
+      IsTruncated?: boolean;
+      NextContinuationToken?: string;
     };
 
-    return (result.Contents ?? [])
+    const entries = (result.Contents ?? [])
       .filter(
         (entry): entry is { Key: string; LastModified?: Date } =>
           typeof entry.Key === 'string',
       )
       .map((entry) => ({ key: entry.Key, lastModified: entry.LastModified }));
+
+    const nextContinuationToken =
+      result.IsTruncated === true &&
+      typeof result.NextContinuationToken === 'string' &&
+      result.NextContinuationToken.length > 0
+        ? result.NextContinuationToken
+        : undefined;
+
+    return { entries, nextContinuationToken };
   }
 
   /**

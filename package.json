@@ -22,6 +22,7 @@
     "db:seed": "ts-node --compiler-options '{\"module\":\"CommonJS\"}' prisma/seed.ts",
     "media:fixtures": "ts-node --compiler-options '{\"module\":\"CommonJS\"}' scripts/generate-media-fixtures.ts",
     "retention": "ts-node --compiler-options '{\"module\":\"CommonJS\"}' scripts/run-retention.ts",
+    "maintenance:series-cover-orphans": "ts-node --compiler-options '{\"module\":\"CommonJS\"}' scripts/run-series-cover-orphans.ts",
     "hls:local-proof": "ts-node --compiler-options '{\"module\":\"CommonJS\"}' scripts/hls-local-proof.ts"
   },
   "dependencies": {

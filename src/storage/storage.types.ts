@@ -45,3 +45,27 @@ export interface ObjectListEntry {
   key: string;
   lastModified?: Date;
 }
+
+/**
+ * Slice "SERIES COVER ORPHAN CLEANUP LIFECYCLE": options for
+ * `StorageService.listObjectPageByPrefix` — ONE page of a `ListObjectsV2`
+ * enumeration. `continuationToken` is whatever the PREVIOUS page returned as
+ * `nextContinuationToken`; omitting it starts at the beginning of `prefix`.
+ */
+export interface ListObjectPageOptions {
+  maxKeys?: number;
+  continuationToken?: string;
+}
+
+/**
+ * Slice "SERIES COVER ORPHAN CLEANUP LIFECYCLE": one page of a prefix
+ * enumeration. `nextContinuationToken` is present ONLY when the provider
+ * reported the listing as truncated AND handed back a usable token — a
+ * caller loops while it is present (under its own page bound) and stops the
+ * instant it is `undefined`, which is what makes "no infinite listing loop"
+ * a property of the return shape rather than of caller discipline alone.
+ */
+export interface ObjectListPage {
+  entries: ObjectListEntry[];
+  nextContinuationToken?: string;
+}

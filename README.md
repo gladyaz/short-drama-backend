@@ -1463,6 +1463,66 @@ on is opt-in at every layer: registering the job at all, requesting
 destructive behavior from it, and the underlying database-identity/
 `NODE_ENV` guard that request must still pass.
 
+## Series cover orphan cleanup
+
+A bounded maintenance sweep that reclaims Cloudflare R2 objects under the
+Series-cover namespace (`admin-series/<seriesId>/cover/<uuid>`) which no
+`Series` row references any more. Full contract:
+[`docs/series-cover-orphan-cleanup.md`](docs/series-cover-orphan-cleanup.md).
+
+The Series cover contract deliberately chose correctness over aggressive
+cleanup — an abandoned upload, a superseded intent, a failed completion, a
+replaced cover, and a hard-deleted series all leave objects behind on
+purpose. This sweep is the deferred other half.
+
+**Dry run is the default and removes nothing:**
+
+```bash
+npm run maintenance:series-cover-orphans
+```
+
+It prints each candidate's key, series, age, and reason, plus exact counters
+(`scanned`, `protected`, `tooRecent`, `eligible`, `deleted`, `failed`,
+`skippedOnRecheck`, ...). Keys only — never a presigned URL or credential.
+
+**Apply is destructive and doubly gated:**
+
+```bash
+NODE_ENV=development \
+SERIES_COVER_ORPHAN_APPLY_BUCKET="$OBJECT_STORAGE_BUCKET" \
+npm run maintenance:series-cover-orphans -- --apply
+```
+
+`NODE_ENV` must be exactly `development`/`test` (a fail-closed allowlist),
+**and** `SERIES_COVER_ORPHAN_APPLY_BUCKET` must exactly equal
+`OBJECT_STORAGE_BUCKET` — the storage analogue of the retention guard's
+`DATABASE_URL`/`DATABASE_URL_TEST` identity check, so `--apply` can never act
+on whatever bucket the ambient environment happens to point at. The gate runs
+before the Nest context, `PrismaService`, or the `S3Client` is constructed.
+
+**Safety properties**, all covered by tests:
+
+- An object referenced by ANY `Series.coverImageKey` or
+  `pendingCoverImageKey` is never a candidate, at any age — checked from a
+  page-scoped snapshot AND re-checked immediately before each delete, both
+  queried by key across all series (the raw-key PATCH surface allows
+  cross-series references).
+- A 24-hour grace window with **no env override** — a source constant, so it
+  cannot be shortened from outside the source tree.
+- Bounded enumeration: 1000 keys per page, 100 pages max, pages processed and
+  discarded one at a time. A truncated listing is reported loudly, never
+  silently.
+- A single delete failure is logged and counted; the sweep continues, writes
+  nothing to the database, and the next run retries.
+
+**Not scheduled.** Unlike retention, there is no cron registration and no
+`SERIES_COVER_ORPHAN_SCHEDULE_*` variable — the CLI is the only invocation
+surface, and `SeriesCoverOrphanCliModule` is not imported by `AppModule`.
+Dry-run inspection comes first; scheduling is a separate, later decision.
+
+**This sweep has never been run destructively against any real bucket.**
+
+
 ## Interactions & Progress API (Phase 9)
 
 Backed by two new Prisma tables added in work unit 9-B1:

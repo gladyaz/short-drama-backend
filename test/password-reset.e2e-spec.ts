@@ -436,6 +436,115 @@ describe('Auth password reset (e2e)', () => {
      * (success) and request+confirm (already-used failure) code paths, not
      * merely that the HTTP response omits it.
      */
+    /**
+     * Password-reset invalidation slice, over the real HTTP surface: a
+     * successful `POST /auth/change-password` ends the account's previous
+     * credential generation, so a reset token issued before it can no longer
+     * confirm. Before this slice this exact sequence SUCCEEDED and re-wrote
+     * the password the owner had just set.
+     */
+    it('a reset token issued before a successful change-password can no longer confirm, and is indistinguishable from an unknown token', async () => {
+      const email = uniqueEmail('stale-after-change');
+      const oldPassword = 'correct-horse-battery';
+      const changedPassword = 'changed-password-e2e-1';
+
+      const registerResponse = await request(app.getHttpServer())
+        .post('/auth/register')
+        .send({ email, password: oldPassword })
+        .expect(HttpStatus.CREATED);
+      const registered = registerResponse.body as AuthResponseDto;
+
+      const staleToken = await requestRawToken(email);
+
+      await request(app.getHttpServer())
+        .post('/auth/change-password')
+        .set('Authorization', `Bearer ${registered.accessToken}`)
+        .send({
+          currentPassword: oldPassword,
+          newPassword: changedPassword,
+          refreshToken: registered.refreshToken,
+        })
+        .expect(HttpStatus.OK);
+
+      const staleResponse = await request(app.getHttpServer())
+        .post('/auth/password-reset/confirm')
+        .send({ token: staleToken, newPassword: 'attacker-supplied-e2e-1' })
+        .expect(HttpStatus.UNAUTHORIZED);
+      const staleBody = staleResponse.body as ErrorResponseBody;
+      expect(staleBody.code).toBe('INVALID_PASSWORD_RESET_TOKEN');
+
+      // Byte-identical to the response a token that never existed gets —
+      // nothing in the client-facing contract reveals that this particular
+      // token died because the account's password was changed.
+      const unknownResponse = await request(app.getHttpServer())
+        .post('/auth/password-reset/confirm')
+        .set('User-Agent', `${emailPrefix}-stale-after-change-unknown-marker`)
+        .send({
+          token: 'this-token-was-never-issued',
+          newPassword: 'attacker-supplied-e2e-1',
+        })
+        .expect(HttpStatus.UNAUTHORIZED);
+      expect(staleResponse.body).toEqual(unknownResponse.body);
+
+      // The rejected confirm changed nothing: the owner's new password is
+      // the account's password.
+      await request(app.getHttpServer())
+        .post('/auth/login')
+        .send({ email, password: 'attacker-supplied-e2e-1' })
+        .expect(HttpStatus.UNAUTHORIZED);
+      await request(app.getHttpServer())
+        .post('/auth/login')
+        .send({ email, password: changedPassword })
+        .expect(HttpStatus.OK);
+    });
+
+    it('recovery still works after a change-password: a token requested afterwards confirms normally', async () => {
+      const email = uniqueEmail('recovery-after-change');
+      const oldPassword = 'correct-horse-battery';
+      const changedPassword = 'changed-password-e2e-2';
+      const recoveredPassword = 'recovered-password-e2e-2';
+
+      const registerResponse = await request(app.getHttpServer())
+        .post('/auth/register')
+        .send({ email, password: oldPassword })
+        .expect(HttpStatus.CREATED);
+      const registered = registerResponse.body as AuthResponseDto;
+
+      const staleToken = await requestRawToken(email);
+
+      await request(app.getHttpServer())
+        .post('/auth/change-password')
+        .set('Authorization', `Bearer ${registered.accessToken}`)
+        .send({
+          currentPassword: oldPassword,
+          newPassword: changedPassword,
+          refreshToken: registered.refreshToken,
+        })
+        .expect(HttpStatus.OK);
+
+      // The point of this test: killing the old generation's tokens must not
+      // disable account recovery itself.
+      const freshToken = await requestRawToken(email);
+      expect(freshToken).not.toBe(staleToken);
+
+      await request(app.getHttpServer())
+        .post('/auth/password-reset/confirm')
+        .send({ token: freshToken, newPassword: recoveredPassword })
+        .expect(HttpStatus.OK)
+        .expect({ success: true });
+
+      await request(app.getHttpServer())
+        .post('/auth/login')
+        .send({ email, password: recoveredPassword })
+        .expect(HttpStatus.OK);
+
+      // ...and the stale token is still dead afterwards.
+      await request(app.getHttpServer())
+        .post('/auth/password-reset/confirm')
+        .send({ token: staleToken, newPassword: 'attacker-supplied-e2e-2' })
+        .expect(HttpStatus.UNAUTHORIZED);
+    });
+
     it('never writes the raw token to any log line across a full request+confirm(+reuse) cycle', async () => {
       const email = uniqueEmail('no-log-leak');
       await request(app.getHttpServer())

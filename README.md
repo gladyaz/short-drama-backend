@@ -692,6 +692,25 @@ stays authenticated with fresh credentials) and:
   require serializing `login()`'s password check against a lock
   `changePassword()` holds — deliberately not attempted in this work unit,
   tracked as a follow-up.
+- **Invalidates every outstanding password-reset token for the account**
+  (password-reset invalidation slice). A successful password change opens a
+  new credential generation, and a recovery artifact minted under the old one
+  may not replace the new credential: every still-usable `PasswordResetToken`
+  row is marked `usedAt` in the SAME transaction as the password update, so a
+  reset link issued before the change (e.g. one an attacker captured) stops
+  working the moment the account owner changes the password. Previously such
+  a token stayed usable for its full 1-hour TTL and could overwrite the
+  brand-new password. Three properties of this are deliberate and tested:
+  a FAILED change (wrong `currentPassword`, unusable `refreshToken`, or a
+  lost session-rotation race) invalidates **nothing** — so a stolen access
+  token cannot be used to destroy the owner's recovery path; an
+  ALREADY-EXPIRED token is left untouched (it is unusable either way, and
+  stamping it would rewrite the audit trail's `expired` reason into
+  `already_used`); and requesting a **new** reset afterwards works normally —
+  recovery is never disabled, only the previous generation's artifacts are.
+  No new audit event is emitted: the invalidation is a documented side effect
+  of `change_password_success` (a per-token trail would leak how many reset
+  requests the account had outstanding).
 - Never returns a session record, a `refreshTokenHash`, or any other
   hash/secret in the response body.
 - The old (pre-change) refresh token is now revoked — reusing it via
@@ -841,6 +860,30 @@ way" precedent, applied here at the "does this email exist" layer:
   endpoint's own "always returns 202" contract for every environment except
   a developer's own machine with the flag on. The route always executes
   normally; only the `devToken` field is conditionally attached.
+- **The token is committed on exactly one side of the credential boundary**
+  (password-reset invalidation slice). The INSERT runs inside a transaction
+  that first takes the account's `User` row lock (`FOR SHARE` — the same mode
+  `POST /auth/login` uses, since this route never writes the `User` row), so
+  it is ordered against `change-password` / `password-reset/confirm` /
+  account deletion: a token is either committed strictly BEFORE a password
+  change (and is therefore invalidated by it) or strictly AFTER it (and is
+  therefore legitimately usable). Previously this was a bare auto-commit
+  INSERT with no ordering at all, so a token could commit while a
+  `change-password` transaction was still mid-flight — issued while the old
+  password was current, yet surviving the change. The lock is deliberately
+  the weak `FOR SHARE`: it conflicts with the three credential mutators but
+  not with itself or with `login`, so concurrent logins and concurrent reset
+  requests for the same account are never newly serialized. A side effect is
+  that a request racing an account deletion now resolves through this route's
+  normal "no account" path instead of failing on a foreign key. Residual, and
+  shared with `POST /auth/login`'s existing `FOR SHARE` guard rather than new
+  to this route: the wait counts against Prisma's default 5s interactive-
+  transaction budget, so pathological lock contention on one account could in
+  principle surface as a `500` instead of the contracted `202`. All three
+  credential mutators do their bcrypt work OUTSIDE their transactions, so the
+  lock is only ever held across a handful of local database round trips —
+  reaching that budget is not attacker-reachable (it needs concurrent
+  credential mutations on the same account, which need the password).
 - **No real email or SMS is ever sent this phase** — that is an explicit,
   hard-scoped-out integration for a future phase. In production (or any
   environment with `DEV_TOOLS_ENABLED` off), the caller has no way to
@@ -879,9 +922,11 @@ On success, returns `200 { "success": true }` and:
   account in.
 
 Errors: `401 INVALID_PASSWORD_RESET_TOKEN` — used identically whether the
-token does not exist, was already used, or has expired (never distinguished,
-mirroring the `INVALID_CREDENTIALS`/`INVALID_REFRESH_TOKEN` anti-enumeration
-precedent); `400` for a `newPassword` that fails the length policy.
+token does not exist, was already used, has expired, or was invalidated by a
+successful `POST /auth/change-password` (never distinguished, mirroring the
+`INVALID_CREDENTIALS`/`INVALID_REFRESH_TOKEN` anti-enumeration precedent — a
+token killed by a password change must not be tellable apart from one that
+never existed, in the response body or in its timing); `400` for a `newPassword` that fails the length policy.
 Rate-limited to **5 requests per minute per IP** (the SAME threshold as
 `POST /auth/login`).
 
@@ -895,7 +940,14 @@ kind of value (an opaque, high-entropy bearer secret checked only via a
 keyed-hash match, never bcrypt), so they share the same hashing key rather
 than this phase minting a fourth long-lived auth secret. `usedAt` (nullable,
 set exactly once) enforces single-use; `expiresAt` bounds the token to a
-1-hour window independently of use. `onDelete: Cascade` — an outstanding
+1-hour window independently of use. `usedAt` is written by THREE paths, all
+meaning "this token is spent": the confirm that consumed it, that same
+confirm's invalidation of the account's other outstanding tokens, and (added
+by the password-reset invalidation slice) a successful
+`POST /auth/change-password`. No `revokedAt`/`generation`/`status` column was
+added — the existing single-use field already expresses invalidation exactly,
+so this required **no schema migration**, and the retention sweep below
+already treats `usedAt`-stamped rows as collectable. `onDelete: Cascade` — an outstanding
 reset token for a deleted account is discarded along with it.
 
 ### Known gaps in the Auth API

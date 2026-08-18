@@ -56,6 +56,16 @@ export const AUTH_AUDIT_METADATA_ALLOWLIST = {
    * revoked, and the current session's own token pair was rotated (see
    * DECISIONS.md "Phase 12 ... approved..." entry, decision 7). No metadata
    * needed.
+   *
+   * Password-reset invalidation slice: this event ALSO covers the
+   * invalidation of every outstanding `PasswordResetToken` for the account,
+   * which a successful change now performs in the same transaction. That is
+   * deliberately recorded as a side effect of this one event rather than as
+   * its own event or a per-token row: the invalidation cannot happen without
+   * a successful change (same transaction, rolled back together), and a
+   * per-token trail would add noise whose only distinguishing content —
+   * how many reset requests the account had outstanding — is exactly what
+   * an audit reader does not need and an audit-log leak should not carry.
    */
   change_password_success: [],
   /**
@@ -105,7 +115,12 @@ export const AUTH_AUDIT_METADATA_ALLOWLIST = {
   /**
    * `POST /auth/password-reset/confirm` was refused. `reason` distinguishes
    * the internal cause (`token_not_found` | `already_used` | `expired` |
-   * `claim_failed`) for operator visibility — mirroring
+   * `claim_failed`) for operator visibility. Password-reset invalidation
+   * slice: a token killed by a successful `changePassword` reports the
+   * EXISTING `already_used` reason (it is `usedAt`-stamped exactly like a
+   * consumed one) — deliberately no new `reason` value, since a distinct one
+   * would let an operator-facing enum drift into a recovery-state oracle if
+   * it ever surfaced — mirroring
    * `change_password_failed`'s/`login_failed`'s existing "generic client
    * response, disambiguated audit reason" precedent. The client-facing
    * error is always the same generic `INVALID_PASSWORD_RESET_TOKEN`

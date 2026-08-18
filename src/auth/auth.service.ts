@@ -230,13 +230,15 @@ type ChangePasswordRotationResult =
  * WHY THE REST OF THE FILE CANNOT REOPEN A CYCLE — the only other database
  * work in this auth surface is SINGLE-statement (auto-commit) writes:
  * `logout`/`logoutAll`/`revokeSession`/`refresh`'s CAS and sweeps (`Session`
- * only), `requestPasswordReset` (`PasswordResetToken` only),
- * `AccountLockoutService`'s upsert (`AccountLockout` only), and
+ * only), `AccountLockoutService`'s upsert (`AccountLockout` only), and
  * `AuthAuditService.emit` (`AuthAuditEvent` only). A single-statement
  * transaction can block, and can be blocked, but it can never hold a lock on
  * one table while waiting on another — so it cannot supply the second edge a
- * cycle needs. `login` is the one other multi-statement transaction here and
- * it already complies: it takes `User` (`FOR SHARE`) first, then `Session`.
+ * cycle needs. The two other multi-statement transactions here both comply
+ * with the rank above: `login` takes `User` (`FOR SHARE`) first, then
+ * `Session`; `requestPasswordReset` (password-reset invalidation slice —
+ * previously a bare auto-commit INSERT) takes `User` (`FOR SHARE`) first,
+ * then `PasswordResetToken`, i.e. rank 1 -> rank 2.
  *
  * LOCK MODE — `FOR NO KEY UPDATE` is what `UPDATE "User" SET "passwordHash"`
  * itself takes, so `changePassword`/`confirmPasswordReset` acquire exactly
@@ -249,12 +251,33 @@ type ChangePasswordRotationResult =
  * SHARE`, which is correct and desirable (a concurrent session INSERT for an
  * account being deleted now waits and then fails cleanly on the foreign key
  * via `isSessionUserForeignKeyViolation`, instead of racing the delete).
+ * `login` and `requestPasswordReset` use the weaker `FOR SHARE`: neither
+ * writes the `User` row, and both only need to be ORDERED against the three
+ * credential mutators — `FOR SHARE` conflicts with `FOR NO KEY UPDATE`/`FOR
+ * UPDATE` (so it is), while staying compatible with itself (so two logins,
+ * two reset requests, or a login and a reset request for the same account
+ * never serialize against each other).
+ *
+ * THE CREDENTIAL-GENERATION COROLLARY (password-reset invalidation slice).
+ * A successful password mutation opens a NEW credential generation, and no
+ * recovery artifact minted under the previous one may survive into it:
+ * `changePassword` and `confirmPasswordReset` both mark every outstanding
+ * `PasswordResetToken` for the account `usedAt` inside the SAME transaction
+ * that writes the new `passwordHash`. That guarantee is only as strong as
+ * the boundary it is measured against, which is why `requestPasswordReset`
+ * had to stop being an unsynchronized auto-commit INSERT: a token inserted
+ * while a `changePassword` transaction was mid-flight (after its
+ * invalidation statement, before its COMMIT) belonged to the OLD generation
+ * yet outlived it. Taking the rank-1 `User` lock first makes every reset
+ * token land unambiguously on one side of the boundary — issued strictly
+ * before the password change (and therefore invalidated by it) or strictly
+ * after it (and therefore legitimately usable).
  *
  * NO RETRY POLICY IS INTRODUCED. This slice removes the cycle; it
  * deliberately does NOT add a `40P01` retry wrapper, and must not — a retry
  * would hide a reintroduced inversion instead of failing loudly on it.
  */
-type AccountRowLockMode = 'no-key-update' | 'update';
+type AccountRowLockMode = 'no-key-update' | 'update' | 'share';
 
 @Injectable()
 export class AuthService {
@@ -273,7 +296,8 @@ export class AuthService {
    * removes.
    *
    * Raw SQL because Prisma's typed client has no way to express a bare
-   * `SELECT ... FOR NO KEY UPDATE` / `FOR UPDATE` row lock. The lock clause
+   * `SELECT ... FOR NO KEY UPDATE` / `FOR UPDATE` / `FOR SHARE` row lock.
+   * The lock clause
    * is chosen by a closed union (never string-interpolated from input) and
    * `userId` is a bound parameter, so this is not an injection surface.
    * Identifiers are verified against `prisma/schema.prisma` (no
@@ -291,15 +315,23 @@ export class AuthService {
     userId: string,
     mode: AccountRowLockMode,
   ): Promise<boolean> {
-    const rows =
-      mode === 'update'
-        ? await tx.$queryRaw<{ id: string }[]>`
-            SELECT "id" FROM "User" WHERE "id" = ${userId} FOR UPDATE
-          `
-        : await tx.$queryRaw<{ id: string }[]>`
-            SELECT "id" FROM "User" WHERE "id" = ${userId} FOR NO KEY UPDATE
-          `;
+    if (mode === 'update') {
+      const rows = await tx.$queryRaw<{ id: string }[]>`
+        SELECT "id" FROM "User" WHERE "id" = ${userId} FOR UPDATE
+      `;
+      return rows.length > 0;
+    }
 
+    if (mode === 'share') {
+      const rows = await tx.$queryRaw<{ id: string }[]>`
+        SELECT "id" FROM "User" WHERE "id" = ${userId} FOR SHARE
+      `;
+      return rows.length > 0;
+    }
+
+    const rows = await tx.$queryRaw<{ id: string }[]>`
+      SELECT "id" FROM "User" WHERE "id" = ${userId} FOR NO KEY UPDATE
+    `;
     return rows.length > 0;
   }
 
@@ -1097,6 +1129,54 @@ export class AuthService {
    * elsewhere in this file — not new to this fix, and not part of this
    * finding.
    *
+   * OUTSTANDING RESET TOKENS ARE INVALIDATED (password-reset invalidation
+   * slice). A successful password change opens a new credential generation,
+   * so every still-usable `PasswordResetToken` for this account is marked
+   * `usedAt` inside the SAME transaction that writes the new hash — see the
+   * "CREDENTIAL-GENERATION COROLLARY" in the canonical lock-order block
+   * above this class. Before this slice a reset token issued BEFORE a
+   * successful change survived it and could still replace the brand-new
+   * password afterwards; that was a deliberate, documented carve-out of the
+   * lock-order slice (a policy question it was not scoped to settle), and
+   * this slice settles it in favour of the stronger invariant.
+   *
+   * Three properties of the placement are load-bearing:
+   *   1. It runs INSIDE the transaction, AFTER the `User` row lock (rank 1
+   *      -> rank 2 of the canonical order) and after `bcrypt.compare` has
+   *      already accepted `currentPassword` outside it. A FAILED password
+   *      change — wrong current password, unusable refresh token, a lost
+   *      revoke-all race — therefore never invalidates anything: the first
+   *      two throw before the transaction opens at all, and the third throws
+   *      `ChangePasswordRaceLost` inside it, which rolls this statement back
+   *      along with everything else the losing attempt touched.
+   *   2. The predicate is `usedAt IS NULL AND expiresAt > now` — the same
+   *      "currently usable" set `confirmPasswordReset`'s own claim statement
+   *      targets. An ALREADY-expired token is deliberately left untouched:
+   *      it is unusable either way, and stamping `usedAt` on it would
+   *      silently reclassify a later confirm's audit `reason` from `expired`
+   *      to `already_used` for no security gain. `now` is this method's
+   *      existing pre-bcrypt timestamp, so the predicate is evaluated
+   *      against an instant slightly EARLIER than the commit — which WIDENS
+   *      the invalidated set (a token expiring during the ~600ms bcrypt
+   *      window is swept too) rather than narrowing it. That is the safe
+   *      direction: it can never leave a still-usable token behind.
+   *   3. It is a plain `updateMany`, not raw SQL. Nothing here needs a
+   *      `RETURNING` clause (unlike the session revoke below, whose id set
+   *      decides a race), and the ORM writes/compares `usedAt`/`expiresAt`
+   *      in correct UTC without the `AT TIME ZONE 'UTC'` handling every raw
+   *      statement in this file needs.
+   *
+   * NO NEW AUDIT EVENT is emitted for the invalidation. It is a side effect
+   * of `change_password_success`, not an independent operation, and one
+   * `AuthAuditEvent` row per revoked token would be noise that also leaks
+   * how many reset requests an account had outstanding. A later confirm of
+   * such a token is already recorded by the existing
+   * `password_reset_confirm_failed` / `already_used` path, and the
+   * caller-facing error stays the identical generic
+   * `INVALID_PASSWORD_RESET_TOKEN` used for unknown/expired/used tokens — a
+   * reset token that was killed by a password change must not be
+   * distinguishable from any other invalid one.
+   *
    * This route has no dedicated `AccountLockoutService` coupling and no
    * `@Throttle()` override (see the paragraph below and the controller),
    * so a caller holding a stolen-but-still-valid access token could attempt
@@ -1228,6 +1308,24 @@ export class AuthService {
             HttpStatus.UNAUTHORIZED,
           );
         }
+
+        // CANONICAL AUTH LOCK ORDER, step 2 (`PasswordResetToken`): every
+        // still-usable password-reset token for this account dies with the
+        // old password. See this method's doc comment ("OUTSTANDING RESET
+        // TOKENS ARE INVALIDATED") for why this sits here specifically —
+        // after the `User` lock and after `currentPassword` was accepted,
+        // inside the transaction so a rolled-back change un-invalidates
+        // them, and scoped to the same "currently usable" predicate
+        // `confirmPasswordReset`'s claim statement uses.
+        //
+        // `updateMany`'s count is deliberately ignored: unlike the session
+        // revoke below, nothing about this statement decides a race. An
+        // account with no outstanding tokens matches zero rows, which is the
+        // overwhelmingly common case and a no-op, not a failure.
+        await tx.passwordResetToken.updateMany({
+          where: { userId, usedAt: null, expiresAt: { gt: now } },
+          data: { usedAt: now },
+        });
 
         // SINGLE raw-SQL statement revoking every non-revoked session for the
         // account, INCLUDING the current one — see this method's doc comment
@@ -1597,6 +1695,36 @@ export class AuthService {
    * like `AuthService.login`'s own dummy-hash comment already accepts for
    * its own extra lockout lookup.
    *
+   * THE CREDENTIAL-GENERATION BOUNDARY (password-reset invalidation slice).
+   * This method used to persist its token with a bare auto-commit INSERT
+   * that took no account-level lock at all. Once `changePassword` began
+   * invalidating outstanding tokens (see its doc comment), that left a real
+   * gap: an INSERT committing in the window between a `changePassword`
+   * transaction's invalidation statement and its COMMIT produced a token
+   * that was issued while the OLD password was still current, yet survived
+   * the change — landing on the wrong side of the boundary the invalidation
+   * exists to draw. A wall-clock/`createdAt` comparison cannot close that
+   * (see `changePassword`'s doc comment for why time bounds were already
+   * rejected there as a CRITICAL defect), so the INSERT now runs inside a
+   * two-statement transaction that takes the canonical rank-1 `User` row
+   * lock first — `FOR SHARE`, the same mode `login` uses, because this
+   * method does not write the `User` row and only needs to be ORDERED
+   * against the three credential mutators, never against other logins or
+   * other reset requests. Every token is therefore committed strictly
+   * before a password change (and invalidated by it) or strictly after it
+   * (and legitimately usable). Lock order is rank 1 -> rank 2, which cannot
+   * form a cycle with anything (see the canonical block above this class).
+   *
+   * Two consequences of that lock, both improvements rather than costs:
+   * a concurrent `deleteAccount()` can no longer make this method's INSERT
+   * fail with a raw foreign-key `P2003`/500 (the lock resolves first, the
+   * row is gone, and the request takes the SAME no-account path an unknown
+   * email takes), and the timing-parity write on the no-account path is now
+   * itself a two-statement transaction of the identical shape, so the
+   * branches still issue the same number of round trips to the same table
+   * — the parity property this method's fix cycle 1 established is
+   * preserved, not silently regressed by the new transaction.
+   *
    * Where the dev-only conditional lives — a route guard, or the
    * response-shaping? Deliberately the LATTER, not `DevToolsGuard`: that
    * guard REJECTS the entire route (404 `DEV_TOOLS_DISABLED`) whenever the
@@ -1630,46 +1758,80 @@ export class AuthService {
     const rawToken = randomBytes(PASSWORD_RESET_TOKEN_BYTES).toString('hex');
     const tokenHash = this.hashPasswordResetToken(rawToken);
 
-    if (!user) {
-      // Fix cycle 1 (review finding 1): a real, unconditional write-shaped
-      // round trip against the SAME table the existing-account branch below
-      // writes to, so a timing oracle cannot distinguish the two branches by
-      // "did a DB write happen" alone. `tokenHash` is derived from bytes
-      // generated fresh above, this call only, and never persisted before
-      // this point, so this `deleteMany` is mathematically guaranteed to
-      // match zero rows — it can never delete a real token, never persists
-      // anything, and leaves nothing to clean up or accumulate. See this
-      // method's doc comment for the full timing-oracle analysis.
-      await this.prisma.passwordResetToken.deleteMany({
-        where: { tokenHash },
+    if (user !== null) {
+      // CANONICAL AUTH LOCK ORDER: `User` (rank 1, `FOR SHARE`) before
+      // `PasswordResetToken` (rank 2). See this method's doc comment ("THE
+      // CREDENTIAL-GENERATION BOUNDARY") for why this INSERT can no longer
+      // be a bare auto-commit write, and the canonical block above the class
+      // for why `FOR SHARE` is the right mode here.
+      const issued = await this.prisma.$transaction(async (tx) => {
+        if (!(await this.lockAccountRow(tx, user.id, 'share'))) {
+          // A concurrent `deleteAccount()` removed the account between the
+          // lookup above and this lock. Falls through to the no-account path
+          // below — the same response an unknown email gets — instead of
+          // letting the INSERT fail on `PasswordResetToken_userId_fkey`.
+          return false;
+        }
+
+        await tx.passwordResetToken.create({
+          data: {
+            userId: user.id,
+            tokenHash,
+            expiresAt: new Date(Date.now() + PASSWORD_RESET_TOKEN_TTL_MS),
+          },
+        });
+
+        return true;
       });
-      await this.authAuditService.emit('password_reset_requested', {
-        ip: context.ip,
-        userAgent: context.userAgent,
-        metadata: { reason: 'user_not_found' },
-      });
-      return { success: true };
+
+      if (issued) {
+        await this.authAuditService.emit('password_reset_requested', {
+          userId: user.id,
+          ip: context.ip,
+          userAgent: context.userAgent,
+        });
+
+        const appConfig = this.configService.get('app', { infer: true })!;
+
+        return appConfig.devToolsEnabled
+          ? { success: true, devToken: rawToken }
+          : { success: true };
+      }
     }
 
-    await this.prisma.passwordResetToken.create({
-      data: {
-        userId: user.id,
-        tokenHash,
-        expiresAt: new Date(Date.now() + PASSWORD_RESET_TOKEN_TTL_MS),
-      },
+    // No account resolved — either the email is unknown, or a concurrent
+    // `deleteAccount()` removed it before the token could be persisted.
+    //
+    // Fix cycle 1 (review finding 1): a real, unconditional write-shaped
+    // round trip against the SAME table the existing-account branch above
+    // writes to, so a timing oracle cannot distinguish the two branches by
+    // "did a DB write happen" alone. `tokenHash` is derived from bytes
+    // generated fresh above, this call only, and never persisted before this
+    // point, so this `deleteMany` is mathematically guaranteed to match zero
+    // rows — it can never delete a real token, never persists anything, and
+    // leaves nothing to clean up or accumulate. See this method's doc
+    // comment for the full timing-oracle analysis.
+    //
+    // Password-reset invalidation slice: wrapped in a transaction taking the
+    // same shaped row lock the branch above takes, purely so that branch's
+    // new BEGIN/lock/write/COMMIT round-trip profile does not itself become
+    // the oracle the `deleteMany` was added to remove. `tokenHash` is passed
+    // where a user id goes deliberately: it is a bound parameter (never
+    // interpolated), and a 64-character hex digest can never equal a `cuid`
+    // `User.id`, so this lock — exactly like the `deleteMany` beside it —
+    // provably matches zero rows and blocks nothing.
+    await this.prisma.$transaction(async (tx) => {
+      await this.lockAccountRow(tx, tokenHash, 'share');
+      await tx.passwordResetToken.deleteMany({ where: { tokenHash } });
     });
 
     await this.authAuditService.emit('password_reset_requested', {
-      userId: user.id,
       ip: context.ip,
       userAgent: context.userAgent,
+      metadata: { reason: 'user_not_found' },
     });
 
-    const appConfig = this.configService.get('app', { infer: true })!;
-
-    return appConfig.devToolsEnabled
-      ? { success: true, devToken: rawToken }
-      : { success: true };
+    return { success: true };
   }
 
   /**
@@ -1781,6 +1943,20 @@ export class AuthService {
    * `Session` revoke all run inside ONE `prisma.$transaction`, so a mid-way
    * failure cannot leave tokens consumed without the password having
    * actually changed, or vice versa.
+   *
+   * NOTHING IN THIS METHOD CHANGED in the password-reset invalidation slice
+   * — it is recorded here only because that slice completes the symmetry it
+   * started. This method already invalidated every outstanding token for the
+   * account when a reset succeeded; `changePassword` now does the same when
+   * a change succeeds (see its doc comment and the
+   * "CREDENTIAL-GENERATION COROLLARY" in the canonical lock-order block), so
+   * BOTH password mutations end the previous credential generation, and the
+   * two are mutually exclusive per account (both lock `User` first). The
+   * observable consequence for this method is on the LOSING side of that
+   * race: when a `changePassword` commits first, its invalidation leaves
+   * nothing for the claim statement below to claim, so the confirm loses on
+   * the existing `wonClaim` check and returns the existing generic
+   * `INVALID_PASSWORD_RESET_TOKEN` — no new branch, error code, or event.
    *
    * LOCK ORDERING (Auth lock-order hardening slice — this replaces an
    * earlier, INCOMPLETE analysis that lived here). The earlier reasoning

@@ -2715,4 +2715,598 @@ describe('AuthService', () => {
       bcryptTestBudgetMs(25 * 3),
     );
   });
+
+  /**
+   * Password-reset invalidation slice — the service-level contract for the
+   * policy this slice adopts:
+   *
+   *   A SUCCESSFUL PASSWORD CHANGE ENDS THE ACCOUNT'S PREVIOUS CREDENTIAL
+   *   GENERATION. Every password-reset token issued before it becomes
+   *   unusable; a token requested after it works normally.
+   *
+   * Before this slice, a reset token issued BEFORE a successful
+   * `changePassword` stayed usable for its full hour afterwards and could
+   * replace the brand-new password — an attacker who captured a reset link
+   * kept a live account-takeover credential even after the legitimate owner
+   * regained control and changed the password. See
+   * `AuthService.changePassword`'s doc comment and the "CREDENTIAL-
+   * GENERATION COROLLARY" in the canonical lock-order block above
+   * `AuthService`. Deterministic concurrency for the same policy lives in
+   * `auth-lock-order.spec.ts`.
+   */
+  describe('changePassword invalidates outstanding password-reset tokens', () => {
+    let devToolsService: AuthService;
+    let devToolsPrisma: PrismaService;
+
+    const OLD_PASSWORD = 'correct-horse-battery';
+    const NEW_PASSWORD = 'brand-new-password-inv-1';
+
+    beforeEach(async () => {
+      const module: TestingModule = await Test.createTestingModule({
+        imports: [JwtModule.register({})],
+        providers: [
+          AuthService,
+          PrismaService,
+          AccountLockoutService,
+          AuthAuditService,
+          {
+            provide: ConfigService,
+            useValue: {
+              get: jest.fn((key: string) =>
+                key === 'app' ? { devToolsEnabled: true } : TEST_AUTH_CONFIG,
+              ),
+            },
+          },
+        ],
+      }).compile();
+
+      devToolsService = module.get<AuthService>(AuthService);
+      devToolsPrisma = module.get<PrismaService>(PrismaService);
+      await devToolsPrisma.onModuleInit();
+    });
+
+    afterEach(async () => {
+      await devToolsPrisma.onModuleDestroy();
+    });
+
+    interface Account {
+      userId: string;
+      email: string;
+      refreshToken: string;
+    }
+
+    async function registerAccount(label: string): Promise<Account> {
+      const email = uniqueEmail(label);
+      const registered = await devToolsService.register({
+        email,
+        password: OLD_PASSWORD,
+      });
+      return {
+        userId: registered.user.id,
+        email,
+        refreshToken: registered.refreshToken,
+      };
+    }
+
+    async function requestRawToken(email: string): Promise<string> {
+      const result = await devToolsService.requestPasswordReset({ email });
+      return result.devToken!;
+    }
+
+    it(
+      'a token issued before a successful change can no longer confirm, and is marked used at rest',
+      async () => {
+        const account = await registerAccount('inv-basic');
+        const staleToken = await requestRawToken(account.email);
+
+        await devToolsService.changePassword(account.userId, {
+          currentPassword: OLD_PASSWORD,
+          newPassword: NEW_PASSWORD,
+          refreshToken: account.refreshToken,
+        });
+
+        await expect(
+          devToolsService.confirmPasswordReset({
+            token: staleToken,
+            newPassword: 'attacker-supplied-password-1',
+          }),
+        ).rejects.toMatchObject({
+          code: AppErrorCode.INVALID_PASSWORD_RESET_TOKEN,
+          status: HttpStatus.UNAUTHORIZED,
+        } as Partial<AppException>);
+
+        // Rejected at the API boundary AND invalidated at rest — not merely
+        // refused by a check that a future refactor could drop.
+        const tokens = await devToolsPrisma.passwordResetToken.findMany({
+          where: { userId: account.userId },
+        });
+        expect(tokens).toHaveLength(1);
+        expect(tokens[0].usedAt).not.toBeNull();
+
+        // The account's password is the one the OWNER set, never the
+        // rejected attempt's.
+        const storedUser = await devToolsPrisma.user.findUnique({
+          where: { id: account.userId },
+        });
+        expect(
+          await bcrypt.compare(NEW_PASSWORD, storedUser!.passwordHash),
+        ).toBe(true);
+        expect(
+          await bcrypt.compare(
+            'attacker-supplied-password-1',
+            storedUser!.passwordHash,
+          ),
+        ).toBe(false);
+      },
+      bcryptTestBudgetMs(6),
+    );
+
+    it(
+      'the rejection is the SAME generic error and audit reason an already-used token gets — no recovery-state oracle',
+      async () => {
+        const account = await registerAccount('inv-generic');
+        const staleToken = await requestRawToken(account.email);
+
+        await devToolsService.changePassword(account.userId, {
+          currentPassword: OLD_PASSWORD,
+          newPassword: NEW_PASSWORD,
+          refreshToken: account.refreshToken,
+        });
+
+        let caught: unknown;
+        try {
+          await devToolsService.confirmPasswordReset({
+            token: staleToken,
+            newPassword: 'attacker-supplied-password-2',
+          });
+        } catch (error) {
+          caught = error;
+        }
+
+        expect(caught).toBeInstanceOf(AppException);
+        const thrown = caught as AppException;
+        expect(thrown.code).toBe(AppErrorCode.INVALID_PASSWORD_RESET_TOKEN);
+        expect(thrown.status).toBe(HttpStatus.UNAUTHORIZED);
+        // Byte-identical to the message every other invalid-token rejection
+        // returns: nothing tells the caller "this died because the password
+        // was changed" rather than "this never existed".
+        expect(thrown.message).toBe('Invalid or expired password reset token');
+
+        const auditRows = await devToolsPrisma.authAuditEvent.findMany({
+          where: {
+            userId: account.userId,
+            event: 'password_reset_confirm_failed',
+          },
+        });
+        expect(auditRows).toHaveLength(1);
+        expect(
+          (auditRows[0].metadata as { reason?: string } | null)?.reason,
+        ).toBe('already_used');
+      },
+      bcryptTestBudgetMs(6),
+    );
+
+    it(
+      'EVERY outstanding token dies, not just the most recent one',
+      async () => {
+        const account = await registerAccount('inv-multiple');
+        const first = await requestRawToken(account.email);
+        const second = await requestRawToken(account.email);
+        const third = await requestRawToken(account.email);
+
+        await devToolsService.changePassword(account.userId, {
+          currentPassword: OLD_PASSWORD,
+          newPassword: NEW_PASSWORD,
+          refreshToken: account.refreshToken,
+        });
+
+        for (const staleToken of [first, second, third]) {
+          await expect(
+            devToolsService.confirmPasswordReset({
+              token: staleToken,
+              newPassword: 'attacker-supplied-password-3',
+            }),
+          ).rejects.toMatchObject({
+            code: AppErrorCode.INVALID_PASSWORD_RESET_TOKEN,
+          });
+        }
+
+        const usable = await devToolsPrisma.passwordResetToken.count({
+          where: { userId: account.userId, usedAt: null },
+        });
+        expect(usable).toBe(0);
+      },
+      bcryptTestBudgetMs(6),
+    );
+
+    it(
+      'a FAILED change (wrong currentPassword) leaves the outstanding token fully usable',
+      async () => {
+        const account = await registerAccount('inv-failed-password');
+        const outstanding = await requestRawToken(account.email);
+
+        await expect(
+          devToolsService.changePassword(account.userId, {
+            currentPassword: 'not-the-current-password',
+            newPassword: NEW_PASSWORD,
+            refreshToken: account.refreshToken,
+          }),
+        ).rejects.toMatchObject({ code: AppErrorCode.INVALID_CREDENTIALS });
+
+        // Invalidation is a consequence of a SUCCESSFUL credential change.
+        // A caller who cannot prove the current password must not be able to
+        // destroy the account owner's recovery path — that would turn a
+        // stolen access token into a denial-of-recovery weapon.
+        const tokens = await devToolsPrisma.passwordResetToken.findMany({
+          where: { userId: account.userId },
+        });
+        expect(tokens).toHaveLength(1);
+        expect(tokens[0].usedAt).toBeNull();
+
+        await devToolsService.confirmPasswordReset({
+          token: outstanding,
+          newPassword: 'recovered-password-1',
+        });
+
+        const storedUser = await devToolsPrisma.user.findUnique({
+          where: { id: account.userId },
+        });
+        expect(
+          await bcrypt.compare(
+            'recovered-password-1',
+            storedUser!.passwordHash,
+          ),
+        ).toBe(true);
+      },
+      bcryptTestBudgetMs(6),
+    );
+
+    it(
+      'a FAILED change (unusable refreshToken) also leaves the outstanding token usable',
+      async () => {
+        const account = await registerAccount('inv-failed-refresh');
+        const outstanding = await requestRawToken(account.email);
+
+        await expect(
+          devToolsService.changePassword(account.userId, {
+            currentPassword: OLD_PASSWORD,
+            newPassword: NEW_PASSWORD,
+            refreshToken: 'this-refresh-token-was-never-issued',
+          }),
+        ).rejects.toMatchObject({ code: AppErrorCode.INVALID_REFRESH_TOKEN });
+
+        const tokens = await devToolsPrisma.passwordResetToken.findMany({
+          where: { userId: account.userId },
+        });
+        expect(tokens).toHaveLength(1);
+        expect(tokens[0].usedAt).toBeNull();
+
+        // Still a working recovery path, end to end.
+        await devToolsService.confirmPasswordReset({
+          token: outstanding,
+          newPassword: 'recovered-password-3',
+        });
+        const storedUser = await devToolsPrisma.user.findUnique({
+          where: { id: account.userId },
+        });
+        expect(
+          await bcrypt.compare(
+            'recovered-password-3',
+            storedUser!.passwordHash,
+          ),
+        ).toBe(true);
+      },
+      bcryptTestBudgetMs(4),
+    );
+
+    it(
+      'a change that ROLLS BACK after losing its session-rotation race leaves the outstanding token usable',
+      async () => {
+        const account = await registerAccount('inv-rollback');
+        const outstanding = await requestRawToken(account.email);
+
+        // Reviewer A (security): the two failure paths above both throw
+        // BEFORE the transaction opens, so neither exercises the rollback
+        // this invalidation depends on. This one does. The session is
+        // revoked from a DIFFERENT connection at the exact moment
+        // `changePassword` opens its transaction — the state a concurrent
+        // `refresh()`/`logout()` landing between the method's own session
+        // pre-check and its transaction produces. The revoke-all statement
+        // then matches nothing, the current session's id is absent from the
+        // returned set, and the transaction throws `ChangePasswordRaceLost`
+        // to force a ROLLBACK.
+        //
+        // No sleeps and no artificial delay: the interleaving is forced by
+        // the transaction boundary itself, not by timing.
+        const loose = devToolsPrisma as unknown as {
+          $transaction: (...args: unknown[]) => unknown;
+        };
+        const original = loose.$transaction;
+        // Always forwards to the REAL implementation; nothing about the
+        // transaction itself is faked (mirrors `auth-lock-order.spec.ts`'s
+        // `realTransaction` helper, including the explicit `unknown` return
+        // type that keeps `Function.apply`'s `any` out of the test).
+        const realTransaction = (...args: unknown[]): unknown =>
+          original.apply(devToolsPrisma, args);
+        let armed = true;
+        const spy = jest
+          .spyOn(loose, '$transaction')
+          .mockImplementation((...args: unknown[]): unknown => {
+            const [first] = args;
+            if (typeof first !== 'function' || !armed) {
+              return realTransaction(...args);
+            }
+            armed = false;
+            return (async (): Promise<unknown> => {
+              await devToolsPrisma.session.updateMany({
+                where: { userId: account.userId, revokedAt: null },
+                data: { revokedAt: new Date() },
+              });
+              return realTransaction(...args);
+            })();
+          });
+
+        try {
+          await expect(
+            devToolsService.changePassword(account.userId, {
+              currentPassword: OLD_PASSWORD,
+              newPassword: NEW_PASSWORD,
+              refreshToken: account.refreshToken,
+            }),
+          ).rejects.toMatchObject({
+            code: AppErrorCode.INVALID_REFRESH_TOKEN,
+          });
+        } finally {
+          spy.mockRestore();
+        }
+
+        // The password was never changed...
+        const storedUser = await devToolsPrisma.user.findUnique({
+          where: { id: account.userId },
+        });
+        expect(
+          await bcrypt.compare(OLD_PASSWORD, storedUser!.passwordHash),
+        ).toBe(true);
+
+        // ...so no new credential generation was opened, and the recovery
+        // token from the CURRENT generation must have survived the rollback.
+        // If the invalidation ever moved outside the transaction, this token
+        // would be dead here while the password it protects is unchanged —
+        // an account left un-recoverable by an operation that did nothing.
+        const tokens = await devToolsPrisma.passwordResetToken.findMany({
+          where: { userId: account.userId },
+        });
+        expect(tokens).toHaveLength(1);
+        expect(tokens[0].usedAt).toBeNull();
+
+        await devToolsService.confirmPasswordReset({
+          token: outstanding,
+          newPassword: 'recovered-password-4',
+        });
+        const recovered = await devToolsPrisma.user.findUnique({
+          where: { id: account.userId },
+        });
+        expect(
+          await bcrypt.compare('recovered-password-4', recovered!.passwordHash),
+        ).toBe(true);
+      },
+      bcryptTestBudgetMs(6),
+    );
+
+    it(
+      'recovery is not disabled: a token requested AFTER the change confirms normally',
+      async () => {
+        const account = await registerAccount('inv-recovery');
+        const staleToken = await requestRawToken(account.email);
+
+        await devToolsService.changePassword(account.userId, {
+          currentPassword: OLD_PASSWORD,
+          newPassword: NEW_PASSWORD,
+          refreshToken: account.refreshToken,
+        });
+
+        const freshToken = await requestRawToken(account.email);
+        expect(freshToken).not.toBe(staleToken);
+
+        await devToolsService.confirmPasswordReset({
+          token: freshToken,
+          newPassword: 'recovered-password-2',
+        });
+
+        const storedUser = await devToolsPrisma.user.findUnique({
+          where: { id: account.userId },
+        });
+        expect(
+          await bcrypt.compare(
+            'recovered-password-2',
+            storedUser!.passwordHash,
+          ),
+        ).toBe(true);
+
+        // The new password works for login, and the stale token is still
+        // dead — a later legitimate reset does not resurrect it.
+        await expect(
+          devToolsService.login({
+            email: account.email,
+            password: 'recovered-password-2',
+          }),
+        ).resolves.toBeDefined();
+        await expect(
+          devToolsService.confirmPasswordReset({
+            token: staleToken,
+            newPassword: 'attacker-supplied-password-4',
+          }),
+        ).rejects.toMatchObject({
+          code: AppErrorCode.INVALID_PASSWORD_RESET_TOKEN,
+        });
+      },
+      bcryptTestBudgetMs(8),
+    );
+
+    it(
+      'an ALREADY-EXPIRED token is left untouched, so its audit reason stays "expired"',
+      async () => {
+        const account = await registerAccount('inv-expired');
+        const expiredToken = await requestRawToken(account.email);
+        await devToolsPrisma.passwordResetToken.updateMany({
+          where: { userId: account.userId },
+          data: { expiresAt: new Date(Date.now() - 1000) },
+        });
+
+        await devToolsService.changePassword(account.userId, {
+          currentPassword: OLD_PASSWORD,
+          newPassword: NEW_PASSWORD,
+          refreshToken: account.refreshToken,
+        });
+
+        // The invalidation targets the "currently usable" set only. Stamping
+        // `usedAt` on a token that was already dead would silently rewrite
+        // the audit trail's `expired` reason into `already_used` for no
+        // security gain.
+        const tokens = await devToolsPrisma.passwordResetToken.findMany({
+          where: { userId: account.userId },
+        });
+        expect(tokens).toHaveLength(1);
+        expect(tokens[0].usedAt).toBeNull();
+
+        await expect(
+          devToolsService.confirmPasswordReset({
+            token: expiredToken,
+            newPassword: 'attacker-supplied-password-5',
+          }),
+        ).rejects.toMatchObject({
+          code: AppErrorCode.INVALID_PASSWORD_RESET_TOKEN,
+        });
+
+        const auditRows = await devToolsPrisma.authAuditEvent.findMany({
+          where: {
+            userId: account.userId,
+            event: 'password_reset_confirm_failed',
+          },
+        });
+        expect(
+          (auditRows[0].metadata as { reason?: string } | null)?.reason,
+        ).toBe('expired');
+      },
+      bcryptTestBudgetMs(6),
+    );
+
+    it(
+      'the invalidation adds no audit noise and leaks no token material',
+      async () => {
+        const account = await registerAccount('inv-audit');
+        const first = await requestRawToken(account.email);
+        const second = await requestRawToken(account.email);
+
+        await devToolsService.changePassword(account.userId, {
+          currentPassword: OLD_PASSWORD,
+          newPassword: NEW_PASSWORD,
+          refreshToken: account.refreshToken,
+        });
+
+        const events = await devToolsPrisma.authAuditEvent.findMany({
+          where: { userId: account.userId },
+        });
+
+        // Exactly ONE success row for the whole operation — the invalidation
+        // is a documented side effect of `change_password_success`, never a
+        // per-token event (which would leak how many reset requests the
+        // account had outstanding).
+        expect(
+          events.filter((row) => row.event === 'change_password_success'),
+        ).toHaveLength(1);
+        expect(
+          events.filter((row) => row.event === 'password_reset_confirmed'),
+        ).toHaveLength(0);
+        expect(
+          events.filter((row) => row.event === 'password_reset_confirm_failed'),
+        ).toHaveLength(0);
+
+        // No raw reset token reaches the audit trail through any column.
+        const serializedAudit = JSON.stringify(events);
+        expect(serializedAudit).not.toContain(first);
+        expect(serializedAudit).not.toContain(second);
+        expect(serializedAudit).not.toContain(OLD_PASSWORD);
+        expect(serializedAudit).not.toContain(NEW_PASSWORD);
+
+        // ...and the stored token rows still hold only keyed hashes, never
+        // the raw values the caller was handed.
+        const tokens = await devToolsPrisma.passwordResetToken.findMany({
+          where: { userId: account.userId },
+        });
+        const serializedTokens = JSON.stringify(tokens);
+        expect(serializedTokens).not.toContain(first);
+        expect(serializedTokens).not.toContain(second);
+      },
+      bcryptTestBudgetMs(6),
+    );
+
+    it(
+      'session semantics are unchanged: the caller keeps exactly one rotated session',
+      async () => {
+        const account = await registerAccount('inv-sessions');
+        await requestRawToken(account.email);
+        // A second device, which must still be revoked exactly as before.
+        await devToolsService.login({
+          email: account.email,
+          password: OLD_PASSWORD,
+        });
+
+        const rotated = await devToolsService.changePassword(account.userId, {
+          currentPassword: OLD_PASSWORD,
+          newPassword: NEW_PASSWORD,
+          refreshToken: account.refreshToken,
+        });
+
+        const activeSessions = await devToolsPrisma.session.findMany({
+          where: { userId: account.userId, revokedAt: null },
+        });
+        expect(activeSessions).toHaveLength(1);
+
+        // The rotated pair still works — the token invalidation did not
+        // disturb the "keep the calling device signed in" contract.
+        await expect(
+          devToolsService.refresh(rotated.refreshToken),
+        ).resolves.toBeDefined();
+      },
+      bcryptTestBudgetMs(6),
+    );
+
+    it(
+      "one account's password change never touches another account's reset tokens",
+      async () => {
+        const victim = await registerAccount('inv-cross-a');
+        const bystander = await registerAccount('inv-cross-b');
+        const bystanderToken = await requestRawToken(bystander.email);
+
+        await devToolsService.changePassword(victim.userId, {
+          currentPassword: OLD_PASSWORD,
+          newPassword: NEW_PASSWORD,
+          refreshToken: victim.refreshToken,
+        });
+
+        const tokens = await devToolsPrisma.passwordResetToken.findMany({
+          where: { userId: bystander.userId },
+        });
+        expect(tokens).toHaveLength(1);
+        expect(tokens[0].usedAt).toBeNull();
+
+        await devToolsService.confirmPasswordReset({
+          token: bystanderToken,
+          newPassword: 'bystander-recovered-1',
+        });
+
+        const storedBystander = await devToolsPrisma.user.findUnique({
+          where: { id: bystander.userId },
+        });
+        expect(
+          await bcrypt.compare(
+            'bystander-recovered-1',
+            storedBystander!.passwordHash,
+          ),
+        ).toBe(true);
+      },
+      bcryptTestBudgetMs(8),
+    );
+  });
 });

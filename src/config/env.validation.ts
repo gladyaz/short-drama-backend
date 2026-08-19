@@ -86,6 +86,8 @@ export function validateEnv(
 
   validateHlsGatewayConfig(config);
 
+  validatePaymentsConfig(config);
+
   return config;
 }
 
@@ -280,6 +282,58 @@ function assertPositiveIntEnvIfPresent(
   if (!Number.isInteger(parsed) || parsed <= 0) {
     throw new Error(
       `Invalid ${key}: must be a positive integer when set (see .env.example). TRANSCODE_ENABLED=true is active, so this value is read.`,
+    );
+  }
+}
+
+/**
+ * Work unit "MIDTRANS PAYMENT BACKEND FOUNDATION": `PAYMENTS_ENABLED`
+ * feature flag + conditionally required `MIDTRANS_SERVER_KEY`, mirroring
+ * `validateTranscodeConfig`'s flag-conditional shape exactly. While the flag
+ * is not the literal string `"true"` (the default, and this slice's only
+ * shipped posture), no `MIDTRANS_*` variable is required at all.
+ *
+ * Two independent fail-closed rules:
+ *
+ * 1. `PAYMENTS_ENABLED=true` requires `MIDTRANS_SERVER_KEY` to be present
+ *    (name-presence only — the value is never read into an error message,
+ *    never logged, and no network call is made here). Without it, nothing
+ *    could authenticate a Snap create call or verify a webhook signature,
+ *    and both would otherwise fail at request time in a less obvious way.
+ *
+ * 2. `MIDTRANS_IS_PRODUCTION=true` is refused unless `NODE_ENV` is exactly
+ *    `"production"` — an ALLOWLIST, deliberately the mirror image of
+ *    `validateDevToolsNodeEnv` above: that guard keeps dev-only surfaces
+ *    out of production; this one keeps the PRODUCTION (real-money) Midtrans
+ *    endpoint out of development/test. An unset, empty, misspelled, or
+ *    differently-cased `NODE_ENV` is treated as NOT production, so the
+ *    production endpoint can never be reached by accident. This check runs
+ *    even while `PAYMENTS_ENABLED` is false — a mis-set production flag is
+ *    a config error worth failing loudly on before it is ever activated.
+ */
+function validatePaymentsConfig(config: Record<string, unknown>): void {
+  if (
+    config.MIDTRANS_IS_PRODUCTION === 'true' &&
+    config.NODE_ENV !== 'production'
+  ) {
+    throw new Error(
+      'Refusing to boot with MIDTRANS_IS_PRODUCTION=true: NODE_ENV is not ' +
+        'exactly "production". The production Midtrans endpoint processes ' +
+        'real money and must never be reachable from a development/test ' +
+        'environment. Unset MIDTRANS_IS_PRODUCTION (sandbox is the default) ' +
+        'or run with NODE_ENV=production. Values are never logged.',
+    );
+  }
+
+  if (config.PAYMENTS_ENABLED !== 'true') {
+    return;
+  }
+
+  if (!config.MIDTRANS_SERVER_KEY) {
+    throw new Error(
+      'Missing required environment variable: MIDTRANS_SERVER_KEY. ' +
+        'PAYMENTS_ENABLED=true requires MIDTRANS_SERVER_KEY to be set ' +
+        '(see .env.example). Values are never logged.',
     );
   }
 }

@@ -1,4 +1,5 @@
 import { HttpStatus, Injectable } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AppErrorCode } from '../common/errors/app-error-code';
 import { AppException } from '../common/errors/app.exception';
@@ -137,6 +138,90 @@ export class EntitlementsService {
     });
 
     return { isPremium: false, expiresAt: null };
+  }
+
+  /**
+   * Work unit "MIDTRANS PAYMENT BACKEND FOUNDATION": grants (or extends)
+   * time-bound premium as the result of an authoritatively-successful
+   * payment. This is the ONLY payment-facing entitlement writer — the
+   * payments module never touches the `Entitlement` table directly, so
+   * premium semantics stay owned by this module (the "no parallel Premium
+   * system" requirement).
+   *
+   * Runs on a CALLER-SUPPLIED `Prisma.TransactionClient` — the caller
+   * (`PaymentNotificationService.applyPaidTransition`) commits this grant in
+   * the SAME transaction as the order's `PAID` CAS, so "order says PAID"
+   * and "premium was granted" can never disagree, and the caller's CAS win
+   * is what guarantees at-most-one grant per order even under concurrent
+   * duplicate webhook delivery.
+   *
+   * First statement is a `SELECT ... FOR UPDATE` on the `User` row — the
+   * same raw-SQL row-lock idiom `AuthService` already uses (and the same
+   * lock-ORDER: User first, dependent rows after, so this cannot form a
+   * lock cycle with the auth flows). It serializes concurrent grants for
+   * the SAME user across DIFFERENT orders: without it, two simultaneously
+   * settling orders could both read the same current expiry and both write
+   * `expiry + 30d`, silently losing one purchased month. With it, the
+   * second transaction waits and extends the first one's result.
+   * An empty lock result means the user row no longer exists (account
+   * deleted mid-payment; `PaymentOrder.userId` is `SetNull`) — returns
+   * `null` so the caller can record the payment without a grant instead of
+   * crashing on an FK violation.
+   *
+   * EXTEND semantics: the new row's `expiresAt` counts `durationDays` from
+   * `max(now, latest active dated expiry)` — buying a second month while
+   * one is still running stacks, buying after a lapse starts from now. An
+   * active UNLIMITED entitlement (`expiresAt: null`, dev-grant only) is not
+   * "extended" (there is nothing beyond forever); the purchase still
+   * creates its own dated row, preserving the one-row-per-grant audit
+   * convention `devGrant` established.
+   */
+  async grantPaidPremium(
+    tx: Prisma.TransactionClient,
+    userId: string,
+    durationDays: number,
+    source: string,
+  ): Promise<{ id: string; expiresAt: Date } | null> {
+    const lockedUser = await tx.$queryRaw<{ id: string }[]>`
+      SELECT "id" FROM "User" WHERE "id" = ${userId} FOR UPDATE`;
+
+    if (lockedUser.length === 0) {
+      return null;
+    }
+
+    const now = new Date();
+    const activeRows = await tx.entitlement.findMany({
+      where: {
+        userId,
+        tier: PREMIUM_TIER,
+        revokedAt: null,
+        OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
+      },
+      select: { expiresAt: true },
+    });
+
+    let base = now;
+    for (const row of activeRows) {
+      if (row.expiresAt !== null && row.expiresAt.getTime() > base.getTime()) {
+        base = row.expiresAt;
+      }
+    }
+
+    const expiresAt = new Date(
+      base.getTime() + durationDays * 24 * 60 * 60 * 1000,
+    );
+
+    const created = await tx.entitlement.create({
+      data: {
+        userId,
+        tier: PREMIUM_TIER,
+        source,
+        expiresAt,
+      },
+      select: { id: true, expiresAt: true },
+    });
+
+    return { id: created.id, expiresAt: created.expiresAt ?? expiresAt };
   }
 
   /**

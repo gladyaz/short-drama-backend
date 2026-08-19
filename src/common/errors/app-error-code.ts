@@ -364,4 +364,83 @@ export enum AppErrorCode {
    * longer the current pending or live one").
    */
   SERIES_COVER_KEY_SUPERSEDED = 'SERIES_COVER_KEY_SUPERSEDED',
+  // Work unit "MIDTRANS PAYMENT BACKEND FOUNDATION"
+  /**
+   * Returned (503) by every `/payments/*` surface — checkout, order status,
+   * and the Midtrans webhook — while `PAYMENTS_ENABLED` is not the literal
+   * string `"true"` (this repo's shipped default). Fail-closed twin of
+   * `DEV_TOOLS_DISABLED`, but 503 rather than 404: the payment surface is a
+   * real, documented part of the API that is temporarily/deliberately not in
+   * service, not a route whose existence is being hidden. For the webhook
+   * specifically, 503 also matches Midtrans' documented retry behavior
+   * (a 503 is retried), so a notification delivered during a brief
+   * flag-off window is not permanently lost.
+   */
+  PAYMENTS_DISABLED = 'PAYMENTS_DISABLED',
+  /**
+   * Returned by `POST /payments/checkout` when `planId` is not one of the
+   * server-side `PAYMENT_PLANS` catalog ids
+   * (`src/payments/payment-plan.constants.ts`). The catalog — never the
+   * client — is the ONLY source of price/duration, so an unknown id has
+   * nothing it could legitimately resolve to. 404, matching
+   * `USER_NOT_FOUND`'s "the referenced thing does not exist" shape.
+   */
+  PAYMENT_PLAN_NOT_FOUND = 'PAYMENT_PLAN_NOT_FOUND',
+  /**
+   * Returned by `GET /payments/:orderId` when the id matches no
+   * `PaymentOrder` row — OR matches a row owned by a DIFFERENT user.
+   * Deliberately the SAME code and status (404) for both, mirroring the
+   * anti-enumeration stance `INVALID_CREDENTIALS` documents for auth: a
+   * caller probing other users' order ids learns nothing about whether an
+   * id exists. Also returned by the Midtrans webhook when a
+   * signature-valid notification names an `order_id` this backend never
+   * generated (e.g. a transaction created directly from the Midtrans
+   * dashboard) — 404 tells Midtrans "not ours", is retried only twice per
+   * their documented policy, and transitions nothing.
+   */
+  PAYMENT_ORDER_NOT_FOUND = 'PAYMENT_ORDER_NOT_FOUND',
+  /**
+   * Returned (409) by `POST /payments/checkout` when another request for
+   * the same user+plan is mid-flight (its order row exists in `CREATED`
+   * but the Midtrans Snap create call has not resolved yet, and it is not
+   * yet old enough to be reclaimed as abandoned). The caller should simply
+   * retry in a moment — at which point the open order is returned
+   * idempotently. This is the loser's answer in the `openOrderKey` unique
+   * race; it can never create a second chargeable order.
+   */
+  PAYMENT_CHECKOUT_IN_PROGRESS = 'PAYMENT_CHECKOUT_IN_PROGRESS',
+  /**
+   * Returned (502) by `POST /payments/checkout` when the Midtrans Snap
+   * create call fails (non-2xx, malformed response, or transport error).
+   * The internal order row is CAS-failed (`FAILED`,
+   * `failureCode: PROVIDER_CREATE_FAILED`) before this is thrown, so a
+   * provider outage leaves an auditable dead order — never a half-open one
+   * that blocks future checkouts, and never any Premium state. The message
+   * carries no provider response body and no request detail (the
+   * Authorization header embeds the Server Key).
+   */
+  PAYMENT_PROVIDER_ERROR = 'PAYMENT_PROVIDER_ERROR',
+  /**
+   * Returned (400) by the Midtrans webhook when the notification body is
+   * not a JSON object carrying the five string fields the verified
+   * Midtrans contract requires (`order_id`, `status_code`, `gross_amount`,
+   * `signature_key`, `transaction_status`). Purely a SHAPE failure —
+   * checked before any signature math or DB lookup. Unknown EXTRA fields
+   * are deliberately tolerated (the provider adds fields over time), which
+   * is why the webhook takes `unknown` and narrows manually instead of
+   * using a whitelisting `ValidationPipe` DTO that would reject them.
+   */
+  PAYMENT_NOTIFICATION_INVALID = 'PAYMENT_NOTIFICATION_INVALID',
+  /**
+   * Returned (403) by the Midtrans webhook when the body parses but fails
+   * AUTHENTICITY: its `signature_key` does not equal
+   * `SHA512(order_id + status_code + gross_amount + ServerKey)` (the
+   * verified official formula, compared timing-safely), or its
+   * signature-covered `gross_amount` does not equal the order's own
+   * server-computed `amountIdr`. Nothing is transitioned and no
+   * entitlement is touched. Deliberately ONE code for both causes: a
+   * forger probing the endpoint learns only "rejected", not which check
+   * tripped.
+   */
+  PAYMENT_NOTIFICATION_REJECTED = 'PAYMENT_NOTIFICATION_REJECTED',
 }

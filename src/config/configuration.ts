@@ -187,12 +187,51 @@ export interface HlsGatewayConfig {
  */
 export const DEFAULT_HLS_TOKEN_TTL_SECONDS = 3600;
 
+/**
+ * Work unit "MIDTRANS PAYMENT BACKEND FOUNDATION": Midtrans Snap payment
+ * provider configuration, mirroring `TranscodeConfig`'s "read
+ * unconditionally here, `env.validation.ts` decides what's required" split
+ * exactly.
+ *
+ * `enabled` follows the fail-closed, exact-string `TRANSCODE_ENABLED`
+ * precedent: `PAYMENTS_ENABLED` must be the literal string `"true"` to
+ * activate anything — absent, empty, `"TRUE"`, `"1"`, `"yes"`, or any other
+ * value all resolve to `false`, never the reverse. While `false` (the
+ * default posture), the Midtrans gateway is an inert
+ * `DisabledMidtransGateway`, `POST /payments/checkout` and the webhook
+ * endpoint answer `503 PAYMENTS_DISABLED`, and no `MIDTRANS_*` variable is
+ * required at boot.
+ *
+ * `midtransServerKey` is `string | undefined` (never defaulted to `''`) —
+ * the same "an empty string is a worse failure mode than a missing one"
+ * rationale as `HlsGatewayConfig.tokenSecret`: nothing may ever compute a
+ * webhook signature or an Authorization header against an empty key.
+ * Required (name-presence only, value never logged) by
+ * `env.validation.ts`'s `validatePaymentsConfig` when `PAYMENTS_ENABLED` is
+ * `"true"`. NEVER logged, NEVER serialized into any API response.
+ *
+ * `midtransIsProduction`: exact-string `"true"` selects the PRODUCTION
+ * Midtrans endpoints (`app.midtrans.com`/`api.midtrans.com`); every other
+ * value — including unset — selects SANDBOX. Production mode can never
+ * become the default, and `env.validation.ts` additionally refuses to boot
+ * with `MIDTRANS_IS_PRODUCTION=true` unless `NODE_ENV` is exactly
+ * `"production"` (a fail-closed allowlist, mirroring
+ * `validateDevToolsNodeEnv`'s shape in reverse), so a dev/test machine can
+ * never accidentally reach the real-money endpoint.
+ */
+export interface PaymentsConfig {
+  enabled: boolean;
+  midtransServerKey: string | undefined;
+  midtransIsProduction: boolean;
+}
+
 export interface RootConfig {
   app: AppConfig;
   auth: AuthConfig;
   storage: StorageConfig;
   transcode: TranscodeConfig;
   hlsGateway: HlsGatewayConfig;
+  payments: PaymentsConfig;
 }
 
 export default (): RootConfig => ({
@@ -243,6 +282,11 @@ export default (): RootConfig => ({
       process.env.HLS_TOKEN_TTL_SECONDS,
       DEFAULT_HLS_TOKEN_TTL_SECONDS,
     ),
+  },
+  payments: {
+    enabled: process.env.PAYMENTS_ENABLED === 'true',
+    midtransServerKey: process.env.MIDTRANS_SERVER_KEY,
+    midtransIsProduction: process.env.MIDTRANS_IS_PRODUCTION === 'true',
   },
 });
 

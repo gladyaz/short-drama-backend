@@ -257,4 +257,81 @@ describe('EntitlementsService', () => {
       expect(rows.filter((r) => r.revokedAt === null)).toHaveLength(1);
     });
   });
+
+  describe('grantPaidPremium (work unit "MIDTRANS PAYMENT BACKEND FOUNDATION")', () => {
+    const DAY_MS = 24 * 60 * 60 * 1000;
+
+    it('grants a dated premium entitlement counted from now for a user with no active premium', async () => {
+      const before = Date.now();
+      const result = await prisma.$transaction((tx) =>
+        service.grantPaidPremium(tx, userId, 30, 'midtrans'),
+      );
+
+      expect(result).not.toBeNull();
+      expect(
+        Math.abs(result!.expiresAt.getTime() - (before + 30 * DAY_MS)),
+      ).toBeLessThan(120_000);
+
+      const rows = await prisma.entitlement.findMany({ where: { userId } });
+      expect(rows).toHaveLength(1);
+      expect(rows[0].tier).toBe('premium');
+      expect(rows[0].source).toBe('midtrans');
+      expect(await service.isEntitled(userId)).toBe(true);
+    });
+
+    it('CRITICAL: stacks a second purchase onto the FIRST purchase’s expiry, losing no paid time', async () => {
+      const first = await prisma.$transaction((tx) =>
+        service.grantPaidPremium(tx, userId, 7, 'midtrans'),
+      );
+      const second = await prisma.$transaction((tx) =>
+        service.grantPaidPremium(tx, userId, 30, 'midtrans'),
+      );
+
+      expect(second!.expiresAt.getTime() - first!.expiresAt.getTime()).toBe(
+        30 * DAY_MS,
+      );
+    });
+
+    it('starts from now (not the stale expiry) when the previous premium has already lapsed', async () => {
+      await prisma.entitlement.create({
+        data: {
+          userId,
+          tier: 'premium',
+          source: 'midtrans',
+          expiresAt: new Date(Date.now() - 10 * DAY_MS),
+        },
+      });
+
+      const before = Date.now();
+      const result = await prisma.$transaction((tx) =>
+        service.grantPaidPremium(tx, userId, 30, 'midtrans'),
+      );
+      expect(
+        Math.abs(result!.expiresAt.getTime() - (before + 30 * DAY_MS)),
+      ).toBeLessThan(120_000);
+    });
+
+    it('still records a dated purchase row when an unlimited dev-grant is active', async () => {
+      await service.devGrant(userId, undefined);
+      const before = Date.now();
+
+      const result = await prisma.$transaction((tx) =>
+        service.grantPaidPremium(tx, userId, 30, 'midtrans'),
+      );
+
+      expect(result).not.toBeNull();
+      expect(
+        Math.abs(result!.expiresAt.getTime() - (before + 30 * DAY_MS)),
+      ).toBeLessThan(120_000);
+      const rows = await prisma.entitlement.findMany({ where: { userId } });
+      expect(rows).toHaveLength(2);
+    });
+
+    it('returns null (and grants nothing) for a user that no longer exists', async () => {
+      const result = await prisma.$transaction((tx) =>
+        service.grantPaidPremium(tx, 'nonexistent-user-id', 30, 'midtrans'),
+      );
+      expect(result).toBeNull();
+    });
+  });
 });

@@ -1673,6 +1673,122 @@ existing one); `revoke` soft-revokes (sets `revokedAt`) every currently
 active entitlement for the target user, mirroring `Session`'s existing
 revocation pattern — never a hard delete.
 
+## Payments API (Midtrans Snap) — work unit "MIDTRANS PAYMENT BACKEND FOUNDATION"
+
+Backend-authoritative one-time premium purchases through the Midtrans Snap
+HOSTED payment page. Feature-gated behind `PAYMENTS_ENABLED=true` (default
+off — every route below answers `503 PAYMENTS_DISABLED` until it is set);
+sandbox vs production endpoints are selected by `MIDTRANS_IS_PRODUCTION`,
+which refuses to boot as `true` outside `NODE_ENV=production`. See
+`.env.example` for all three variables. No frontend exists yet — this is
+the payment authority layer only.
+
+The intended customer flow (Spotify-like):
+
+```
+app → POST /payments/checkout { planId }
+    → backend prices the plan, creates PaymentOrder + Midtrans transaction
+    → app redirects the user to checkoutUrl (hosted by Midtrans)
+    → user pays → Midtrans calls POST /payments/midtrans/notification
+    → backend verifies the SHA512 signature, transitions the order,
+      activates/extends premium EXACTLY ONCE
+    → app returns from the redirect, shows "checking payment",
+      polls GET /payments/:orderId, and re-fetches /users/me/entitlement
+```
+
+**The redirect back from the payment page is NEVER payment authority.** The
+query parameters Midtrans appends to the return URL are UI hints; the only
+things that can move an order or grant premium are the signature-verified
+webhook and the authenticated GET Status reconciliation
+(`PaymentNotificationService.reconcilePayment`). A frontend must always ask
+`GET /payments/:orderId` (the redirect's `order_id` value is accepted as
+the ref) and render what the backend says.
+
+### Plans (server-authoritative catalog)
+
+Clients send ONLY a `planId`; price, currency, and premium duration are
+resolved server-side from `src/payments/payment-plan.constants.ts`
+(placeholder pricing pending a product decision — no fee/markup exists):
+
+| planId        | grants   | price (IDR) |
+| ------------- | -------- | ----------- |
+| `premium-7d`  | 7 days   | 19,000      |
+| `premium-30d` | 30 days  | 49,000      |
+| `premium-90d` | 90 days  | 129,000     |
+
+Consecutive purchases STACK: a new grant's expiry counts from
+`max(now, latest active expiry)` (`EntitlementsService.grantPaidPremium`,
+source `midtrans`, reusing the Phase 10 entitlement model — no parallel
+premium system).
+
+### POST /payments/checkout (authenticated, 20/min per IP)
+
+Body: `{ "planId": "premium-30d" }` → `201`:
+
+```json
+{
+  "orderId": "cme...",
+  "providerOrderId": "sd-<uuid>",
+  "planId": "premium-30d",
+  "status": "PENDING",
+  "amountIdr": 49000,
+  "currency": "IDR",
+  "checkoutUrl": "https://app.sandbox.midtrans.com/snap/v3/redirection/<token>",
+  "checkoutExpiresAt": "..."
+}
+```
+
+Errors: `404 PAYMENT_PLAN_NOT_FOUND`, `409 PAYMENT_CHECKOUT_IN_PROGRESS`
+(concurrent checkout for the same plan — retry shortly),
+`502 PAYMENT_PROVIDER_ERROR` (Snap create failed; the order is recorded as
+`FAILED`, nothing is granted), `503 PAYMENTS_DISABLED`.
+
+Retrying checkout for a plan that already has an OPEN order returns the
+SAME order/checkout URL (at most one open order per user+plan — DB-unique
+`openOrderKey`), so a double-tap or network retry can never create a second
+chargeable transaction. Open orders self-expire with the Snap payment
+window (24h), so a dead page never blocks a re-purchase.
+
+### GET /payments/:orderId (authenticated, owner-isolated)
+
+`:orderId` accepts the internal `orderId` OR the provider `order_id`
+(`sd-...`) from the redirect return. Non-owners and unknown ids both get
+the same `404 PAYMENT_ORDER_NOT_FOUND` (anti-enumeration). Returns the
+order summary (`status`, `isPaid`, `paidAt`, `amountIdr`, `checkoutUrl`,
+timestamps) — never raw provider payloads or signatures.
+
+### POST /payments/midtrans/notification (public webhook, 120/min per IP)
+
+The Midtrans server-to-server notification endpoint (configure it in the
+Midtrans dashboard). No user authentication — authenticity is the SHA512
+`signature_key = SHA512(order_id + status_code + gross_amount + ServerKey)`
+verified timing-safely, followed by a `gross_amount`-vs-order check against
+the order's own server-computed amount. Success requires the verified
+official semantics: `transaction_status` `settlement`/`capture`,
+`fraud_status` (when present) `accept`, `status_code` `200` — a
+`challenge` stays PENDING, unknown statuses are acknowledged and ignored.
+
+Internal state machine: `CREATED → PENDING → PAID → REFUNDED`, with
+`FAILED`/`EXPIRED`/`CANCELED` as not-paid outcomes (`deny`-then-retry and
+late settlements are admitted; nothing ever downgrades `PAID`). Every
+transition is a guarded-`updateMany` CAS, so duplicate and out-of-order
+notifications are database-level no-ops, and the PAID transition + premium
+grant commit in ONE transaction — duplicate/simultaneous success delivery
+activates premium exactly once. Responses: `200 {"status":"ok"}`
+(processed or deliberately ignored), `400 PAYMENT_NOTIFICATION_INVALID`,
+`403 PAYMENT_NOTIFICATION_REJECTED` (bad signature/amount),
+`404 PAYMENT_ORDER_NOT_FOUND` (not our order), `503 PAYMENTS_DISABLED`.
+
+No raw notification payload is persisted — only normalized
+identifier/status fields on `PaymentOrder` — and the Server Key never
+appears in any response, log line (all payment logging passes
+`redactSensitiveText`), or stored row.
+
+Still gated / follow-up work: real Midtrans SANDBOX smoke (explicitly
+human-approved), mobile/web checkout UI, admin payment listing, refund
+handling beyond state recording, promoting the plan catalog to a managed
+surface.
+
 ## Analytics & Monitoring (Phase 11)
 
 Self-hosted, zero external egress — events live in the `AnalyticsEvent`

@@ -199,3 +199,46 @@ export const ADMIN_MEDIA_UPLOAD_INITIATE_RATE_TTL_MS = minutes(1);
  */
 export const VIDEO_PLAYBACK_URL_RATE_LIMIT = 60;
 export const VIDEO_PLAYBACK_URL_RATE_TTL_MS = minutes(1);
+
+/**
+ * Work unit "MIDTRANS PAYMENT BACKEND FOUNDATION": `POST /payments/checkout`
+ * creates a real transaction at an external payment provider on every
+ * non-idempotent call — the exact `ADMIN_MEDIA_UPLOAD_INITIATE_RATE_LIMIT`
+ * rationale ("a route that mints real, credential-backed external artifacts
+ * must not inherit the cheap-local-computation default"), applied to a
+ * provider-charging route instead of a presign-minting one, so it gets the
+ * same dedicated-override treatment rather than the generous 300/min
+ * default. 20/minute is far above any legitimate purchase pattern (a real
+ * user checks out a handful of times per DAY, and a retried checkout for
+ * the same plan is answered from the existing open order without a
+ * provider call at all) while bounding what a stolen token can make this
+ * backend do to the Midtrans API.
+ *
+ * Same honest limit as every other override in this file, recorded rather
+ * than overstated: `ThrottlerGuard` keys on client IP, not user id, so an
+ * attacker rotating source addresses is not bounded by it, and users
+ * sharing one NAT share a bucket.
+ */
+export const PAYMENT_CHECKOUT_RATE_LIMIT = 20;
+export const PAYMENT_CHECKOUT_RATE_TTL_MS = minutes(1);
+
+/**
+ * Work unit "MIDTRANS PAYMENT BACKEND FOUNDATION": the Midtrans
+ * notification webhook is UNAUTHENTICATED by design (provider authenticity
+ * is proven by the SHA512 signature inside the body, not by a bearer
+ * token), and this file's stated convention is that every unauthenticated
+ * route gets an explicit tight override rather than the generous default.
+ * Signature verification is cheap (one SHA512) but each accepted
+ * notification costs a DB lookup + a possible transaction, so the bucket is
+ * sized for the provider, not for browsers: Midtrans delivers one
+ * notification per status change per order plus a bounded retry ladder
+ * (2-5 retries), all from Midtrans infrastructure IPs. 120/minute per IP
+ * comfortably covers a burst of concurrent settlements while capping how
+ * fast a forger can hammer the signature check from one address. A 429
+ * answered to a REAL Midtrans delivery is retried by their documented
+ * retry policy and can additionally be recovered by
+ * `reconcilePayment` (GET Status), so throttling here never strands a
+ * payment permanently.
+ */
+export const PAYMENT_WEBHOOK_RATE_LIMIT = 120;
+export const PAYMENT_WEBHOOK_RATE_TTL_MS = minutes(1);

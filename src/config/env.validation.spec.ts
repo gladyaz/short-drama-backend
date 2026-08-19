@@ -533,3 +533,121 @@ describe('validateEnv — TRANSCODE_MAX_ATTEMPTS / TRANSCODE_STALLED_AFTER_MINUT
     );
   });
 });
+
+/**
+ * Work unit "MIDTRANS PAYMENT BACKEND FOUNDATION": `PAYMENTS_ENABLED`
+ * requires `MIDTRANS_SERVER_KEY` (name-presence only), mirroring the
+ * TRANSCODE_ENABLED/REDIS_URL conditional pattern; and
+ * `MIDTRANS_IS_PRODUCTION=true` is a fail-closed allowlist on
+ * `NODE_ENV === 'production'` — the real-money endpoint can never be
+ * selected from a dev/test environment, and sandbox is always the default.
+ */
+describe('validateEnv — PAYMENTS_ENABLED / MIDTRANS_* (MIDTRANS PAYMENT BACKEND FOUNDATION)', () => {
+  const SECRET_VALUE = 'SB-Mid-server-spec-fixture-value';
+
+  it('boots with every payments variable unset (the shipped default posture)', () => {
+    expect(() => validateEnv({ ...VALID_CONFIG })).not.toThrow();
+  });
+
+  it('boots with PAYMENTS_ENABLED=false and no MIDTRANS_* variable', () => {
+    expect(() =>
+      validateEnv({ ...VALID_CONFIG, PAYMENTS_ENABLED: 'false' }),
+    ).not.toThrow();
+  });
+
+  it('PAYMENTS_ENABLED=true without MIDTRANS_SERVER_KEY fails naming the variable', () => {
+    expect(() =>
+      validateEnv({ ...VALID_CONFIG, PAYMENTS_ENABLED: 'true' }),
+    ).toThrow(/Missing required environment variable: MIDTRANS_SERVER_KEY/);
+  });
+
+  it('PAYMENTS_ENABLED=true with MIDTRANS_SERVER_KEY boots (sandbox default)', () => {
+    expect(() =>
+      validateEnv({
+        ...VALID_CONFIG,
+        PAYMENTS_ENABLED: 'true',
+        MIDTRANS_SERVER_KEY: SECRET_VALUE,
+      }),
+    ).not.toThrow();
+  });
+
+  it('only the exact string "true" enables the requirement (fail-closed flag parsing)', () => {
+    for (const nonTrue of ['TRUE', '1', 'yes', '']) {
+      expect(() =>
+        validateEnv({ ...VALID_CONFIG, PAYMENTS_ENABLED: nonTrue }),
+      ).not.toThrow();
+    }
+  });
+
+  describe('MIDTRANS_IS_PRODUCTION allowlist', () => {
+    it.each(['test', 'development', 'Production', 'staging', ''])(
+      'CRITICAL: MIDTRANS_IS_PRODUCTION=true refuses to boot with NODE_ENV=%s',
+      (nodeEnv) => {
+        expect(() =>
+          validateEnv({
+            ...VALID_CONFIG,
+            NODE_ENV: nodeEnv,
+            MIDTRANS_IS_PRODUCTION: 'true',
+          }),
+        ).toThrow(/Refusing to boot with MIDTRANS_IS_PRODUCTION=true/);
+      },
+    );
+
+    it('CRITICAL: MIDTRANS_IS_PRODUCTION=true refuses to boot with NODE_ENV unset', () => {
+      expect(() =>
+        validateEnv({ ...VALID_CONFIG, MIDTRANS_IS_PRODUCTION: 'true' }),
+      ).toThrow(/Refusing to boot with MIDTRANS_IS_PRODUCTION=true/);
+    });
+
+    it('the production check applies even while payments are disabled', () => {
+      expect(() =>
+        validateEnv({
+          ...VALID_CONFIG,
+          NODE_ENV: 'test',
+          PAYMENTS_ENABLED: 'false',
+          MIDTRANS_IS_PRODUCTION: 'true',
+        }),
+      ).toThrow(/Refusing to boot with MIDTRANS_IS_PRODUCTION=true/);
+    });
+
+    it('MIDTRANS_IS_PRODUCTION=true + NODE_ENV=production boots', () => {
+      expect(() =>
+        validateEnv({
+          ...VALID_CONFIG,
+          NODE_ENV: 'production',
+          PAYMENTS_ENABLED: 'true',
+          MIDTRANS_SERVER_KEY: SECRET_VALUE,
+          MIDTRANS_IS_PRODUCTION: 'true',
+        }),
+      ).not.toThrow();
+    });
+
+    it('MIDTRANS_IS_PRODUCTION unset/false boots under any NODE_ENV (sandbox is the default)', () => {
+      expect(() =>
+        validateEnv({ ...VALID_CONFIG, NODE_ENV: 'test' }),
+      ).not.toThrow();
+      expect(() =>
+        validateEnv({
+          ...VALID_CONFIG,
+          NODE_ENV: 'test',
+          MIDTRANS_IS_PRODUCTION: 'false',
+        }),
+      ).not.toThrow();
+    });
+  });
+
+  it('no MIDTRANS_SERVER_KEY value ever appears in an error message', () => {
+    try {
+      validateEnv({
+        ...VALID_CONFIG,
+        NODE_ENV: 'test',
+        PAYMENTS_ENABLED: 'true',
+        MIDTRANS_SERVER_KEY: SECRET_VALUE,
+        MIDTRANS_IS_PRODUCTION: 'true',
+      });
+      throw new Error('expected validateEnv to throw');
+    } catch (error) {
+      expect(String(error)).not.toContain(SECRET_VALUE);
+    }
+  });
+});

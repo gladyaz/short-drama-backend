@@ -20,6 +20,7 @@ import { ExportModule } from './export/export.module';
 import { HealthModule } from './health/health.module';
 import { InteractionsModule } from './interactions/interactions.module';
 import { MediaModule } from './media/media.module';
+import { PaymentsModule } from './payments/payments.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { ProgressModule } from './progress/progress.module';
 import { RetentionModule } from './retention/retention.module';
@@ -72,6 +73,13 @@ import { VideosModule } from './videos/videos.module';
     // `RetentionModule`'s own doc comment. Registers no cron job at all
     // unless explicitly enabled.
     RetentionModule,
+    // Work unit "MIDTRANS PAYMENT BACKEND FOUNDATION": env-gated
+    // (`PAYMENTS_ENABLED`, default OFF) Midtrans Snap payment surface —
+    // checkout/status routes and the provider notification webhook. While
+    // the flag is off (this repo's shipped default) every payment route
+    // answers 503 PAYMENTS_DISABLED and the provider gateway is an inert
+    // no-credential stub — see `PaymentsModule`'s own doc comment.
+    PaymentsModule,
   ],
   controllers: [AppController],
   providers: [AppService, { provide: APP_GUARD, useClass: ThrottlerGuard }],

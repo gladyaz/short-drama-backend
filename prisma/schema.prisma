@@ -60,6 +60,16 @@ model User {
   /// precedent instead. See `PasswordResetToken` below for the full design
   /// rationale.
   passwordResetTokens PasswordResetToken[]
+  /// Work unit "MIDTRANS PAYMENT BACKEND FOUNDATION": payment orders this
+  /// user has initiated. Nullable back-reference with `onDelete: SetNull`
+  /// (NOT `Cascade`), mirroring the `AuthAuditEvent` precedent above rather
+  /// than the `Session`/`AccountLockout` one: a payment order is a financial
+  /// audit record — deleting an account must not destroy the history of what
+  /// was charged and what was granted for it. Unlike `AuthAuditEvent`, no
+  /// pre-delete scrub is needed: a `PaymentOrder` row carries no PII (no
+  /// email, IP, user agent, or card data — only plan/amount/status fields
+  /// and server-generated identifiers; see the `PaymentOrder` model below).
+  paymentOrders       PaymentOrder[]
 }
 
 // Phase 12, work unit 12A-B1: persistent (PostgreSQL, survives restart)
@@ -757,6 +767,83 @@ model AuthAuditEvent {
 // dead weight, not an audit trail worth preserving — this mirrors
 // `Session`/`AccountLockout`'s existing cascade precedent, not
 // `AuthAuditEvent`'s survive-and-get-scrubbed precedent.
+// Work unit "MIDTRANS PAYMENT BACKEND FOUNDATION": the authoritative,
+// server-owned record of one checkout attempt against the Midtrans Snap
+// hosted-payment flow. This row — never a webhook payload, never a redirect
+// query parameter, never anything a client sends — is the single source of
+// truth for what was ordered, what it costs, and whether it has been paid.
+//
+// `status` is a plain `String` (NOT a Postgres enum, matching the
+// `Video.lifecycleState`/`Entitlement.tier` precedent), app-layer validated
+// against the closed `PaymentOrderStatus` union in
+// `src/payments/payment-state.constants.ts` (CREATED | PENDING | PAID |
+// FAILED | EXPIRED | CANCELED | REFUNDED). Every transition is applied via a
+// guarded `updateMany` CAS whose `where` clause names the exact set of
+// states the transition is allowed FROM (the `TranscodeIntentService`
+// `processingState` idiom) — a duplicate or out-of-order webhook matches 0
+// rows and writes nothing, which is what makes webhook processing idempotent
+// and monotonic at the DATABASE level rather than as a check-then-act hope.
+//
+// `providerOrderId` is the server-GENERATED id sent to Midtrans as
+// `transaction_details.order_id` (`sd-<uuid>`, well within Midtrans'
+// String(50) / [-_~.] contract) — a client never chooses or supplies it.
+// `@unique` both enforces the Midtrans "single use per merchant" order-id
+// contract and gives webhook lookups an index.
+//
+// `openOrderKey` is the checkout idempotency anchor: `"<userId>:<planId>"`
+// while the order is open (CREATED/PENDING), `NULL` once it reaches any
+// terminal state (every terminal CAS clears it in the same write). The
+// partial-uniqueness this needs ("at most one OPEN order per user+plan") is
+// expressed as a plain nullable `@unique` — Postgres allows any number of
+// NULLs in a unique index — so a retried/double-tapped checkout finds and
+// returns the existing open order instead of silently creating (and
+// potentially charging) a second one, and a concurrent duplicate INSERT
+// loses with a unique violation instead of racing.
+//
+// `entitlementId` (nullable, `@unique`) records WHICH `Entitlement` row this
+// order's success produced — written in the SAME transaction as the
+// PAID transition, so "order says PAID" and "premium was granted for it" can
+// never disagree. Plain string reference (no `@relation`), matching the
+// `Video.seriesId`/`UserVideoInteraction.videoId` app-level-reference
+// precedent. `amountIdr` is the server-computed authoritative charge in
+// whole rupiah (Midtrans: IDR only, no decimals); `entitlementDurationDays`
+// snapshots the purchased premium duration AT CHECKOUT TIME so a later
+// catalog change can never retroactively alter what an already-paid order
+// grants. `snapToken`/`checkoutUrl` are the Midtrans-issued hosted-payment
+// references (client-facing by design — not secrets, but never logged).
+// No raw provider payload is persisted anywhere on this row (deliberate,
+// see `PaymentNotificationService`'s doc comment): only normalized
+// identifiers/status fields — so no `signature_key`, Server Key material,
+// or unbounded JSON can ever leak through a DB dump or API response.
+model PaymentOrder {
+  id                        String    @id @default(cuid())
+  userId                    String?
+  user                      User?     @relation(fields: [userId], references: [id], onDelete: SetNull)
+  provider                  String
+  providerOrderId           String    @unique
+  planId                    String
+  amountIdr                 Int
+  currency                  String
+  status                    String
+  openOrderKey              String?   @unique
+  snapToken                 String?
+  checkoutUrl               String?
+  checkoutExpiresAt         DateTime?
+  providerTransactionId     String?
+  providerTransactionStatus String?
+  providerFraudStatus       String?
+  entitlementDurationDays   Int
+  paidAt                    DateTime?
+  entitlementId             String?   @unique
+  failureCode               String?
+  createdAt                 DateTime  @default(now())
+  updatedAt                 DateTime  @updatedAt
+
+  @@index([userId])
+  @@index([status])
+  @@index([createdAt])
+}
+
 model PasswordResetToken {
   id        String    @id @default(cuid())
   userId    String

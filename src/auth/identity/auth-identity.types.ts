@@ -63,5 +63,33 @@ export interface AuthIdentitySummaryDto {
 export interface WhatsAppOtpRequestResponseDto {
   success: true;
   expiresInSeconds: number;
+  /**
+   * PHASE 10C — added when the backend and mobile provider contracts were
+   * reconciled (`docs/auth-identity-api-contract.md` §10).
+   *
+   * WHY IT IS PART OF THE CONTRACT RATHER THAN A CLIENT CONSTANT. The
+   * resend cooldown is enforced per-NUMBER in the database
+   * (`OTP_RESEND_COOLDOWN_MS`), so a client that hardcodes its own
+   * countdown is guessing at a server rule — and a client that receives no
+   * value at all has nothing to count down from. The mobile client's own
+   * hardening notes record what that cost: an absent field produced `NaN`,
+   * which fails every comparison, so the countdown never reached zero and
+   * the resend button stayed disabled for the rest of the session.
+   *
+   * SAFE TO RETURN, on the same reasoning as `expiresInSeconds`: it is a
+   * fixed public constant, identical for every caller and every number,
+   * emitted only on the `202` path that already answers identically for a
+   * registered and an unregistered number. It is NOT the remaining time on
+   * a pre-existing challenge — that WOULD be a recent-activity oracle.
+   *
+   * A MINIMUM WAIT, NOT AN ADMISSION GUARANTEE. It reports the per-number
+   * cooldown alone; the per-IP route throttle (3 per 10 min — reached by
+   * one send plus two resends, and answering a generic `HTTP_ERROR` 429)
+   * and the per-number rolling budget can both push the real wait further.
+   * Clients must keep handling `429` on resend. See
+   * `IssuedOtpChallenge.resendAvailableInSeconds` and
+   * `docs/auth-identity-api-contract.md` §3.3.
+   */
+  resendAvailableInSeconds: number;
   devCode?: string;
 }

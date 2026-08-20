@@ -266,6 +266,7 @@ export class AuthIdentityService {
     return {
       success: true,
       expiresInSeconds: issued.expiresInSeconds,
+      resendAvailableInSeconds: issued.resendAvailableInSeconds,
       devCode: issued.devCode,
     };
   }

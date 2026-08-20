@@ -19,7 +19,11 @@ import { GoogleTokenRejected } from './../src/auth/identity/google/google-id-tok
 import { WHATSAPP_OTP_PROVIDER } from './../src/auth/identity/whatsapp/whatsapp-otp.types';
 import { LocalFakeWhatsAppOtpProvider } from './../src/auth/identity/whatsapp/whatsapp-local-fake.provider';
 import { WhatsAppOtpService } from './../src/auth/identity/whatsapp/whatsapp-otp.service';
-import { OTP_MAX_ATTEMPTS } from './../src/auth/identity/auth-identity.constants';
+import {
+  OTP_MAX_ATTEMPTS,
+  OTP_RESEND_COOLDOWN_MS,
+  OTP_TTL_MS,
+} from './../src/auth/identity/auth-identity.constants';
 import { bcryptTestBudgetMs } from './../src/common/testing/bcrypt-test-budget.helpers';
 import {
   TEST_FIXTURE_NAMESPACE,
@@ -281,6 +285,16 @@ describe('Auth identities (e2e)', () => {
         .expect(HttpStatus.ACCEPTED);
 
       expect(requested.body).toMatchObject({ success: true });
+      // PHASE 10C — the two timing fields are part of the frozen contract.
+      // The client renders its expiry and resend countdowns from THESE
+      // values; a missing one previously produced a NaN countdown that never
+      // finished and a resend button that stayed disabled for the whole
+      // session, so "present and correct" is asserted at the HTTP boundary
+      // rather than trusted.
+      expect(requested.body).toMatchObject({
+        expiresInSeconds: Math.floor(OTP_TTL_MS / 1000),
+        resendAvailableInSeconds: Math.floor(OTP_RESEND_COOLDOWN_MS / 1000),
+      });
       // `DEV_TOOLS_ENABLED` is not set in the test environment, so no
       // plaintext code may appear in the response body.
       expect(requested.body).not.toHaveProperty('devCode');
@@ -501,6 +515,127 @@ describe('Auth identities (e2e)', () => {
         .delete('/auth/identities/facebook')
         .set('Authorization', `Bearer ${auth.accessToken}`)
         .expect(HttpStatus.BAD_REQUEST);
+    });
+  });
+
+  /**
+   * PHASE 10C — the reconciled contract's three cross-provider guarantees,
+   * asserted at the real HTTP boundary because they are exactly the ones a
+   * client depends on and a unit test cannot observe: what the canonical
+   * email routes may NOT do, what a phone-only account's JSON actually looks
+   * like, and that OTP-start cannot be used to probe for accounts.
+   */
+  describe('canonical contract guarantees', () => {
+    it('LOGIN NEVER REGISTERS: an unknown email is 401 and creates no row', async () => {
+      const email = uniqueEmail('login-never-registers');
+
+      const before = await prisma.user.count({ where: { email } });
+      expect(before).toBe(0);
+
+      const response = await request(server())
+        .post('/auth/login')
+        .send({ email, password: 'correct-horse-battery' })
+        .expect(HttpStatus.UNAUTHORIZED);
+
+      expect((response.body as ErrorResponseBody).code).toBe(
+        'INVALID_CREDENTIALS',
+      );
+      // The load-bearing assertion. `INVALID_CREDENTIALS` alone would still
+      // be satisfied by an implementation that created the account and then
+      // failed the password check, so the row count is what actually pins
+      // "account creation is EXPLICIT, and only `POST /auth/register` does
+      // it". The mobile client removed its own login-or-register fallback
+      // for the same reason; this is the server-side half of that contract.
+      expect(await prisma.user.count({ where: { email } })).toBe(0);
+    });
+
+    it('a phone-only account reports email: null — never a synthetic address', async () => {
+      const phone = fixturePhone();
+      const code = await completeOtp(phone);
+
+      const verified = await request(server())
+        .post('/auth/whatsapp/otp/verify')
+        .send({ phone, code })
+        .expect(HttpStatus.OK);
+      const session = verified.body as AuthResponseDto;
+
+      // PRESENT, and null — not omitted. A client may read `user.email`
+      // unconditionally; what it must not assume is that it is a string.
+      expect(session.user).toHaveProperty('email', null);
+
+      const me = await request(server())
+        .get('/auth/me')
+        .set('Authorization', `Bearer ${session.accessToken}`)
+        .expect(HttpStatus.OK);
+      expect(me.body).toHaveProperty('email', null);
+
+      // No invented address anywhere in the account's own records: the human
+      // -readable label for this account comes from the MASKED identifier on
+      // the identity listing, which is why that listing exists.
+      const stored = await prisma.user.findUniqueOrThrow({
+        where: { id: session.user.id },
+        select: { email: true },
+      });
+      expect(stored.email).toBeNull();
+
+      const identities = await request(server())
+        .get('/auth/identities')
+        .set('Authorization', `Bearer ${session.accessToken}`)
+        .expect(HttpStatus.OK);
+      const listed = identities.body as AuthIdentitySummaryDto[];
+      expect(listed).toHaveLength(1);
+      expect(listed[0].provider).toBe('whatsapp');
+      expect(listed[0].identifier).not.toContain('@');
+      expect(listed[0].identifier).not.toBe(phone);
+    });
+
+    it('OTP-start answers identically for a number with an account and one without', async () => {
+      const registered = fixturePhone();
+      const code = await completeOtp(registered);
+      await request(server())
+        .post('/auth/whatsapp/otp/verify')
+        .send({ phone: registered, code })
+        .expect(HttpStatus.OK);
+
+      // BACK-DATES the challenge rather than deleting it, which matters.
+      // Clearing the cooldown is necessary — leaving it in force would mask
+      // the comparison behind a 429 that has nothing to do with account
+      // existence — but DELETING the row would also erase this number's
+      // request history, and then a hypothetical implementation that
+      // derived its timing from that history would produce identical bodies
+      // for both numbers and pass this test vacuously. Back-dating leaves
+      // `registered` with one real prior challenge and the fresh number with
+      // none, so the comparison below discriminates a fixed constant from a
+      // history-derived value as well as an account-existence leak.
+      await prisma.phoneOtpChallenge.updateMany({
+        where: { phoneE164: registered },
+        data: { createdAt: new Date(Date.now() - 10 * 60 * 1000) },
+      });
+      resetThrottlerStorage(throttlerStorage);
+
+      const knownNumber = await request(server())
+        .post('/auth/whatsapp/otp/request')
+        .send({ phone: registered })
+        .expect(HttpStatus.ACCEPTED);
+
+      const unknownNumber = await request(server())
+        .post('/auth/whatsapp/otp/request')
+        .send({ phone: fixturePhone() })
+        .expect(HttpStatus.ACCEPTED);
+
+      // Deep-equal bodies AND identical status. Both timing fields are
+      // fixed public constants precisely so this equality holds — a
+      // remaining-cooldown value would make the response vary by the
+      // number's recent history, which the back-dated row above now makes
+      // observable. What this cannot see is response TIMING; that side
+      // channel is closed by construction instead, because `requestOtp`
+      // never reads `User` or `AuthIdentity` at all.
+      expect(knownNumber.body).toEqual(unknownNumber.body);
+      expect(knownNumber.body).toMatchObject({
+        success: true,
+        expiresInSeconds: Math.floor(OTP_TTL_MS / 1000),
+        resendAvailableInSeconds: Math.floor(OTP_RESEND_COOLDOWN_MS / 1000),
+      });
     });
   });
 

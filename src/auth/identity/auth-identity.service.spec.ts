@@ -15,7 +15,11 @@ import { AccountLockoutService } from '../account-lockout.service';
 import { AuthAuditService } from '../auth-audit.service';
 import { AuthService } from '../auth.service';
 import { AuthIdentityService } from './auth-identity.service';
-import { OTP_MAX_ATTEMPTS, OTP_TTL_MS } from './auth-identity.constants';
+import {
+  OTP_MAX_ATTEMPTS,
+  OTP_RESEND_COOLDOWN_MS,
+  OTP_TTL_MS,
+} from './auth-identity.constants';
 import { GOOGLE_IDENTITY_VERIFIER } from './google/google-identity.types';
 import type {
   GoogleIdentityVerifier,
@@ -586,6 +590,12 @@ describe('AuthIdentityService', () => {
       const requested = await identityService.requestOtp({ phone });
       expect(requested).toMatchObject({ success: true });
       expect(requested.expiresInSeconds).toBe(Math.floor(OTP_TTL_MS / 1000));
+      // PHASE 10C: the client renders its resend countdown from THIS value
+      // rather than a constant of its own, so it must be the server's real
+      // cooldown and must be present on every issue.
+      expect(requested.resendAvailableInSeconds).toBe(
+        Math.floor(OTP_RESEND_COOLDOWN_MS / 1000),
+      );
       // No plaintext code in the response while dev-tools exposure is off.
       expect(requested.devCode).toBeUndefined();
 

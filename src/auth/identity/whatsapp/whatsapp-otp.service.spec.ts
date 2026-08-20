@@ -5,7 +5,11 @@ import {
   TEST_FIXTURE_PHONE_PREFIX,
   fixturePhone,
 } from '../../../common/testing/fixture-namespace.helpers';
-import { OTP_MAX_ATTEMPTS, OTP_TTL_MS } from '../auth-identity.constants';
+import {
+  OTP_MAX_ATTEMPTS,
+  OTP_MAX_REQUESTS_PER_WINDOW,
+  OTP_TTL_MS,
+} from '../auth-identity.constants';
 import {
   OtpRejected,
   OtpRequestThrottled,
@@ -294,6 +298,51 @@ describe('WhatsAppOtpService', () => {
       await expect(
         service.claimChallenge(phone, provider.lastCodeFor(phone)),
       ).resolves.toBeUndefined();
+    });
+
+    /**
+     * PHASE 10C, fix cycle 1 (Reviewer B, LOW-1). The `window_exhausted`
+     * branch of `assertRequestAllowed` had no test at all — reaching it
+     * needs `OTP_MAX_REQUESTS_PER_WINDOW` requests whose cooldowns have
+     * each elapsed, which no suite did.
+     *
+     * Closing it matters now because `resendAvailableInSeconds` makes an
+     * implicit claim about this exact branch: that field reports the
+     * 60-second COOLDOWN, and this test is the standing proof the cooldown
+     * is not the only gate — which is why the field is documented as a
+     * minimum wait rather than a promise of admission.
+     */
+    it('refuses a request once the per-number rolling budget is spent, even with the cooldown clear', async () => {
+      const phone = fixturePhone();
+
+      for (let i = 0; i < OTP_MAX_REQUESTS_PER_WINDOW; i += 1) {
+        await service.issueChallenge(phone, {});
+        // Back-dated past the 60s cooldown but well inside the 1-hour
+        // window, so the NEXT issue is never refused by the cooldown while
+        // every row still counts against the budget. Without this the loop
+        // would stop at the cooldown and never reach the branch under test.
+        await prisma.phoneOtpChallenge.updateMany({
+          where: { phoneE164: phone },
+          data: { createdAt: new Date(Date.now() - 10 * 60 * 1000) },
+        });
+      }
+
+      await expect(service.issueChallenge(phone, {})).rejects.toMatchObject({
+        reason: 'window_exhausted',
+      });
+
+      // Same exception class the cooldown raises, so both surface to the
+      // caller as one `OTP_RESEND_COOLDOWN`: the client cannot tell which
+      // limiter stopped it, and must not need to.
+      await expect(service.issueChallenge(phone, {})).rejects.toBeInstanceOf(
+        OtpRequestThrottled,
+      );
+
+      // The budget is checked BEFORE a code is generated or handed to the
+      // provider, so a refused request costs no message and writes no row.
+      expect(
+        await prisma.phoneOtpChallenge.count({ where: { phoneE164: phone } }),
+      ).toBe(OTP_MAX_REQUESTS_PER_WINDOW);
     });
   });
 

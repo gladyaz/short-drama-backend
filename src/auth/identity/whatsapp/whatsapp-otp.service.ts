@@ -89,6 +89,38 @@ export class OtpRequestThrottled extends Error {
 export interface IssuedOtpChallenge {
   expiresInSeconds: number;
   /**
+   * PHASE 10C: the per-number resend COOLDOWN — a MINIMUM wait, never a
+   * promise that the next request will be accepted.
+   *
+   * Always the full `OTP_RESEND_COOLDOWN_MS`, because a challenge that was
+   * just issued restarts the cooldown by definition — this is never a
+   * remaining-time computation against an EXISTING challenge, so it cannot
+   * vary by caller or by number and therefore carries no account-existence
+   * or recent-activity signal. Exactly the same "fixed, public constant of
+   * the system" property that already makes `expiresInSeconds` safe.
+   *
+   * IT IS THE COOLDOWN ONLY, and two other limiters sit beside it, so a
+   * finished countdown is not permission:
+   *   - the per-IP `@Throttle()` on the route (3 per 10 min) — the one an
+   *     ordinary user actually reaches, since one send plus two resends
+   *     exhausts it. Its `429` comes from the framework, so it carries
+   *     `code: "HTTP_ERROR"`, NOT `OTP_RESEND_COOLDOWN`.
+   *   - the per-number rolling budget (`OTP_MAX_REQUESTS_PER_WINDOW` in
+   *     `OTP_REQUEST_WINDOW_MS`), whose refusal can be nearly an hour away
+   *     even though this field said 60.
+   * A client MUST keep handling `429` on resend rather than treating a
+   * finished countdown as a guarantee.
+   *
+   * Deliberately NOT computed from the number's real request history: that
+   * would vary by how recently somebody asked for a code for this number,
+   * which is exactly the recent-activity oracle the `202` contract avoids.
+   *
+   * It exists so a client renders its resend countdown from the server's
+   * own value instead of hardcoding one that would silently drift from
+   * `OTP_RESEND_COOLDOWN_MS`.
+   */
+  resendAvailableInSeconds: number;
+  /**
    * The plaintext code, present ONLY when dev-token exposure is permitted
    * (see `exposeDevCode`). `undefined` in every other case, including every
    * production configuration.
@@ -177,6 +209,7 @@ export class WhatsAppOtpService {
 
     return {
       expiresInSeconds: Math.floor(OTP_TTL_MS / 1000),
+      resendAvailableInSeconds: Math.floor(OTP_RESEND_COOLDOWN_MS / 1000),
       devCode: this.exposeDevCode(code),
     };
   }

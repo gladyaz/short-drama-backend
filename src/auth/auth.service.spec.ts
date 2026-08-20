@@ -17,6 +17,7 @@ import {
   fixtureEmail,
 } from '../common/testing/fixture-namespace.helpers';
 import type { AuthResponseDto } from './auth.types';
+import { requirePasswordHash } from '../common/testing/password-hash.helpers';
 
 const TEST_AUTH_CONFIG = {
   jwtAccessSecret: 'test-access-secret-not-a-real-secret',
@@ -1034,12 +1035,12 @@ describe('AuthService', () => {
 
       // The stored password hash actually changed.
       const storedUser = await prisma.user.findUnique({ where: { email } });
-      expect(await bcrypt.compare(newPassword, storedUser!.passwordHash)).toBe(
-        true,
-      );
-      expect(await bcrypt.compare(oldPassword, storedUser!.passwordHash)).toBe(
-        false,
-      );
+      expect(
+        await bcrypt.compare(newPassword, requirePasswordHash(storedUser)),
+      ).toBe(true);
+      expect(
+        await bcrypt.compare(oldPassword, requirePasswordHash(storedUser)),
+      ).toBe(false);
 
       // Logging in with the OLD password now fails; the NEW password works.
       await expect(
@@ -1080,7 +1081,7 @@ describe('AuthService', () => {
 
       const storedUser = await prisma.user.findUnique({ where: { email } });
       expect(
-        await bcrypt.compare(correctPassword, storedUser!.passwordHash),
+        await bcrypt.compare(correctPassword, requirePasswordHash(storedUser)),
       ).toBe(true);
 
       // The session is untouched — the presented refresh token still works.
@@ -1117,7 +1118,7 @@ describe('AuthService', () => {
 
       const storedUser = await prisma.user.findUnique({ where: { email } });
       expect(
-        await bcrypt.compare(correctPassword, storedUser!.passwordHash),
+        await bcrypt.compare(correctPassword, requirePasswordHash(storedUser)),
       ).toBe(true);
     });
 
@@ -1155,7 +1156,7 @@ describe('AuthService', () => {
         where: { email: emailA },
       });
       expect(
-        await bcrypt.compare(correctPassword, storedUserA!.passwordHash),
+        await bcrypt.compare(correctPassword, requirePasswordHash(storedUserA)),
       ).toBe(true);
 
       const sessionsB = await prisma.session.findMany({
@@ -1271,7 +1272,7 @@ describe('AuthService', () => {
       // The password change must NOT have been applied.
       const storedUser = await prisma.user.findUnique({ where: { email } });
       expect(
-        await bcrypt.compare(correctPassword, storedUser!.passwordHash),
+        await bcrypt.compare(correctPassword, requirePasswordHash(storedUser)),
       ).toBe(true);
 
       // Every session for the account ends up revoked (the defensive
@@ -1689,7 +1690,7 @@ describe('AuthService', () => {
       // usable" rejection, and must not itself revoke anything.
       const storedUser = await prisma.user.findUnique({ where: { email } });
       expect(
-        await bcrypt.compare(correctPassword, storedUser!.passwordHash),
+        await bcrypt.compare(correctPassword, requirePasswordHash(storedUser)),
       ).toBe(true);
 
       const sessionAfter = await prisma.session.findUnique({
@@ -2486,12 +2487,12 @@ describe('AuthService', () => {
       const storedUser = await devToolsPrisma.user.findUnique({
         where: { email },
       });
-      expect(await bcrypt.compare(newPassword, storedUser!.passwordHash)).toBe(
-        true,
-      );
-      expect(await bcrypt.compare(oldPassword, storedUser!.passwordHash)).toBe(
-        false,
-      );
+      expect(
+        await bcrypt.compare(newPassword, requirePasswordHash(storedUser)),
+      ).toBe(true);
+      expect(
+        await bcrypt.compare(oldPassword, requirePasswordHash(storedUser)),
+      ).toBe(false);
 
       await expect(
         devToolsService.login({ email, password: oldPassword }),
@@ -2541,7 +2542,10 @@ describe('AuthService', () => {
         where: { email },
       });
       expect(
-        await bcrypt.compare('brand-new-password-1', storedUser!.passwordHash),
+        await bcrypt.compare(
+          'brand-new-password-1',
+          requirePasswordHash(storedUser),
+        ),
       ).toBe(true);
     });
 
@@ -2569,9 +2573,9 @@ describe('AuthService', () => {
       const storedUser = await devToolsPrisma.user.findUnique({
         where: { email },
       });
-      expect(await bcrypt.compare(oldPassword, storedUser!.passwordHash)).toBe(
-        true,
-      );
+      expect(
+        await bcrypt.compare(oldPassword, requirePasswordHash(storedUser)),
+      ).toBe(true);
     });
 
     it('rejects an unknown/garbage token with the same generic INVALID_PASSWORD_RESET_TOKEN error', async () => {
@@ -2612,7 +2616,9 @@ describe('AuthService', () => {
       const storedB = await devToolsPrisma.user.findUnique({
         where: { email: emailB },
       });
-      expect(await bcrypt.compare(password, storedB!.passwordHash)).toBe(true);
+      expect(await bcrypt.compare(password, requirePasswordHash(storedB))).toBe(
+        true,
+      );
       await expect(
         devToolsService.login({ email: emailB, password }),
       ).resolves.toBeDefined();
@@ -2773,12 +2779,15 @@ describe('AuthService', () => {
         where: { email },
       });
       expect(
-        await bcrypt.compare('brand-new-password-1', storedUser!.passwordHash),
+        await bcrypt.compare(
+          'brand-new-password-1',
+          requirePasswordHash(storedUser),
+        ),
       ).toBe(true);
       expect(
         await bcrypt.compare(
           'attacker-supplied-password',
-          storedUser!.passwordHash,
+          requirePasswordHash(storedUser),
         ),
       ).toBe(false);
 
@@ -2951,13 +2960,13 @@ describe('AuthService', () => {
       expect(
         await bcrypt.compare(
           'fresh-token-password-3',
-          storedUser!.passwordHash,
+          requirePasswordHash(storedUser),
         ),
       ).toBe(true);
       expect(
         await bcrypt.compare(
           'loser-stale-password-2',
-          storedUser!.passwordHash,
+          requirePasswordHash(storedUser),
         ),
       ).toBe(false);
     });
@@ -3076,12 +3085,12 @@ describe('AuthService', () => {
           where: { id: account.userId },
         });
         expect(
-          await bcrypt.compare(NEW_PASSWORD, storedUser!.passwordHash),
+          await bcrypt.compare(NEW_PASSWORD, requirePasswordHash(storedUser)),
         ).toBe(true);
         expect(
           await bcrypt.compare(
             'attacker-supplied-password-1',
-            storedUser!.passwordHash,
+            requirePasswordHash(storedUser),
           ),
         ).toBe(false);
       },
@@ -3201,7 +3210,7 @@ describe('AuthService', () => {
         expect(
           await bcrypt.compare(
             'recovered-password-1',
-            storedUser!.passwordHash,
+            requirePasswordHash(storedUser),
           ),
         ).toBe(true);
       },
@@ -3239,7 +3248,7 @@ describe('AuthService', () => {
         expect(
           await bcrypt.compare(
             'recovered-password-3',
-            storedUser!.passwordHash,
+            requirePasswordHash(storedUser),
           ),
         ).toBe(true);
       },
@@ -3312,7 +3321,7 @@ describe('AuthService', () => {
           where: { id: account.userId },
         });
         expect(
-          await bcrypt.compare(OLD_PASSWORD, storedUser!.passwordHash),
+          await bcrypt.compare(OLD_PASSWORD, requirePasswordHash(storedUser)),
         ).toBe(true);
 
         // ...so no new credential generation was opened, and the recovery
@@ -3334,7 +3343,10 @@ describe('AuthService', () => {
           where: { id: account.userId },
         });
         expect(
-          await bcrypt.compare('recovered-password-4', recovered!.passwordHash),
+          await bcrypt.compare(
+            'recovered-password-4',
+            requirePasswordHash(recovered),
+          ),
         ).toBe(true);
       },
       bcryptTestBudgetMs(6),
@@ -3366,7 +3378,7 @@ describe('AuthService', () => {
         expect(
           await bcrypt.compare(
             'recovered-password-2',
-            storedUser!.passwordHash,
+            requirePasswordHash(storedUser),
           ),
         ).toBe(true);
 
@@ -3549,7 +3561,7 @@ describe('AuthService', () => {
         expect(
           await bcrypt.compare(
             'bystander-recovered-1',
-            storedBystander!.passwordHash,
+            requirePasswordHash(storedBystander),
           ),
         ).toBe(true);
       },

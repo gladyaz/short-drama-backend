@@ -225,6 +225,55 @@ export interface PaymentsConfig {
   midtransIsProduction: boolean;
 }
 
+/**
+ * PHASE 10B — PRODUCTION IDENTITY PROVIDERS. Google + WhatsApp provider
+ * configuration, mirroring `PaymentsConfig`/`TranscodeConfig`'s "read
+ * unconditionally here, `env.validation.ts` decides what is required"
+ * split exactly.
+ *
+ * Both `enabled` flags follow the fail-closed, exact-string precedent
+ * `TRANSCODE_ENABLED`/`PAYMENTS_ENABLED` set: the value must be the literal
+ * string `"true"` to activate anything — absent, empty, `"TRUE"`, `"1"`,
+ * `"yes"` and every other value resolve to `false`, never the reverse.
+ * `false` is this repository's shipped default for both, which is what
+ * makes "production execution fails closed until configured" true by
+ * construction rather than by discipline: with the flag off, `AuthModule`
+ * binds the inert `DisabledGoogleIdentityVerifier` /
+ * `DisabledWhatsAppOtpProvider`, the routes answer
+ * `503 GOOGLE_AUTH_DISABLED` / `503 WHATSAPP_AUTH_DISABLED`, and no
+ * provider-specific variable is required at boot.
+ *
+ * EMAIL/PASSWORD HAS NO FLAG, deliberately. It is not an optional provider
+ * that can be switched off — it is the always-available baseline this phase
+ * adds alongside, and there must be no configuration under which an
+ * existing account loses the ability to sign in the way it always has.
+ *
+ * `googleClientIds` is the exact-match `aud` allowlist for ID-token
+ * verification. It is a LIST because one backend legitimately serves
+ * several OAuth clients (Android, iOS and web each get their own client
+ * id). These values are NOT secrets — a Google OAuth client id ships inside
+ * the mobile app binary and is public by design — but they are still read
+ * from the environment rather than committed, so a deployment can change
+ * them without a code change. The OAuth client SECRET is deliberately NOT
+ * part of this config and is never read anywhere in this codebase:
+ * verifying an ID token requires only Google's public keys and the client
+ * id, so there is no reason for this backend to hold the secret at all,
+ * and a secret that is never held cannot be leaked.
+ *
+ * `whatsappOtpDriver` names WHICH `WhatsAppOtpProvider` implementation to
+ * bind. `fake` — the only implemented driver — is refused outside
+ * `development`/`test` by `env.validation.ts`. There is no default: with
+ * `WHATSAPP_AUTH_ENABLED=true` and no valid driver, the process refuses to
+ * boot rather than starting a backend that accepts OTP requests and
+ * delivers nothing.
+ */
+export interface IdentityProvidersConfig {
+  googleEnabled: boolean;
+  googleClientIds: string[];
+  whatsappEnabled: boolean;
+  whatsappOtpDriver: string | undefined;
+}
+
 export interface RootConfig {
   app: AppConfig;
   auth: AuthConfig;
@@ -232,6 +281,7 @@ export interface RootConfig {
   transcode: TranscodeConfig;
   hlsGateway: HlsGatewayConfig;
   payments: PaymentsConfig;
+  identityProviders: IdentityProvidersConfig;
 }
 
 export default (): RootConfig => ({
@@ -288,7 +338,28 @@ export default (): RootConfig => ({
     midtransServerKey: process.env.MIDTRANS_SERVER_KEY,
     midtransIsProduction: process.env.MIDTRANS_IS_PRODUCTION === 'true',
   },
+  identityProviders: {
+    googleEnabled: process.env.GOOGLE_AUTH_ENABLED === 'true',
+    googleClientIds: parseCsvEnv(process.env.GOOGLE_OAUTH_CLIENT_IDS),
+    whatsappEnabled: process.env.WHATSAPP_AUTH_ENABLED === 'true',
+    whatsappOtpDriver: process.env.WHATSAPP_OTP_PROVIDER_DRIVER,
+  },
 });
+
+/**
+ * PHASE 10B: splits a comma-separated env value into trimmed, non-empty
+ * entries — the exact shape `app.corsOrigins` above already uses for
+ * `CORS_ORIGINS`, reused rather than reinvented. An absent or blank value
+ * yields an empty array, which `env.validation.ts` treats as "not
+ * configured" when the corresponding feature flag is on, and which
+ * `validateGoogleClaims` independently treats as "matches nothing".
+ */
+function parseCsvEnv(value: string | undefined): string[] {
+  return (value ?? '')
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+}
 
 /**
  * Slice 11P: permissive parse — an absent/blank value falls back to

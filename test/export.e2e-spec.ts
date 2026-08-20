@@ -152,9 +152,28 @@ describe('User data export (e2e)', () => {
       .expect(HttpStatus.OK);
 
     const body = response.body as UserExportDto;
-    const { memberSince, ...restProfile } = body.profile;
+    const { memberSince, authIdentities, ...restProfile } = body.profile;
     expect(memberSince).toEqual(expect.any(String));
     expect(restProfile).toEqual({ email, displayName: null });
+
+    // PHASE 10B: a fresh `POST /auth/register` account carries exactly ONE
+    // authentication method, and the export reports it. This asserts the
+    // whole chain end-to-end over HTTP — registration writes the `email`
+    // `AuthIdentity` row in the same transaction as the `User`, and the
+    // export surfaces it — which is what makes the "do not remove the last
+    // usable method" rule correct for accounts created this way.
+    //
+    // `verifiedAt` is null because this application has never implemented
+    // email-address verification; claiming otherwise in a person's own data
+    // export would be a fabricated record.
+    expect(authIdentities).toEqual([
+      {
+        provider: 'email',
+        identifier: email,
+        linkedAt: expect.any(String) as string,
+        verifiedAt: null,
+      },
+    ]);
     expect(body.interactions).toEqual([]);
     expect(body.watchProgress).toEqual([]);
     expect(body.entitlements).toEqual([]);

@@ -3,6 +3,10 @@ import { EVENT_PROPERTY_ALLOWLIST } from '../analytics/analytics.types';
 import { AppException } from '../common/errors/app.exception';
 import { PrismaService } from '../prisma/prisma.service';
 import { ExportService } from './export.service';
+import {
+  fixtureEmail,
+  fixturePhone,
+} from '../common/testing/fixture-namespace.helpers';
 
 /**
  * Integration-style spec (Phase 12, work unit 12C-B2), following the
@@ -86,6 +90,11 @@ describe('ExportService', () => {
     await prisma.video.deleteMany({
       where: { id: { contains: testIdPrefix } },
     });
+    // Cascades with `User` below, but cleaned explicitly to match this
+    // teardown's existing "explicit even when cascade-redundant" style.
+    await prisma.authIdentity.deleteMany({
+      where: { user: { email: { contains: testIdPrefix } } },
+    });
     await prisma.user.deleteMany({
       where: { email: { contains: testIdPrefix } },
     });
@@ -101,6 +110,12 @@ describe('ExportService', () => {
       email: user.email,
       displayName: 'Export Spec User',
       memberSince: user.createdAt.toISOString(),
+      // PHASE 10B: linked authentication methods are part of the personal
+      // data this export must report (see `ExportedProfileDto`). Empty here
+      // because this fixture inserts its `User` row directly rather than
+      // going through `AuthService.register`, which is what creates the
+      // `email` identity — the dedicated test below covers a populated one.
+      authIdentities: [],
     });
     expect(result.interactions).toEqual([]);
     expect(result.watchProgress).toEqual([]);
@@ -108,6 +123,65 @@ describe('ExportService', () => {
     expect(result.analyticsEvents).toEqual([]);
     expect(typeof result.exportedAt).toBe('string');
     expect(new Date(result.exportedAt).toString()).not.toBe('Invalid Date');
+  });
+
+  it('reports every linked authentication method, transformed for export', async () => {
+    // PHASE 10B. The phone number is reported IN FULL here, unlike
+    // `GET /auth/identities` which masks it: this endpoint exists to tell
+    // the account owner exactly what is stored about them, and a masked
+    // value would defeat that. `providerSubject` is deliberately absent —
+    // for `google` it is an opaque identifier meaningful only to Google, and
+    // echoing it into a downloadable file gives the person nothing while
+    // creating a cross-provider correlation handle.
+    const verifiedAt = new Date('2026-08-20T10:00:00.000Z');
+    // Namespaced fixtures, NOT literals: `AuthIdentity` enforces
+    // `@@unique([provider, providerSubject])`, so two concurrent Jest runs
+    // sharing this database would collide on any fixed email/phone — the
+    // exact failure mode `fixture-namespace.helpers.ts` exists to prevent.
+    const identityEmail = fixtureEmail('export-identity');
+    const identityPhone = fixturePhone();
+    await prisma.authIdentity.createMany({
+      data: [
+        {
+          userId,
+          provider: 'email',
+          providerSubject: identityEmail,
+          normalizedIdentifier: identityEmail,
+        },
+        {
+          userId,
+          provider: 'whatsapp',
+          providerSubject: identityPhone,
+          normalizedIdentifier: identityPhone,
+          verifiedAt,
+        },
+      ],
+    });
+
+    const result = await service.exportForUser(userId);
+
+    expect(result.profile.authIdentities.map((i) => i.provider).sort()).toEqual(
+      ['email', 'whatsapp'],
+    );
+
+    const whatsapp = result.profile.authIdentities.find(
+      (identity) => identity.provider === 'whatsapp',
+    );
+    // Reported in FULL, not masked — this endpoint's whole purpose.
+    expect(whatsapp?.identifier).toBe(identityPhone);
+    expect(whatsapp?.verifiedAt).toBe(verifiedAt.toISOString());
+
+    // `verifiedAt` is NULL for `email` because this application has never
+    // implemented email-address verification — claiming otherwise in a
+    // person's own data export would be a fabricated record.
+    expect(
+      result.profile.authIdentities.find((i) => i.provider === 'email')
+        ?.verifiedAt,
+    ).toBeNull();
+
+    expect(JSON.stringify(result.profile.authIdentities)).not.toContain(
+      'providerSubject',
+    );
   });
 
   it('exports a null displayName as null, not undefined/omitted', async () => {

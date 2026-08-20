@@ -11,6 +11,8 @@ import { PrismaService } from '../prisma/prisma.service';
 import { AccountLockoutService } from './account-lockout.service';
 import { AuthAuditService } from './auth-audit.service';
 import { hashIp, sanitizeUserAgent } from './auth-crypto';
+import { EMAIL_AUTH_PROVIDER } from './identity/auth-identity.constants';
+import { classifyUniqueViolation } from './identity/unique-violation';
 import {
   ACCESS_TOKEN_TTL,
   BCRYPT_COST_FACTOR,
@@ -93,6 +95,22 @@ function invalidRefreshToken(): AppException {
  * token never existed" from "someone already used it" from "you waited too
  * long".
  */
+/**
+ * PHASE 10B: a concurrent `deleteAccount()` removed the account between an
+ * identity-provider request's own checks and its session insert. Reported as
+ * `INVALID_ACCESS_TOKEN` — matching `deleteAccount`/`getUserById`'s existing
+ * precedent for "this token names an account that no longer exists" —
+ * rather than `INVALID_CREDENTIALS`, because for a social sign-in there were
+ * never any credentials to be invalid.
+ */
+function identityAccountVanished(): AppException {
+  return new AppException(
+    AppErrorCode.INVALID_ACCESS_TOKEN,
+    'Invalid or expired access token',
+    HttpStatus.UNAUTHORIZED,
+  );
+}
+
 function invalidPasswordResetToken(): AppException {
   return new AppException(
     AppErrorCode.INVALID_PASSWORD_RESET_TOKEN,
@@ -207,9 +225,10 @@ type ChangePasswordRotationResult =
  * tables, in this rank:
  *
  *     1. `User`
- *     2. `PasswordResetToken`
- *     3. `Session`
- *     4. `AuthAuditEvent`
+ *     2. `AuthIdentity`      (PHASE 10B)
+ *     3. `PasswordResetToken`
+ *     4. `Session`
+ *     5. `AuthAuditEvent`
  *
  * WHY IT EXISTS — before this slice, the three account-mutating transactions
  * disagreed about which resource they took first, and two of the resulting
@@ -257,7 +276,30 @@ type ChangePasswordRotationResult =
  * with the rank above: `login` takes `User` (`FOR SHARE`) first, then
  * `Session`; `requestPasswordReset` (password-reset invalidation slice —
  * previously a bare auto-commit INSERT) takes `User` (`FOR SHARE`) first,
- * then `PasswordResetToken`, i.e. rank 1 -> rank 2.
+ * then `PasswordResetToken`.
+ *
+ * PHASE 10B ADDITIONS (production identity providers) comply unchanged, and
+ * are listed here so the invariant stays checkable against the whole auth
+ * surface rather than just this file:
+ *   - `AuthIdentityService.linkIdentity` takes `User` (`FOR SHARE`, via
+ *     `lockAccountRowForIdentity`) then `AuthIdentity` — rank 1 -> rank 2.
+ *   - `AuthIdentityService.unlinkIdentity` takes `User` (`FOR NO KEY
+ *     UPDATE`) then `AuthIdentity`. The stronger, SELF-CONFLICTING mode is
+ *     load-bearing there rather than cautious: it is what stops two
+ *     concurrent unlinks of DIFFERENT providers from each seeing the
+ *     other's identity still present and both succeeding, leaving an
+ *     account with no way to sign in.
+ *   - `AuthIdentityService.createAccountForIdentity` takes no lock at all
+ *     and correctly needs none: every statement is an INSERT of a row that
+ *     did not previously exist (`User`, then `AuthIdentity`, then
+ *     `Session`), so it holds nothing any other transaction could be
+ *     waiting for.
+ *   - `WhatsAppOtpService` never opens a multi-statement transaction. Every
+ *     `PhoneOtpChallenge` write is single-statement and auto-commit — the
+ *     same property that keeps `AccountLockoutService` out of the lock
+ *     graph — so that table can never supply a cycle edge even though it is
+ *     written immediately before the account-scoped transaction that issues
+ *     a session.
  *
  * LOCK MODE — `FOR NO KEY UPDATE` is what `UPDATE "User" SET "passwordHash"`
  * itself takes, so `changePassword`/`confirmPasswordReset` acquire exactly
@@ -377,13 +419,91 @@ export class AuthService {
     }
 
     const passwordHash = await bcrypt.hash(dto.password, BCRYPT_COST_FACTOR);
-    const user = await this.prisma.user.create({
-      data: {
-        email,
-        passwordHash,
-        displayName: dto.displayName,
-      },
-    });
+
+    // PHASE 10B: the `User` row and its `email` `AuthIdentity` row are
+    // created in ONE transaction, so an account can never exist without the
+    // identity row that records how it signs in.
+    //
+    // WHY THAT MATTERS, concretely: `AuthIdentity` is the authoritative
+    // answer to "which methods can this account use", and
+    // `DELETE /auth/identities/:provider` refuses to remove an account's
+    // LAST usable method by counting these rows. A registered account
+    // missing its `email` row would later be able to link Google and then
+    // unlink it, satisfying a naive count while still holding a perfectly
+    // good password — or, worse, the reverse. The migration backfilled this
+    // row for every pre-existing account for exactly the same reason; this
+    // keeps new ones consistent with them.
+    //
+    // Both statements are INSERTs of rows that do not yet exist, so this
+    // transaction takes no lock any other transaction could already hold and
+    // needs no `lockAccountRow` — see the CANONICAL AUTH LOCK ORDER block
+    // above this class, and `AuthIdentityService.createAccountForIdentity`,
+    // which is the same shape for the social providers.
+    //
+    // `verifiedAt` is deliberately left NULL: this application has never
+    // implemented email-address verification, and stamping a timestamp here
+    // would fabricate an ownership proof that never happened. Nothing
+    // authorizes off that column — it is evidence, not a gate.
+    let user: User;
+    try {
+      user = await this.prisma.$transaction(async (tx) => {
+        const created = await tx.user.create({
+          data: {
+            email,
+            passwordHash,
+            displayName: dto.displayName,
+          },
+        });
+
+        await tx.authIdentity.create({
+          data: {
+            userId: created.id,
+            provider: EMAIL_AUTH_PROVIDER,
+            // The SAME lowercased value the `User.email` column holds and the
+            // same one `login` looks up by — see the migration's backfill,
+            // which normalizes identically so backfilled and new rows agree
+            // byte-for-byte.
+            providerSubject: email,
+            normalizedIdentifier: email,
+          },
+        });
+
+        return created;
+      });
+    } catch (error) {
+      // PHASE 10B: the `findUnique` duplicate check above is a CHECK-THEN-ACT,
+      // and this catch is what makes losing that race truthful instead of
+      // opaque. Two paths can claim an email between the check and this
+      // insert: another concurrent `register` for the same address, and — new
+      // in this phase — a `POST /auth/google` whose token carries that
+      // verified email and which creates an account for it
+      // (`AuthIdentityService.createAccountForIdentity`). Either way the
+      // database, not this code, decides, and the loser must be told the same
+      // `EMAIL_ALREADY_REGISTERED` the pre-flight check would have produced a
+      // moment earlier.
+      //
+      // Regression test: `auth-identity.service.spec.ts`, "a concurrent
+      // registration claiming the same email yields a truthful code, not a
+      // 500" — which is how this defect was found in the first place.
+      //
+      // BOTH constraints are treated as the same answer because both mean
+      // exactly "that email address is already spoken for": `User.email`
+      // (the account row) and `AuthIdentity(provider, providerSubject)` (the
+      // email identity row this same transaction writes). Anything else
+      // propagates unchanged and still surfaces as a 500 — reinterpreting an
+      // unrelated database failure as "email taken" would trade a
+      // diagnosable error for a misleading one, the same reasoning
+      // `persistSession`'s deliberately narrow catch applies.
+      const violation = classifyUniqueViolation(error);
+      if (violation === 'user_email' || violation === 'identity_subject') {
+        throw new AppException(
+          AppErrorCode.EMAIL_ALREADY_REGISTERED,
+          'An account with this email already exists',
+          HttpStatus.CONFLICT,
+        );
+      }
+      throw error;
+    }
 
     // Phase 12, work unit 12A-B3: operational security audit trail
     // (DECISIONS.md "Phase 12 ... approved..." entry, decision 6). Awaited
@@ -449,6 +569,35 @@ export class AuthService {
         userId: user.id,
         ip: context.ip,
         userAgent: context.userAgent,
+      });
+      throw invalidCredentials();
+    }
+
+    // PHASE 10B — SECURITY-CRITICAL, and deliberately a SEPARATE check from
+    // `!passwordMatches` below rather than folded into it.
+    //
+    // `User.passwordHash` became nullable in this phase (a Google-only or
+    // WhatsApp-only account has no password). The `??` above therefore
+    // compares the supplied password against `DUMMY_HASH_FOR_TIMING_PARITY`
+    // for such an account — which is exactly the right thing for TIMING, and
+    // exactly the wrong thing to authenticate on: that dummy hash is a
+    // FIXED, COMMITTED CONSTANT. If its plaintext preimage were ever
+    // discovered, relying on "the comparison returns false" would hand an
+    // attacker every passwordless account in the database at once.
+    //
+    // So the refusal is explicit and unconditional, and it is placed AFTER
+    // the bcrypt comparison so a passwordless account and a wrong-password
+    // account still take indistinguishable time — the same anti-enumeration
+    // property the dummy hash exists to provide. Audited with its own
+    // `reason`, while the caller receives the same generic
+    // `INVALID_CREDENTIALS` every other branch returns.
+    if (user.passwordHash === null) {
+      await this.accountLockoutService.recordFailure(user.id);
+      await this.authAuditService.emit('login_failed', {
+        userId: user.id,
+        ip: context.ip,
+        userAgent: context.userAgent,
+        metadata: { reason: 'no_password_credential' },
       });
       throw invalidCredentials();
     }
@@ -527,8 +676,14 @@ export class AuthService {
         // only — the hash is compared below, in JS — so a DELETED account
         // (concurrent `deleteAccount`) is distinguishable from a CHANGED
         // password and each gets its own truthful audit reason.
+        // PHASE 10B: `passwordHash` is nullable now, so the row type must
+        // admit `null` — an accurate type here matters because the equality
+        // check below is the whole superseded-credential guard. The
+        // `=== null` refusal above means `user.passwordHash` is a non-null
+        // string by this point, so a concurrently-nulled column would
+        // correctly fail the comparison rather than silently matching.
         const [currentCredential] = await tx.$queryRaw<
-          { passwordHash: string }[]
+          { passwordHash: string | null }[]
         >`
           SELECT "passwordHash" FROM "User"
           WHERE "id" = ${user.id}
@@ -795,8 +950,14 @@ export class AuthService {
     // changePassword() committed..." (commit-first order) and "a refresh()
     // racing a changePassword() that is still UNCOMMITTED..." (sweep-first
     // order, the window described above).
+    // PHASE 10B: `passwordHash` is nullable now (a Google/WhatsApp-only
+    // account has none), so the row type must admit `null`. The comparison
+    // below is unchanged and stays correct for every combination: a
+    // passwordless account compares `null === null` and passes, exactly as
+    // a password account compares hash-to-hash — what this guard detects is
+    // a CHANGE, and "no password before, no password now" is not one.
     const [currentCredential] = await this.prisma.$queryRaw<
-      { passwordHash: string }[]
+      { passwordHash: string | null }[]
     >`
       SELECT "passwordHash" FROM "User"
       WHERE "id" = ${user.id}
@@ -1295,10 +1456,33 @@ export class AuthService {
       throw invalidRefreshToken();
     }
 
+    // PHASE 10B: `passwordHash` is nullable now. This route CHANGES an
+    // existing password by re-verifying the current one, so an account that
+    // has never had a password has nothing to verify against and nothing to
+    // change — it is refused rather than being allowed to SET a first
+    // password here. That would be a credential-ADDING flow with its own
+    // ownership-proof requirements, not the credential-ROTATING flow this
+    // method is (and was reviewed as).
+    //
+    // The dummy-hash comparison still runs first, so a passwordless account
+    // and a wrong-password account take indistinguishable time, and the
+    // refusal never relies on `bcrypt.compare` returning false against the
+    // fixed, committed `DUMMY_HASH_FOR_TIMING_PARITY` constant — see
+    // `login`'s guard for why that distinction is security-critical.
     const passwordMatches = await bcrypt.compare(
       dto.currentPassword,
-      user.passwordHash,
+      user.passwordHash ?? DUMMY_HASH_FOR_TIMING_PARITY,
     );
+
+    if (user.passwordHash === null) {
+      await this.authAuditService.emit('change_password_failed', {
+        userId,
+        ip: context.ip,
+        userAgent: context.userAgent,
+        metadata: { reason: 'no_password_credential' },
+      });
+      throw invalidCredentials();
+    }
 
     if (!passwordMatches) {
       await this.authAuditService.emit('change_password_failed', {
@@ -1797,7 +1981,36 @@ export class AuthService {
     context: AuthRequestContext = {},
   ): Promise<PasswordResetRequestResponseDto> {
     const email = dto.email.toLowerCase();
-    const user = await this.prisma.user.findUnique({ where: { email } });
+    const matchedAccount = await this.prisma.user.findUnique({
+      where: { email },
+      select: { id: true, passwordHash: true },
+    });
+
+    // PHASE 10B — an account is only resolvable HERE if it actually has a
+    // password credential to reset.
+    //
+    // WHY THIS RESTRICTION EXISTS. `User.email` is now populated for
+    // Google-created accounts too (from the verified `email` claim), and
+    // `confirmPasswordReset` SETS `passwordHash`. Without this check, a
+    // password reset would silently ADD an email/password credential to a
+    // Google-only account — a brand-new way into that account, created by a
+    // flow whose entire purpose is to restore an EXISTING one. That is
+    // precisely the "gain a credential without explicitly linking it"
+    // shortcut the account-linking policy exists to prevent, arrived at
+    // through a different door.
+    //
+    // The account is treated exactly like an unknown email: same `202`, same
+    // timing-parity work below, no token created. The audit reason is
+    // truthful and internal-only, and — like every other branch of this
+    // method — the HTTP response is byte-identical either way, so this adds
+    // no enumeration surface.
+    const user =
+      matchedAccount !== null && matchedAccount.passwordHash !== null
+        ? matchedAccount
+        : null;
+
+    const unresolvedReason =
+      matchedAccount === null ? 'user_not_found' : 'no_password_credential';
 
     // Generated unconditionally (see doc comment above) so both branches do
     // the same token-generation/hashing work; only persisted below when a
@@ -1872,10 +2085,16 @@ export class AuthService {
       await tx.passwordResetToken.deleteMany({ where: { tokenHash } });
     });
 
+    // PHASE 10B: `unresolvedReason` distinguishes a genuinely unknown email
+    // from a real account with no password credential (Google/WhatsApp-only)
+    // — internal, operator-facing detail only. The response above and below
+    // this line is byte-identical for both, so this is not an enumeration
+    // surface; it exists so an operator investigating "my reset email never
+    // arrived" can tell the two apart without guessing.
     await this.authAuditService.emit('password_reset_requested', {
       ip: context.ip,
       userAgent: context.userAgent,
-      metadata: { reason: 'user_not_found' },
+      metadata: { reason: unresolvedReason },
     });
 
     return { success: true };
@@ -2387,10 +2606,34 @@ export class AuthService {
       );
     }
 
+    // PHASE 10B: `passwordHash` is nullable now. Self-service deletion is
+    // gated on re-proving the account's PASSWORD (DECISIONS.md decision 1),
+    // so an account that has never had one cannot satisfy that gate and is
+    // refused — the same generic `INVALID_CREDENTIALS` a wrong password
+    // gets, with its own audited reason.
+    //
+    // STATED PLAINLY BECAUSE IT IS A REAL, KNOWN GAP: a Google-only or
+    // WhatsApp-only account currently has no self-service deletion path.
+    // Weakening the gate — accepting a bare access token as sufficient
+    // proof for an irreversible hard delete — would be a materially
+    // different, unreviewed security decision, and inventing an alternative
+    // proof (re-verify with the provider) is a new flow, not an adjustment
+    // to this one. Failing closed and documenting it is the honest outcome
+    // for this work unit; see the final report's follow-up list.
     const passwordMatches = await bcrypt.compare(
       dto.currentPassword,
-      user.passwordHash,
+      user.passwordHash ?? DUMMY_HASH_FOR_TIMING_PARITY,
     );
+
+    if (user.passwordHash === null) {
+      await this.authAuditService.emit('account_deletion_failed', {
+        userId,
+        ip: context.ip,
+        userAgent: context.userAgent,
+        metadata: { reason: 'no_password_credential' },
+      });
+      throw invalidCredentials();
+    }
 
     if (!passwordMatches) {
       await this.authAuditService.emit('account_deletion_failed', {
@@ -2493,6 +2736,110 @@ export class AuthService {
       ip: context.ip,
       userAgent: context.userAgent,
     });
+  }
+
+  // ======================================================================
+  // PHASE 10B — SESSION-ISSUANCE SEAM FOR EXTERNAL IDENTITY PROVIDERS
+  // ======================================================================
+  //
+  // `issueSessionForIdentity` below is the ONLY way `AuthIdentityService`
+  // (Google, WhatsApp) obtains a Short Drama session — for a brand-new
+  // account and a returning one alike. It is a thin, deliberately
+  // non-generic wrapper over this class's EXISTING private
+  // `prepareTokenPair` / `persistSession` / `lockAccountRow`, adding no
+  // behaviour of its own, and that is the point: "all three providers
+  // produce the SAME accessToken/refreshToken/session semantics" holds
+  // because there is literally one implementation, not two kept in
+  // agreement by convention.
+  //
+  // Fix cycle 1 (Reviewer B, finding 2): an earlier version ALSO exposed a
+  // `persistIdentitySession` seam so that a new account's `User`,
+  // `AuthIdentity` and `Session` rows could be written in ONE transaction.
+  // That required signing the access token INSIDE that transaction (the
+  // `sub` is the id of the row being inserted), which contradicted this
+  // file's own standing rule — see `prepareTokenPair`'s doc comment — that
+  // `await`ed crypto must never run while a transaction holds a pooled
+  // connection, on pain of a starved `signAsync` turning a successful
+  // request into an opaque `P2028`.
+  //
+  // The seam was REMOVED rather than worked around.
+  // `AuthIdentityService.createAccountForIdentity` now commits only the
+  // `User` + `AuthIdentity` pair (two fast inserts, no crypto) and then
+  // calls `issueSessionForIdentity` normally. The invariant that actually
+  // mattered is unchanged and still transactional: an account row can never
+  // exist without the identity row that says how to sign into it. A failure
+  // strictly between that commit and session issuance leaves a real,
+  // usable account with no session — the caller simply signs in again and
+  // takes the existing-identity path, which is self-healing rather than
+  // stranding anyone.
+  //
+  // These are `public` rather than reimplemented in the identity service,
+  // and NOT a general-purpose "issue a session for any user id" utility:
+  // each carries the narrow contract its one caller needs, so a future
+  // caller cannot casually mint a session without reading what it
+  // guarantees.
+
+  /**
+   * Issues a session for an EXISTING account whose external identity has
+   * already been verified by the caller.
+   *
+   * Structurally identical to `login`'s session creation, minus the
+   * password comparison that has no analogue here: the token pair is
+   * prepared OUTSIDE the transaction (so no JWT signing or HMAC work
+   * happens while a pooled connection holds a row lock across an event-loop
+   * yield — see `prepareTokenPair`), then one short transaction takes the
+   * canonical rank-1 `User` row lock (`FOR SHARE`, ordering this against
+   * `changePassword`/`confirmPasswordReset`/`deleteAccount` exactly as
+   * `login` is ordered) and inserts the `Session` row.
+   *
+   * A missing row means a concurrent `deleteAccount()` removed the account
+   * mid-flight; that surfaces as `INVALID_ACCESS_TOKEN`, matching
+   * `deleteAccount`'s own precedent for the same situation.
+   */
+  async issueSessionForIdentity(
+    userId: string,
+    context: AuthRequestContext = {},
+  ): Promise<AuthResponseDto> {
+    const tokens = await this.prepareTokenPair({ id: userId }, context);
+
+    return this.prisma.$transaction(async (tx) => {
+      if (!(await this.lockAccountRow(tx, userId, 'share'))) {
+        throw identityAccountVanished();
+      }
+
+      const user = await tx.user.findUnique({
+        where: { id: userId },
+        select: { id: true, email: true, displayName: true },
+      });
+
+      if (!user) {
+        // Unreachable in practice — the `FOR SHARE` lock above already
+        // proved the row exists and holds it for the rest of this
+        // transaction — but expressed as the same clean error rather than a
+        // non-null assertion, so a future change to the lock helper cannot
+        // turn this into a crash.
+        throw identityAccountVanished();
+      }
+
+      return this.persistSession(user, tokens, tx, identityAccountVanished);
+    });
+  }
+
+  /**
+   * Exposes the canonical `User`-row lock to `AuthIdentityService`, so its
+   * link/unlink transactions take the SAME rank-1 lock, in the same modes,
+   * as every account-mutating transaction in this file — see the "CANONICAL
+   * AUTH LOCK ORDER" block above this class. Deliberately a pass-through
+   * rather than a reimplementation: a second `SELECT ... FOR ...` helper
+   * that drifted from this one is exactly how a lock-order invariant gets
+   * quietly broken.
+   */
+  async lockAccountRowForIdentity(
+    tx: Prisma.TransactionClient,
+    userId: string,
+    mode: AccountRowLockMode,
+  ): Promise<boolean> {
+    return this.lockAccountRow(tx, userId, mode);
   }
 
   /**

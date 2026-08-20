@@ -443,4 +443,175 @@ export enum AppErrorCode {
    * tripped.
    */
   PAYMENT_NOTIFICATION_REJECTED = 'PAYMENT_NOTIFICATION_REJECTED',
+  // PHASE 10B (production identity providers: email + Google + WhatsApp)
+  /**
+   * Returned (503) by every Google sign-in/link route when
+   * `GOOGLE_AUTH_ENABLED` is not the literal string `"true"`, or when it is
+   * but `GOOGLE_OAUTH_CLIENT_IDS` is unset. Mirrors `PAYMENTS_DISABLED`'s
+   * shape exactly — a fail-closed "this provider is not configured on this
+   * server" answer, never a partial attempt against an unconfigured
+   * verifier. Deliberately DISTINCT from `INVALID_GOOGLE_TOKEN`: a caller
+   * presenting a perfectly valid token to a server that has no Google
+   * client id configured has an operator problem, not a credential
+   * problem, and collapsing the two would make that undiagnosable.
+   */
+  GOOGLE_AUTH_DISABLED = 'GOOGLE_AUTH_DISABLED',
+  /**
+   * Returned (401) for EVERY way a presented Google ID token can fail
+   * server-side verification: malformed/non-JWT input, unknown or missing
+   * `kid`, an algorithm other than RS256, a signature that does not verify
+   * against Google's published JWKS, an `iss` that is not
+   * `accounts.google.com`/`https://accounts.google.com`, an `aud` outside
+   * this server's configured client-id allowlist, an `exp` in the past, an
+   * `iat`/`nbf` in the future, or a missing `sub`.
+   *
+   * Deliberately ONE generic code, following the
+   * `INVALID_CREDENTIALS`/`INVALID_REFRESH_TOKEN`/`INVALID_ACCESS_TOKEN`
+   * precedent this enum already sets: splitting it would tell an attacker
+   * probing the endpoint exactly which check to defeat next (e.g.
+   * distinguishing "wrong audience" from "expired" reveals that the
+   * signature and issuer already passed). The specific cause is recorded in
+   * the server-side audit trail instead, never in the response.
+   */
+  INVALID_GOOGLE_TOKEN = 'INVALID_GOOGLE_TOKEN',
+  /**
+   * Returned (503) by every WhatsApp OTP route when `WHATSAPP_AUTH_ENABLED`
+   * is not the literal string `"true"`. Same fail-closed shape and
+   * rationale as `GOOGLE_AUTH_DISABLED`/`PAYMENTS_DISABLED` above.
+   */
+  WHATSAPP_AUTH_DISABLED = 'WHATSAPP_AUTH_DISABLED',
+  /**
+   * Returned (400) when a supplied phone number cannot be normalized to
+   * E.164 (see `normalizePhoneToE164`). A pure INPUT-SHAPE failure, decided
+   * before any database read, so it reveals nothing about which numbers
+   * have accounts — the same "shape errors are safe, existence errors are
+   * not" split the payments webhook already draws between
+   * `PAYMENT_NOTIFICATION_INVALID` (400, shape) and
+   * `PAYMENT_ORDER_NOT_FOUND` (404, existence).
+   */
+  INVALID_PHONE_NUMBER = 'INVALID_PHONE_NUMBER',
+  /**
+   * Returned (401) by `POST /auth/whatsapp/otp/verify` and
+   * `POST /auth/identities/whatsapp/link` for EVERY failing-OTP condition:
+   * no challenge exists for the number, the code is wrong, the challenge
+   * expired, its attempt budget is exhausted, it was already consumed, or
+   * it lost the single-use claim race to a concurrent verify.
+   *
+   * ONE generic code for all six, for exactly the reason
+   * `INVALID_PASSWORD_RESET_TOKEN` documents: distinguishing "wrong code"
+   * from "no challenge for this number" would turn this endpoint into a
+   * phone-number enumeration oracle, and distinguishing "expired" from
+   * "attempts exhausted" would tell an attacker whether their guessing is
+   * making progress. Never split it.
+   */
+  INVALID_OTP = 'INVALID_OTP',
+  /**
+   * Returned (429) by `POST /auth/whatsapp/otp/request` when this phone
+   * number already has a challenge issued inside the resend-cooldown
+   * window, or has exhausted its per-number request budget for the rolling
+   * window (see `OTP_RESEND_COOLDOWN_MS` / `OTP_MAX_REQUESTS_PER_WINDOW`).
+   *
+   * This is a PER-NUMBER, database-backed limit that survives restarts and
+   * is independent of the per-IP `@Throttle()` on the same route — an
+   * attacker rotating IPs still cannot pump messages at one victim's phone,
+   * which is the abuse this code exists to stop (every OTP is a real
+   * message that costs money and annoys a real person).
+   *
+   * ACCEPTED, DOCUMENTED TRADEOFF: answering 429 rather than 202 confirms
+   * that *somebody* recently requested a code for this number. That is
+   * inherent to any cooldown a caller can observe, it says nothing about
+   * whether an ACCOUNT exists for the number (a code can be requested for
+   * any number at all), and the alternative — silently swallowing the
+   * request — would leave a real user retrying against a wall with no way
+   * to know they must wait.
+   */
+  OTP_RESEND_COOLDOWN = 'OTP_RESEND_COOLDOWN',
+  /**
+   * Returned (409) when a social sign-in proves an identity that is NOT yet
+   * linked to any account, but whose verified email matches an EXISTING
+   * account's email. NOTHING is created, linked, or signed in.
+   *
+   * This is the account-takeover boundary of this whole phase, and the
+   * reason it is an error rather than a convenience: "the strings match" is
+   * not proof of ownership. Auto-attaching a Google identity to an
+   * email/password account on a matching email would mean anyone who can
+   * obtain a Google token for an address — including via a provider whose
+   * email verification this server does not control — inherits an existing
+   * Short Drama account, its entitlements, and its payment history.
+   *
+   * The supported path is explicit and requires proving BOTH sides: sign in
+   * to the existing account normally (email + password), then call
+   * `POST /auth/identities/google/link` with the Google credential while
+   * authenticated. Linking always requires a live Short Drama session; it
+   * is never a side effect of a sign-in attempt.
+   *
+   * ================== KNOWN, ACCEPTED LIMITATION ==================
+   *
+   * `POST /auth/register` has never verified that the registrant controls
+   * the email address they supply (this predates Phase 10B and is unchanged
+   * by it), and this backend ships no email delivery at all — even
+   * `POST /auth/password-reset/request` only returns a dev-gated token. A
+   * person can therefore register `victim@example.com` without owning it,
+   * and the real owner of that Google account will subsequently be REFUSED
+   * here and told to "sign in with your existing method, then link" — a
+   * password they never set.
+   *
+   * This is an AVAILABILITY / squatting problem, not a takeover: the
+   * squatter gains nothing the victim controls, and the victim's Google
+   * account is never attached to the squatter's account. The refusal is
+   * still the correct behaviour — the alternative (attaching Google to an
+   * account whose email was never proven) is the actual takeover this code
+   * exists to prevent, so the check must NOT be narrowed to "only collide
+   * when the existing email is verified": with no email verification
+   * anywhere in this system, that would disable the boundary entirely.
+   *
+   * The real fix is email-ownership verification at registration, which
+   * needs an email-delivery capability this backend does not have and is a
+   * separate work unit. Recorded here rather than left for a future reader
+   * to rediscover.
+   */
+  AUTH_ACCOUNT_LINK_REQUIRED = 'AUTH_ACCOUNT_LINK_REQUIRED',
+  /**
+   * Returned (409) by the link routes when the presented external identity
+   * is already bound to a DIFFERENT Short Drama account. Refused rather
+   * than transferred: moving an identity between accounts is an account
+   * -recovery operation with its own (unbuilt) ownership-proof
+   * requirements, not something a link call may do implicitly. Linking the
+   * identity a caller has ALREADY linked to their own account is not an
+   * error — it is an idempotent success.
+   */
+  AUTH_IDENTITY_ALREADY_LINKED = 'AUTH_IDENTITY_ALREADY_LINKED',
+  /**
+   * Returned (409) by the link routes when the caller's account already has
+   * an identity for this provider with a DIFFERENT subject (e.g. linking a
+   * second, different Google account). Enforced by
+   * `AuthIdentity @@unique([userId, provider])` at the database level as
+   * well. Every additional identity is an additional independent way into
+   * the account, so accumulating them silently is a security decision, not
+   * a convenience — unlink the existing one first.
+   */
+  AUTH_PROVIDER_ALREADY_LINKED = 'AUTH_PROVIDER_ALREADY_LINKED',
+  /**
+   * Returned (409) by `DELETE /auth/identities/:provider` when removing the
+   * named provider would leave the account with NO usable way to sign in —
+   * the "do not remove the user's last authentication method" rule.
+   *
+   * "Usable" is evaluated against real credentials, not row counts: an
+   * `email` identity only counts while `User.passwordHash` is non-null
+   * (an account that has never had a password cannot log in with one),
+   * while `google`/`whatsapp` identities always count. Deliberately
+   * DISTINCT from `SESSION_NOT_FOUND`'s "no such thing" 404: the identity
+   * exists and belongs to the caller — the removal is refused on policy,
+   * and telling them why is what lets them fix it (link another method
+   * first).
+   */
+  AUTH_LAST_IDENTITY = 'AUTH_LAST_IDENTITY',
+  /**
+   * Returned (404) by `DELETE /auth/identities/:provider` when the
+   * authenticated caller has no identity for that provider. Mirrors
+   * `SESSION_NOT_FOUND`'s ownership-scoped shape: the lookup is always
+   * scoped to the caller's own `userId`, so this can never be used to probe
+   * another account's linked providers.
+   */
+  AUTH_IDENTITY_NOT_FOUND = 'AUTH_IDENTITY_NOT_FOUND',
 }

@@ -12,8 +12,41 @@ datasource db {
 
 model User {
   id                  String                 @id @default(cuid())
-  email               String                 @unique
-  passwordHash        String
+  /// PHASE 10B (production identity providers): NULLABLE as of the
+  /// `add_auth_identity_and_phone_otp` migration. It was `String @unique`
+  /// (NOT NULL) for every phase before this one, because the only way to
+  /// create an account was `POST /auth/register`, which always supplies an
+  /// email. A WHATSAPP-only account has no email at all — the user proved
+  /// ownership of a phone number, nothing more — and inventing a synthetic
+  /// placeholder ("+6281234567890@whatsapp.local") would be a lie that a
+  /// later `POST /auth/password-reset/request` could act on. `NULL` is the
+  /// truthful representation. Postgres permits ANY number of NULLs in a
+  /// unique index, so `@unique` still enforces "at most one account per
+  /// real email" exactly as before while allowing many email-less accounts.
+  ///
+  /// Every pre-existing row keeps its non-null value untouched — dropping a
+  /// NOT NULL constraint rewrites no data. This column is NOT the identity
+  /// key for any provider: `AuthIdentity.providerSubject` is (see that
+  /// model), and a Google account is resolved by its Google `sub`, never by
+  /// the email Google reports.
+  email               String?                @unique
+  /// PHASE 10B: NULLABLE as of the same migration, for the same class of
+  /// reason — a GOOGLE-only or WHATSAPP-only account has no password, and
+  /// storing a random unusable hash instead would be indistinguishable from
+  /// a real credential to every `bcrypt.compare` call site.
+  ///
+  /// SECURITY-CRITICAL CONSEQUENCE: every call site that compares a
+  /// caller-supplied password against this column MUST explicitly refuse
+  /// when it is `null`, BEFORE deciding the caller is authenticated —
+  /// never rely on the comparison itself to fail. `AuthService.login`,
+  /// `.changePassword` and `.deleteAccount` fall back to
+  /// `DUMMY_HASH_FOR_TIMING_PARITY` purely to keep response latency
+  /// constant, and that dummy hash is a FIXED, committed constant: if its
+  /// plaintext preimage were ever discovered, an implicit "the compare
+  /// returned false" check would let it authenticate as every passwordless
+  /// account in the database. Each of those three methods therefore carries
+  /// an explicit `passwordHash === null` refusal.
+  passwordHash        String?
   displayName         String?
   createdAt           DateTime               @default(now())
   updatedAt           DateTime               @updatedAt
@@ -70,6 +103,15 @@ model User {
   /// email, IP, user agent, or card data — only plan/amount/status fields
   /// and server-generated identifiers; see the `PaymentOrder` model below).
   paymentOrders       PaymentOrder[]
+  /// PHASE 10B (production identity providers): every authentication method
+  /// that resolves to this account — email/password, Google, WhatsApp.
+  /// Cascades with the `User` (`onDelete: Cascade`, matching
+  /// `Session`/`AccountLockout`/`PasswordResetToken`, NOT `AuthAuditEvent`'s
+  /// survive-and-scrub): a credential binding for an account that no longer
+  /// exists is dead weight, and — unlike an audit row — leaving it behind
+  /// would leave a live Google `sub` / phone number in the database pointing
+  /// at nothing. See `AuthIdentity` below for the full design rationale.
+  authIdentities      AuthIdentity[]
 }
 
 // Phase 12, work unit 12A-B1: persistent (PostgreSQL, survives restart)
@@ -489,12 +531,12 @@ model Video {
 // this work unit). `sortOrder` defaults to 0, independent of and unrelated
 // to `Video.sortOrder` (a different table, a different ordering concern).
 model Series {
-  id            String    @id
-  title         String
-  coverImageKey String?
-  sortOrder     Int       @default(0)
-  createdAt     DateTime  @default(now())
-  updatedAt     DateTime  @updatedAt
+  id                   String    @id
+  title                String
+  coverImageKey        String?
+  sortOrder            Int       @default(0)
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
   /// Phase 11, work unit 11F-1: safe (soft) archive — the PRIMARY "delete"
   /// action for a `Series` row. Nullable with NO default, so every
   /// pre-existing row (and every caller that creates/updates a `Series`
@@ -508,7 +550,7 @@ model Series {
   /// is distinct from the guarded HARD `DELETE /admin/series/:id`, which
   /// actually removes the row and is refused (409) whenever the series
   /// still has published episodes.
-  archivedAt    DateTime?
+  archivedAt           DateTime?
   /// Work unit "SERIES COVER UPLOAD BACKEND CONTRACT" fix cycle 1 (2026-08-15,
   /// closing the reviewer-reproduced stale/replayed-`complete` HIGH finding):
   /// the durable, server-side record of the ONE object key `createCoverUpload`
@@ -854,5 +896,164 @@ model PasswordResetToken {
   createdAt DateTime  @default(now())
 
   @@index([userId])
+  @@index([expiresAt])
+}
+
+// PHASE 10B — PRODUCTION IDENTITY PROVIDERS. The provider-NEUTRAL binding
+// between one external authentication method and one internal Short Drama
+// `User`. Deliberately a separate table rather than `googleSubject` /
+// `whatsappPhone` columns bolted onto `User`: a per-provider column set
+// makes every new provider a `User` migration, makes "which methods can
+// this account actually sign in with" an ad-hoc OR across nullable columns,
+// and gives the database no single place to enforce "one external identity
+// belongs to at most one account" — the constraint that account-takeover
+// protection ultimately rests on.
+//
+// `provider` is a plain `String` (NOT a Postgres enum), matching the
+// `Video.lifecycleState` / `Entitlement.tier` / `PaymentOrder.status`
+// precedent this schema already sets for every closed set it stores.
+// App-layer validated against the closed `AuthProvider` union in
+// `src/auth/identity/auth-identity.constants.ts` (`email` | `google` |
+// `whatsapp`) — adding a fourth provider stays a code change, not a
+// `CREATE TYPE`/`ALTER TYPE` migration.
+//
+// `providerSubject` is the provider's own STABLE, AUTHORITATIVE identifier
+// for the human — never a display name, never anything the client chose:
+//   - `google`   — the OIDC `sub` claim from a SERVER-VERIFIED ID token.
+//                  Deliberately NOT the email: Google documents `sub` as
+//                  the only stable per-account identifier, an email can be
+//                  changed or (on Workspace domains) reassigned to a
+//                  different human, and treating a claimed email as an
+//                  identity key is precisely the account-takeover shape
+//                  this model exists to prevent.
+//   - `whatsapp` — the E.164 phone number proved by a verified OTP.
+//   - `email`    — the lowercased email address whose password lives in
+//                  `User.passwordHash`.
+//
+// `@@unique([provider, providerSubject])` is THE security constraint, and
+// enforces two of the three required prohibitions at the DATABASE level
+// rather than as a check-then-act hope: one Google `sub` can exist at most
+// once across the whole table (no duplicate Google subject), one normalized
+// phone can exist at most once (no duplicate WhatsApp identity), and since
+// a row has exactly one `userId`, an already-bound identity can never also
+// be bound to a second account — a concurrent second binding loses with a
+// `P2002` unique violation instead of racing. `@@unique([userId, provider])`
+// enforces the third: at most ONE identity per provider per account, so
+// "unlink Google" is unambiguous and an account cannot silently accumulate
+// several Google subjects (each of which would be an independent way in).
+//
+// `normalizedIdentifier` is the human-readable, normalized value BEHIND the
+// subject — the lowercased email for `email`/`google`, the E.164 phone for
+// `whatsapp` — kept for operator legibility and for the account-collision
+// check that produces `AUTH_ACCOUNT_LINK_REQUIRED`. It is NULLABLE and
+// deliberately NOT unique: a Google account whose `email_verified` claim is
+// false stores `NULL` here (an unverified email is not evidence of
+// anything), and making it unique would let an unrelated, unverified
+// third-party claim block a real account.
+//
+// `verifiedAt` records when the provider's ownership proof was accepted:
+// the OTP verification time for `whatsapp`, the ID-token verification time
+// for `google`, and `NULL` for `email` — this app has never implemented
+// email-address verification, so claiming a verification time for a
+// backfilled email identity would be a fabricated audit record. Nothing
+// authorizes off this column today; it is evidence, not a gate.
+model AuthIdentity {
+  id                   String    @id @default(cuid())
+  userId               String
+  user                 User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  provider             String
+  providerSubject      String
+  normalizedIdentifier String?
+  createdAt            DateTime  @default(now())
+  verifiedAt           DateTime?
+
+  @@unique([provider, providerSubject])
+  @@unique([userId, provider])
+  @@index([userId])
+}
+
+// PHASE 10B — one outstanding WhatsApp OTP challenge. Deliberately NOT
+// linked to a `User` (no `userId`, no foreign key): an OTP request is made
+// for a PHONE NUMBER, and at request time the server does not know — and
+// must not be made to reveal — whether that number belongs to an existing
+// account. A nullable FK would have been a second, quieter enumeration
+// surface for exactly the thing `POST /auth/whatsapp/otp/request`'s
+// always-`202` contract exists to hide.
+//
+// `codeHash` (NEVER the code) is the only representation of the OTP that is
+// ever persisted, following `Session.refreshTokenHash` /
+// `PasswordResetToken.tokenHash`'s established "hash of a bearer secret,
+// never the plaintext" precedent. It is HMAC-SHA256 keyed with
+// `JWT_REFRESH_SECRET` over a fixed domain tag PLUS THE PHONE NUMBER (see
+// `AuthIdentityService.hashOtpCode`) — the phone binding matters here in a
+// way it does not for the two 256-bit tokens above, because a 6-digit code
+// has only 10^6 possible values: without it, an attacker who observed one
+// row could recognize the same code for a different phone, and the entire
+// hash space could be precomputed once. It is deliberately NOT bcrypt: the
+// brute-force defense for a low-entropy code is the ATTEMPT LIMIT plus the
+// short expiry (both enforced below), not hash slowness, and a slow hash on
+// this path would only make the verify endpoint a CPU-exhaustion target.
+//
+// `attemptCount` + `consumedAt` are what make a challenge single-use and
+// non-brute-forceable, and both are only ever mutated by SINGLE-STATEMENT
+// conditional `updateMany` CAS writes (`AuthIdentityService.verifyOtp`) —
+// never inside a multi-statement transaction. That is a deliberate,
+// load-bearing choice: see the "CANONICAL AUTH LOCK ORDER" block in
+// `src/auth/auth.service.ts` — a single-statement auto-commit write can be
+// blocked and can block, but can never hold a lock on one table while
+// waiting on another, so this table can never supply an edge to a deadlock
+// cycle even though it is touched immediately before the account-scoped
+// transaction that issues the session.
+//
+// `ipHash` is the same HMAC-SHA256-of-client-IP (`hashIp`, keyed with
+// `AUTH_AUDIT_IP_HASH_SECRET`) already stored on `Session`/`AuthAuditEvent`
+// — never a raw IP — and exists solely to bound per-IP OTP request abuse.
+//
+// Rows are pruned opportunistically by `AuthIdentityService.requestOtp`
+// once older than `OTP_CHALLENGE_RETENTION_MS`, so a phone number (PII for
+// a person who may not even have an account here) does not linger
+// indefinitely. There is no janitor job to schedule and no cascade to rely
+// on, because there is no owning row to cascade from.
+model PhoneOtpChallenge {
+  id           String    @id @default(cuid())
+  phoneE164    String
+  /// PHASE 10B, fix cycle 1 (Reviewer B, finding 1) — the DATABASE-ENFORCED
+  /// "at most ONE live challenge per phone number" invariant.
+  ///
+  /// Equal to `phoneE164` while the challenge is live, and `NULL` the moment
+  /// it is consumed (every consume path sets both columns in the same
+  /// write). Because Postgres permits any number of NULLs in a unique index,
+  /// a plain nullable `@unique` expresses exactly the partial uniqueness this
+  /// needs — the identical mechanism, for the identical reason, as
+  /// `PaymentOrder.openOrderKey` above ("at most one OPEN order per
+  /// user+plan"), and expressible in this schema file so `prisma db push`
+  /// and `prisma migrate deploy` produce the same database.
+  ///
+  /// WHY IT IS REQUIRED, and why application-level reconciliation was not
+  /// enough. Admission control was originally "INSERT, then re-read and
+  /// decide who won". Under READ COMMITTED a caller's SELECT cannot see a
+  /// concurrent INSERT that has not yet committed, so two callers could each
+  /// conclude they had won, and their two follow-up "retire the other
+  /// challenge" writes then CROSSED — leaving the number with the older code
+  /// live, or with NO live code at all despite messages having been
+  /// delivered. That is a repeatable denial of WhatsApp sign-in for a
+  /// targeted number, and it reproduced under real load: a full parallel
+  /// test run left a number with zero live challenges after an eight-request
+  /// burst.
+  ///
+  /// With this column the question is not re-derived in application code at
+  /// all. A second live INSERT for the same number simply loses to the unique
+  /// index (`P2002`), atomically, at any isolation level, and is answered
+  /// `OTP_RESEND_COOLDOWN`. Exactly one live challenge per number is now a
+  /// property of the schema rather than of an interleaving.
+  liveKey      String?   @unique
+  codeHash     String
+  expiresAt    DateTime
+  attemptCount Int       @default(0)
+  consumedAt   DateTime?
+  createdAt    DateTime  @default(now())
+  ipHash       String?
+
+  @@index([phoneE164, createdAt])
   @@index([expiresAt])
 }

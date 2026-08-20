@@ -236,10 +236,61 @@
  * recent N" is already the natural default to keep.
  */
 export interface ExportedProfileDto {
-  email: string;
+  /**
+   * PHASE 10B: NULLABLE, because `User.email` is. A WhatsApp-only account
+   * genuinely has no email address, and reporting `""` in a personal-data
+   * export would be a false statement about what this system holds — the
+   * one thing an export must never be.
+   */
+  email: string | null;
   displayName: string | null;
   /** `User.createdAt`, ISO 8601. When this account was created. */
   memberSince: string;
+  /**
+   * PHASE 10B: which authentication methods are linked to this account.
+   *
+   * INCLUDED because a personal-data export must reflect what the system
+   * actually holds about the person, and `AuthIdentity` holds real personal
+   * data — most obviously a PHONE NUMBER for a WhatsApp identity, which
+   * exists nowhere else in this export. Omitting it would have made the
+   * export quietly incomplete the moment this phase shipped.
+   *
+   * TRANSFORMED, not dumped. `providerSubject` is deliberately excluded:
+   * for `google` it is an opaque identifier that is meaningful only to
+   * Google, and echoing it into a downloadable file gives the person
+   * nothing while creating a cross-provider correlation handle. The phone
+   * number IS included in full here (unlike `GET /auth/identities`, which
+   * masks it) precisely because this endpoint's purpose is to tell the
+   * account owner what is stored about them — a masked value would defeat
+   * that. `id` is excluded as a surrogate key, consistent with every other
+   * section of this export.
+   */
+  authIdentities: ExportedAuthIdentityDto[];
+}
+
+/**
+ * One `AuthIdentity` row, transformed for export — see
+ * `ExportedProfileDto.authIdentities` for the include/exclude reasoning.
+ */
+export interface ExportedAuthIdentityDto {
+  /** `email` | `google` | `whatsapp`. */
+  provider: string;
+  /**
+   * The normalized, human-readable value: the email address for
+   * `email`/`google`, the full E.164 phone number for `whatsapp`. `null`
+   * when the provider asserted none (e.g. a Google account whose email was
+   * not verified).
+   */
+  identifier: string | null;
+  /** ISO 8601. When this method was linked to the account. */
+  linkedAt: string;
+  /**
+   * ISO 8601, or `null`. When the provider's ownership proof was accepted.
+   * Always `null` for `email` — this application has never implemented
+   * email-address verification, and saying otherwise here would be a
+   * fabricated claim in the person's own data export.
+   */
+  verifiedAt: string | null;
 }
 
 /**

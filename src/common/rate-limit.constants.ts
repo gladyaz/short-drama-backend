@@ -242,3 +242,60 @@ export const PAYMENT_CHECKOUT_RATE_TTL_MS = minutes(1);
  */
 export const PAYMENT_WEBHOOK_RATE_LIMIT = 120;
 export const PAYMENT_WEBHOOK_RATE_TTL_MS = minutes(1);
+
+/**
+ * PHASE 10B — PRODUCTION IDENTITY PROVIDERS. Per-route IP throttles for the
+ * three new UNAUTHENTICATED entry points, following the established
+ * "every unauthenticated route gets an explicit tight override" precedent
+ * the login/register/refresh/password-reset constants above set.
+ *
+ * A NOTE ON WHAT THESE DO AND DO NOT PROTECT, because it matters for
+ * reviewing the WhatsApp limits in particular: every constant in this file
+ * is COARSE, IN-MEMORY, PER-IP, PER-APPLICATION-INSTANCE throttling (see
+ * this file's header). An attacker who rotates source IPs defeats all of
+ * it. That is acceptable for `login`/`register` — the account-side damage
+ * is separately bounded by the persistent PostgreSQL `AccountLockout` — and
+ * it is why the OTP flow does NOT rely on these constants for its real
+ * protection either: the per-NUMBER cooldown/budget and per-CHALLENGE
+ * attempt limit in `src/auth/identity/auth-identity.constants.ts` are
+ * database-backed, survive restarts, and apply across every instance and
+ * every source IP. These are the outer, cheap layer; those are the load
+ * -bearing one.
+ */
+
+/**
+ * `POST /auth/google`: 10 requests per minute per IP. More generous than
+ * `LOGIN_RATE_LIMIT` (5/min) on purpose — a Google sign-in involves no
+ * server-side password guessing to slow down (the credential is a
+ * cryptographically signed ID token that cannot be brute-forced), so the
+ * limit exists only to bound the CPU cost of signature verification and the
+ * rate of JWKS cache misses, not to protect a guessable secret. Still
+ * tighter than the app-wide default, because the route is unauthenticated.
+ */
+export const GOOGLE_AUTH_RATE_LIMIT = 10;
+export const GOOGLE_AUTH_RATE_TTL_MS = seconds(60);
+
+/**
+ * `POST /auth/whatsapp/otp/request`: 3 requests per 10 minutes per IP —
+ * deliberately the SAME threshold as `REGISTER_RATE_LIMIT` and
+ * `PASSWORD_RESET_REQUEST_RATE_LIMIT`, which it resembles exactly: an
+ * unauthenticated, low-frequency-legitimate-use, state-creating action
+ * where a genuine caller essentially never needs more than a couple of
+ * attempts in a ten-minute window. Unlike those two, this action also
+ * SENDS A MESSAGE that costs money and interrupts a real person, which is
+ * why it is additionally bounded per phone number in the database.
+ */
+export const WHATSAPP_OTP_REQUEST_RATE_LIMIT = 3;
+export const WHATSAPP_OTP_REQUEST_RATE_TTL_MS = minutes(10);
+
+/**
+ * `POST /auth/whatsapp/otp/verify`: 5 requests per minute per IP — the same
+ * threshold as `LOGIN_RATE_LIMIT`, and for the same reason: this is the
+ * route where a low-entropy secret is guessed, so it is the one that most
+ * resembles a password prompt. The real defense against guessing a 6-digit
+ * code is `OTP_MAX_ATTEMPTS` (counted atomically ON THE CHALLENGE ROW, so
+ * it cannot be outrun by concurrency or by rotating IPs); this limit simply
+ * makes the cheap outer layer consistent with the rest of the file.
+ */
+export const WHATSAPP_OTP_VERIFY_RATE_LIMIT = 5;
+export const WHATSAPP_OTP_VERIFY_RATE_TTL_MS = seconds(60);

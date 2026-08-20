@@ -1,6 +1,23 @@
 export interface AuthUserDto {
   id: string;
-  email: string;
+  /**
+   * PHASE 10B: NULLABLE as of the production-identity-providers work unit.
+   * A WhatsApp-only account has no email at all (see `User.email`'s schema
+   * doc comment for why a synthetic placeholder would be worse than
+   * `null`), and a Google account only has one when Google asserted
+   * `email_verified`.
+   *
+   * CONTRACT NOTE FOR CLIENTS: this field is still PRESENT on every
+   * response and still carries the same value it always did for every
+   * account created through `POST /auth/register` — which is every account
+   * that existed before this phase. Only accounts created through a social
+   * provider can carry `null`, so no existing client behaviour changes for
+   * any existing user. A client that needs a human-readable label for a
+   * phone-only account should read `GET /auth/identities` (whose
+   * `identifier` is a MASKED phone number) rather than expecting an email
+   * here.
+   */
+  email: string | null;
   displayName?: string;
 }
 

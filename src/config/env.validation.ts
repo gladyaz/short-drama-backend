@@ -88,6 +88,8 @@ export function validateEnv(
 
   validatePaymentsConfig(config);
 
+  validateIdentityProvidersConfig(config);
+
   return config;
 }
 
@@ -429,4 +431,157 @@ function validateHlsGatewayConfig(config: Record<string, unknown>): void {
   // the TRANSCODE_MAX_ATTEMPTS/etc. "optional, but must be a positive
   // integer if present" pattern immediately above.
   assertPositiveIntEnvIfPresent(config, 'HLS_TOKEN_TTL_SECONDS');
+}
+
+/**
+ * PHASE 10B — PRODUCTION IDENTITY PROVIDERS. Boot-time, fail-closed
+ * validation for the Google and WhatsApp providers, following the exact
+ * `validatePaymentsConfig`/`validateTranscodeConfig` conditional shape:
+ * nothing here is required while the corresponding feature flag is off
+ * (this repository's shipped default), and nothing here ever reads, logs or
+ * echoes a value — only variable NAMES appear in error messages.
+ *
+ * EMAIL/PASSWORD IS NOT VALIDATED HERE because it is not optional and has
+ * no flag. `JWT_ACCESS_SECRET`/`JWT_REFRESH_SECRET`/
+ * `AUTH_AUDIT_IP_HASH_SECRET` are already unconditionally required by
+ * `REQUIRED_KEYS` above, which is exactly right: email/password sign-in
+ * must work in every environment, and this phase must not create a
+ * configuration in which it does not.
+ */
+function validateIdentityProvidersConfig(
+  config: Record<string, unknown>,
+): void {
+  validateGoogleAuthConfig(config);
+  validateWhatsAppConfig(config);
+}
+
+/**
+ * `GOOGLE_OAUTH_CLIENT_IDS` is required (name presence only) when
+ * `GOOGLE_AUTH_ENABLED=true`, because a verifier with an empty audience
+ * allowlist can accept nothing — it would answer 401 to every legitimate
+ * sign-in, which is a far more confusing failure than refusing to boot.
+ * `GoogleOidcIdentityVerifier`'s constructor enforces the same invariant
+ * independently, so this check is the early, legible half of a
+ * belt-and-braces pair, not the only one.
+ *
+ * NOTHING SECRET IS REQUIRED, and that is worth stating explicitly rather
+ * than leaving as an omission a later reviewer must infer: verifying a
+ * Google ID token needs Google's PUBLIC signing keys and this server's
+ * client id (itself public — it ships in the mobile app binary). The OAuth
+ * client SECRET belongs to the authorization-code exchange, which happens
+ * on the CLIENT in this architecture; this backend never performs that
+ * exchange, never reads a client secret, and therefore cannot leak one.
+ */
+function validateGoogleAuthConfig(config: Record<string, unknown>): void {
+  if (config.GOOGLE_AUTH_ENABLED !== 'true') {
+    return;
+  }
+
+  // Captured BEFORE the presence check below narrows the `config.X`
+  // property-access expression itself — see `validateTranscodeConfig`'s
+  // `rawRedisUrl` comment for why this avoids tripping `no-base-to-string`
+  // at the `String()` call further down.
+  const rawClientIds = config.GOOGLE_OAUTH_CLIENT_IDS;
+  if (!config.GOOGLE_OAUTH_CLIENT_IDS) {
+    throw new Error(
+      'Missing required environment variable: GOOGLE_OAUTH_CLIENT_IDS. ' +
+        'GOOGLE_AUTH_ENABLED=true requires at least one Google OAuth client id ' +
+        '(comma-separated for multiple platforms; see .env.example). ' +
+        'Values are never logged.',
+    );
+  }
+
+  const hasNonEmptyEntry = String(rawClientIds)
+    .split(',')
+    .some((entry) => entry.trim().length > 0);
+
+  if (!hasNonEmptyEntry) {
+    throw new Error(
+      'Invalid GOOGLE_OAUTH_CLIENT_IDS: GOOGLE_AUTH_ENABLED=true requires at ' +
+        'least one non-empty client id. A blank or comma-only value would ' +
+        'produce a verifier that rejects every token. Values are never logged.',
+    );
+  }
+}
+
+/**
+ * PHASE 10B — the guard that makes the local fake OTP provider impossible in
+ * production.
+ *
+ * Two independent rules, in the order they matter:
+ *
+ * 1. `WHATSAPP_OTP_PROVIDER_DRIVER=fake` is refused unless `NODE_ENV` is
+ *    EXACTLY `development` or `test` — a fail-closed ALLOWLIST, deliberately
+ *    the same shape as `validateDevToolsNodeEnv` above, and for the same
+ *    reason that check was escalated from a denylist after review: an unset,
+ *    empty, misspelled or differently-cased `NODE_ENV` (e.g. `"Production"`)
+ *    silently passes a `!== 'production'` test. The fake provider retains
+ *    plaintext OTP codes in memory and sends no message at all, so a
+ *    production deployment running it would appear to work while every
+ *    verification code was undeliverable — and any operator (or attacker)
+ *    with access to a `devCode`-enabled response could sign in as any phone
+ *    number. This check runs even when `WHATSAPP_AUTH_ENABLED` is false: a
+ *    mis-set driver is a configuration error worth failing loudly on before
+ *    it is ever activated, exactly as `validatePaymentsConfig` treats
+ *    `MIDTRANS_IS_PRODUCTION`.
+ *
+ * 2. With `WHATSAPP_AUTH_ENABLED=true`, the driver must name an IMPLEMENTED
+ *    provider. `fake` is currently the only one, because no WhatsApp vendor
+ *    credentials exist for this project and no vendor client has been
+ *    written or tested against them. Combined with rule 1, that means
+ *    WhatsApp OTP cannot presently be enabled in production AT ALL — the
+ *    process refuses to start. That is the intended, honest outcome: a
+ *    backend that accepts OTP requests, answers 202, and silently delivers
+ *    nothing would be strictly worse than one that will not boot. See the
+ *    final report's "requirements still needed for real provider
+ *    activation" section for exactly what unblocks it.
+ */
+const FAKE_WHATSAPP_ALLOWED_NODE_ENVS = ['development', 'test'] as const;
+
+function validateWhatsAppConfig(config: Record<string, unknown>): void {
+  const driver =
+    typeof config.WHATSAPP_OTP_PROVIDER_DRIVER === 'string'
+      ? config.WHATSAPP_OTP_PROVIDER_DRIVER
+      : undefined;
+
+  if (
+    driver === 'fake' &&
+    !(FAKE_WHATSAPP_ALLOWED_NODE_ENVS as readonly string[]).includes(
+      typeof config.NODE_ENV === 'string' ? config.NODE_ENV : '',
+    )
+  ) {
+    throw new Error(
+      'Refusing to boot with WHATSAPP_OTP_PROVIDER_DRIVER=fake: NODE_ENV is ' +
+        'not exactly "development" or "test". The fake provider retains ' +
+        'plaintext OTP codes in memory and delivers no message, so it must ' +
+        'never run outside local development or automated tests. Unset ' +
+        'WHATSAPP_OTP_PROVIDER_DRIVER, or run with NODE_ENV=development/test. ' +
+        'Values are never logged.',
+    );
+  }
+
+  if (config.WHATSAPP_AUTH_ENABLED !== 'true') {
+    return;
+  }
+
+  if (driver === undefined || driver.trim().length === 0) {
+    throw new Error(
+      'Missing required environment variable: WHATSAPP_OTP_PROVIDER_DRIVER. ' +
+        'WHATSAPP_AUTH_ENABLED=true requires an explicit OTP delivery driver ' +
+        '(see .env.example). There is deliberately no default: a backend that ' +
+        'accepts OTP requests without a real delivery provider would answer ' +
+        '202 while silently sending nothing.',
+    );
+  }
+
+  if (driver !== 'fake') {
+    throw new Error(
+      `Unsupported WHATSAPP_OTP_PROVIDER_DRIVER: "${driver}". The only ` +
+        'implemented driver is "fake" (development/test only) — no WhatsApp ' +
+        'vendor client ships in this build, because no vendor credentials ' +
+        'exist to build or test one against. Implement a WhatsAppOtpProvider ' +
+        'for the chosen vendor and register it in AuthModule before enabling ' +
+        'WHATSAPP_AUTH_ENABLED in this environment.',
+    );
+  }
 }

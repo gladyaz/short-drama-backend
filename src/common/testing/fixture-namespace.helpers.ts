@@ -212,3 +212,50 @@ export function uniqueFixtureMarker(label: string): string {
   fixtureSequence += 1;
   return `${TEST_FIXTURE_NAMESPACE}-${fixtureSequence}-${label}`;
 }
+
+/**
+ * PHASE 10B — per-run namespaced PHONE NUMBERS, for specs that exercise the
+ * WhatsApp OTP identity flow.
+ *
+ * WHY THIS EXISTS RATHER THAN A HARDCODED NUMBER. `AuthIdentity` enforces
+ * `@@unique([provider, providerSubject])`, and for the `whatsapp` provider
+ * the subject IS the E.164 phone number. Two concurrent Jest runs sharing
+ * `short_drama_test` (which is exactly the situation
+ * `TEST_FIXTURE_NAMESPACE` above was introduced to survive) would collide on
+ * any fixed number: one run's identity row would make the other's
+ * `AUTH_IDENTITY_ALREADY_LINKED`, producing a failure whose message points
+ * at the linking policy rather than at the real cause. The prefix below is
+ * derived from the same process id plus random bytes as
+ * `TEST_FIXTURE_NAMESPACE`, so two live runs can never generate the same
+ * number.
+ *
+ * SHAPE: `+62` (the country code `normalizePhoneToE164` treats as the
+ * default) then a literal `9` marking the block as synthetic, then 9
+ * process-derived digits, then a 2-digit per-call sequence — 14 digits
+ * total, comfortably inside E.164's 15-digit ceiling and above the 8-digit
+ * floor, so every generated value normalizes successfully.
+ *
+ * `+629...` is not an allocated Indonesian mobile prefix (real ones are
+ * `+628...`), which is a deliberate second safeguard: even a catastrophic
+ * misconfiguration that reached a real messaging provider could not deliver
+ * a message to a real person's phone.
+ */
+export const TEST_FIXTURE_PHONE_PREFIX = `+629${String(
+  process.pid % 100000,
+).padStart(
+  5,
+  '0',
+)}${randomBytes(2).toString('hex').replace(/[a-f]/g, '0').padStart(4, '0')}`;
+
+let fixturePhoneSequence = 0;
+
+/**
+ * A unique, namespaced E.164 phone number for one fixture. Cleanup
+ * predicates must be scoped with
+ * `{ startsWith: TEST_FIXTURE_PHONE_PREFIX }`, never a literal — the same
+ * contract `fixtureEmail`/`TEST_FIXTURE_NAMESPACE` carry.
+ */
+export function fixturePhone(): string {
+  fixturePhoneSequence += 1;
+  return `${TEST_FIXTURE_PHONE_PREFIX}${String(fixturePhoneSequence % 100).padStart(2, '0')}`;
+}

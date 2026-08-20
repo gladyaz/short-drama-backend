@@ -45,7 +45,23 @@ export class ExportService {
   async exportForUser(userId: string): Promise<UserExportDto> {
     const user = await this.prisma.user.findUnique({
       where: { id: userId },
-      select: { email: true, displayName: true, createdAt: true },
+      select: {
+        email: true,
+        displayName: true,
+        createdAt: true,
+        // PHASE 10B: linked authentication methods are part of the personal
+        // data this system holds — see `ExportedProfileDto.authIdentities`
+        // for what is included, what is transformed away, and why.
+        authIdentities: {
+          select: {
+            provider: true,
+            normalizedIdentifier: true,
+            createdAt: true,
+            verifiedAt: true,
+          },
+          orderBy: { createdAt: 'asc' },
+        },
+      },
     });
 
     if (!user) {
@@ -165,6 +181,12 @@ export class ExportService {
         email: user.email,
         displayName: user.displayName ?? null,
         memberSince: user.createdAt.toISOString(),
+        authIdentities: user.authIdentities.map((identity) => ({
+          provider: identity.provider,
+          identifier: identity.normalizedIdentifier,
+          linkedAt: identity.createdAt.toISOString(),
+          verifiedAt: identity.verifiedAt?.toISOString() ?? null,
+        })),
       },
       interactions,
       watchProgress,

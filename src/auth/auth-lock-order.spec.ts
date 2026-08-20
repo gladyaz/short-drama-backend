@@ -14,6 +14,7 @@ import {
   TEST_FIXTURE_NAMESPACE,
   fixtureEmail,
 } from '../common/testing/fixture-namespace.helpers';
+import { requirePasswordHash } from '../common/testing/password-hash.helpers';
 
 /**
  * Auth lock-order hardening slice — the executable proof for the "CANONICAL
@@ -905,15 +906,15 @@ describe('AuthService — canonical auth lock order', () => {
           // the two candidate passwords, and never against the original.
           const matchesChanged = await bcrypt.compare(
             CHANGED_PASSWORD,
-            user.passwordHash,
+            requirePasswordHash(user),
           );
           const matchesReset = await bcrypt.compare(
             RESET_PASSWORD,
-            user.passwordHash,
+            requirePasswordHash(user),
           );
           const matchesOld = await bcrypt.compare(
             OLD_PASSWORD,
-            user.passwordHash,
+            requirePasswordHash(user),
           );
           expect(matchesOld).toBe(false);
           expect([matchesChanged, matchesReset].filter(Boolean)).toHaveLength(
@@ -1010,12 +1011,12 @@ describe('AuthService — canonical auth lock order', () => {
         const user = await prisma.user.findUniqueOrThrow({
           where: { id: account.userId },
         });
-        expect(await bcrypt.compare(RESET_PASSWORD, user.passwordHash)).toBe(
-          true,
-        );
-        expect(await bcrypt.compare(CHANGED_PASSWORD, user.passwordHash)).toBe(
-          false,
-        );
+        expect(
+          await bcrypt.compare(RESET_PASSWORD, requirePasswordHash(user)),
+        ).toBe(true);
+        expect(
+          await bcrypt.compare(CHANGED_PASSWORD, requirePasswordHash(user)),
+        ).toBe(false);
       },
       bcryptTestBudgetMs(6),
     );
@@ -1053,12 +1054,12 @@ describe('AuthService — canonical auth lock order', () => {
         const user = await prisma.user.findUniqueOrThrow({
           where: { id: account.userId },
         });
-        expect(await bcrypt.compare(CHANGED_PASSWORD, user.passwordHash)).toBe(
-          true,
-        );
-        expect(await bcrypt.compare(RESET_PASSWORD, user.passwordHash)).toBe(
-          false,
-        );
+        expect(
+          await bcrypt.compare(CHANGED_PASSWORD, requirePasswordHash(user)),
+        ).toBe(true);
+        expect(
+          await bcrypt.compare(RESET_PASSWORD, requirePasswordHash(user)),
+        ).toBe(false);
 
         // The rejected confirm changed NOTHING else either: the replacement
         // session `changePassword` issued is still the account's one active
@@ -1104,9 +1105,9 @@ describe('AuthService — canonical auth lock order', () => {
         const user = await prisma.user.findUniqueOrThrow({
           where: { id: account.userId },
         });
-        expect(await bcrypt.compare(RESET_PASSWORD, user.passwordHash)).toBe(
-          true,
-        );
+        expect(
+          await bcrypt.compare(RESET_PASSWORD, requirePasswordHash(user)),
+        ).toBe(true);
 
         // ...and the stale token from BEFORE the change is still dead — a
         // later, legitimate reset does not resurrect it.
@@ -1653,7 +1654,7 @@ describe('AuthService — canonical auth lock order', () => {
           expect(
             await bcrypt.compare(
               `reset-password-req-race-${i}`,
-              user.passwordHash,
+              requirePasswordHash(user),
             ),
           ).toBe(true);
         }

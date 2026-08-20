@@ -174,6 +174,94 @@ export const AUTH_AUDIT_METADATA_ALLOWLIST = {
    * capture.
    */
   data_export_success: [],
+  /**
+   * PHASE 10B: a social/OTP sign-in succeeded and issued the SAME internal
+   * access + refresh token pair every email/password login issues.
+   * `provider` is a fixed value of the closed `AuthProvider` union
+   * (`google` | `whatsapp` — never `email`, which keeps using
+   * `login_success`), and `outcome` distinguishes `signed_in` (the identity
+   * already existed) from `registered` (a brand-new Short Drama account was
+   * created for a genuinely new identity). Both are small non-sensitive
+   * enums — never a Google `sub`, never a phone number, never a token.
+   */
+  identity_login_success: ['provider', 'outcome'],
+  /**
+   * PHASE 10B: a social/OTP sign-in was refused. `provider` is the same
+   * closed enum; `reason` is the INTERNAL cause, which the client never
+   * sees — every one of these collapses to a single generic client-facing
+   * error (`INVALID_GOOGLE_TOKEN` / `INVALID_OTP`), exactly as
+   * `login_failed`'s `reason` disambiguates a response that is always
+   * `INVALID_CREDENTIALS`.
+   *
+   * Google values are `GoogleTokenRejectionReason` (`bad_audience`,
+   * `expired`, `bad_signature`, ...). WhatsApp values are
+   * `otp_not_found` | `otp_expired` | `otp_wrong_code` |
+   * `otp_attempts_exhausted` | `otp_already_used` | `otp_claim_lost`.
+   * Every value is a fixed enum string — never the attempted code, never
+   * the raw token, never the phone number.
+   */
+  identity_login_failed: ['provider', 'reason'],
+  /**
+   * PHASE 10B: a sign-in proved an identity that is not linked to any
+   * account, but whose VERIFIED email matches an existing account —
+   * refused with `AUTH_ACCOUNT_LINK_REQUIRED`, nothing created or linked.
+   *
+   * This is the single most security-relevant event this phase adds and is
+   * deliberately its own event name rather than an `identity_login_failed`
+   * reason: a burst of these against one account is the signature of an
+   * attempted provider-collision takeover, and an operator must be able to
+   * alert on it without pattern-matching inside a `reason` field. `userId`
+   * IS recorded (it is the EXISTING account being targeted, which still
+   * exists and is exactly what an investigator needs); the attacker-side
+   * identity is not, since a raw Google `sub` is an identifier for a real
+   * person at another provider.
+   */
+  identity_link_required: ['provider'],
+  /**
+   * PHASE 10B: an authenticated caller successfully linked a new provider
+   * to their own account, having proved ownership of it in the same
+   * request. `provider` only — never the subject.
+   */
+  identity_linked: ['provider'],
+  /**
+   * PHASE 10B: an authenticated caller removed one of their own linked
+   * providers. Recorded because losing a way into an account is exactly as
+   * security-relevant as gaining one — a silently unlinked provider is
+   * indistinguishable from an attacker locking the owner out. `provider`
+   * only.
+   */
+  identity_unlinked: ['provider'],
+  /**
+   * PHASE 10B: a link or unlink was refused. `reason` is `already_linked`
+   * (the identity belongs to another account), `provider_taken` (this
+   * account already has a different identity for that provider),
+   * `last_identity` (removing it would leave the account with no usable way
+   * to sign in), or `not_found`. `provider` accompanies it. The
+   * client-facing error IS specific for these (unlike sign-in), because
+   * every one of them is only reachable by a caller who has ALREADY
+   * authenticated as the account in question — there is no enumeration
+   * surface to protect, and a caller who cannot tell why a link failed
+   * cannot fix it.
+   */
+  identity_link_failed: ['provider', 'reason'],
+  /**
+   * PHASE 10B: `POST /auth/whatsapp/otp/request` was accepted and a
+   * challenge row was created. Deliberately carries NO metadata and NO
+   * `userId`: at request time the server does not know (and must not
+   * record in a way that implies) whether the number belongs to an
+   * account, and the phone number itself is never written to the audit
+   * trail — `ipHash` is the only correlatable field, exactly as for every
+   * other event here.
+   */
+  otp_requested: [],
+  /**
+   * PHASE 10B: `POST /auth/whatsapp/otp/request` was refused by the
+   * per-NUMBER cooldown or rolling request budget (`OTP_RESEND_COOLDOWN`).
+   * `reason` is `cooldown` or `window_exhausted`. Kept as its own event
+   * (rather than a failed-login reason) so that OTP-bombing one victim's
+   * number is visible to an operator as its own signal.
+   */
+  otp_request_throttled: ['reason'],
 } as const satisfies Record<string, readonly string[]>;
 
 export type AuthAuditEventName = keyof typeof AUTH_AUDIT_METADATA_ALLOWLIST;

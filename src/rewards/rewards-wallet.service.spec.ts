@@ -11,6 +11,24 @@ import { RewardsWalletService } from './rewards-wallet.service';
 import { REWARD_REASONS, REWARD_SOURCE_TYPES } from './rewards.constants';
 
 /**
+ * Minimal deferred promise, matching `auth-lock-order.spec.ts`'s helper of
+ * the same name. Used to force a deterministic interleaving from observable
+ * database progress instead of from a timer.
+ */
+interface Deferred {
+  readonly promise: Promise<void>;
+  resolve(): void;
+}
+
+function deferred(): Deferred {
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+/**
  * Integration-style spec against the real Postgres test database, following
  * the `EntitlementsService` / `InteractionsService` precedent (real
  * `PrismaService`, self-cleaning `afterEach`).
@@ -321,12 +339,31 @@ describe('RewardsWalletService', () => {
    * Prisma level and asserts the failure it produces. It exercises no
    * `RewardsWalletService` code path — nothing in this codebase performs the
    * unlocked sequence, and nothing may reintroduce it.
+   *
+   * NO SLEEPS, for the reason `auth-lock-order.spec.ts` states outright:
+   * "every interleaving below is forced with deferred promises resolved by
+   * observable database progress (a statement returning), never by elapsed
+   * wall-clock time." An earlier version of this test widened the race with
+   * a 30ms timer and was FLAKY exactly as that rule predicts — under a
+   * loaded full-suite run the first transaction could commit before the
+   * second one read, so the second took the replay branch and both
+   * succeeded, failing an assertion that demands one rejection. The barrier
+   * below removes the timing dependency entirely: each side announces that
+   * its own read has returned and waits for the other's before inserting, so
+   * BOTH reads are guaranteed to observe an empty table no matter how the
+   * scheduler behaves.
    */
   describe('lock necessity (positive control)', () => {
     it('CRITICAL: an UNLOCKED check-then-insert loses one caller to a constraint violation', async () => {
       const wallet = await prisma.rewardWallet.create({ data: { userId } });
 
-      const unlockedAttempt = () =>
+      const readA = deferred();
+      const readB = deferred();
+
+      const unlockedAttempt = (
+        own: Deferred,
+        other: Deferred,
+      ): Promise<string> =>
         prisma.$transaction(async (tx) => {
           // Deliberately NO `lockAccount` call — this is the pre-lock shape.
           const existing = await tx.rewardLedgerEntry.findUnique({
@@ -334,12 +371,16 @@ describe('RewardsWalletService', () => {
               userId_idempotencyKey: { userId, idempotencyKey: 'race-probe' },
             },
           });
+
+          // Observable database progress: this read has returned.
+          own.resolve();
+          // Both reads are now guaranteed to have happened before any insert.
+          await other.promise;
+
           if (existing) {
             return 'replayed';
           }
-          // Widen the window so the interleaving is deterministic rather than
-          // dependent on how fast the database answers.
-          await new Promise((resolve) => setTimeout(resolve, 30));
+
           await tx.rewardLedgerEntry.create({
             data: {
               userId,
@@ -355,8 +396,8 @@ describe('RewardsWalletService', () => {
         });
 
       const outcomes = await Promise.allSettled([
-        unlockedAttempt(),
-        unlockedAttempt(),
+        unlockedAttempt(readA, readB),
+        unlockedAttempt(readB, readA),
       ]);
 
       // Exactly one caller is REJECTED outright. This is the concrete reason
@@ -367,6 +408,13 @@ describe('RewardsWalletService', () => {
       // tests above) both callers succeed and one reports `replayed`.
       expect(outcomes.filter((o) => o.status === 'rejected')).toHaveLength(1);
       expect(outcomes.filter((o) => o.status === 'fulfilled')).toHaveLength(1);
+
+      // And the table proves it: one row, not two.
+      expect(
+        await prisma.rewardLedgerEntry.count({
+          where: { userId, idempotencyKey: 'race-probe' },
+        }),
+      ).toBe(1);
     });
   });
 

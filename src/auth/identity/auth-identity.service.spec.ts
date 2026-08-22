@@ -9,10 +9,16 @@ import {
   TEST_FIXTURE_NAMESPACE,
   TEST_FIXTURE_PHONE_PREFIX,
   fixtureEmail,
+  fixtureMarker,
   fixturePhone,
 } from '../../common/testing/fixture-namespace.helpers';
 import { AccountLockoutService } from '../account-lockout.service';
 import { AuthAuditService } from '../auth-audit.service';
+import type {
+  AuthAuditEventName,
+  EmitAuthAuditEventParams,
+} from '../auth-audit.types';
+import type { RootConfig } from '../../config/configuration';
 import { AuthService } from '../auth.service';
 import { AuthIdentityService } from './auth-identity.service';
 import {
@@ -113,6 +119,54 @@ class RecordingOtpProvider implements WhatsAppOtpProvider {
   }
 }
 
+/**
+ * The marker `userAgent` every audit row this suite produces is stamped
+ * with, so a row that has no other attribution is still unambiguously OURS.
+ * Namespaced (never a bare literal) per `fixture-namespace.helpers.ts`.
+ */
+const SPEC_AUDIT_USER_AGENT = fixtureMarker('ai-audit-agent');
+
+/**
+ * `AuthAuditService` with this run's fixture namespace stamped onto every
+ * row it writes.
+ *
+ * WHY THIS EXISTS. Many of the audit rows this suite produces are emitted
+ * with NO `userId`: `otp_requested` on every `requestOtp`,
+ * `identity_login_failed` on every rejected Google token or wrong OTP, and
+ * `login_failed`/`password_reset_requested` for an address that never
+ * resolved to an account. Having neither a user to join through nor a marker
+ * of their own, `afterEach` used to reclaim them with a namespace-blind
+ * `deleteMany({ where: { userId: null } })` — which also deleted the
+ * `userId: null` rows belonging to every OTHER Jest worker sharing this
+ * database. `auth-audit.service.spec.ts` is the suite that pays for it: its
+ * rows are deliberately emitted WITHOUT a `userId`, so a concurrent run of
+ * this file would delete them mid-test and its assertions would then fail on
+ * a `null` row — a failure whose message points at IP hashing rather than at
+ * the real cause. See `fixture-namespace.helpers.ts` for the full model.
+ *
+ * `auth.service.spec.ts` and `account-deletion.service.spec.ts` solve the
+ * same problem by passing a marker `userAgent` at each call site. This suite
+ * has ~90 such call sites, so it stamps the marker once, at the single point
+ * every audit row is born — which also makes it impossible for a call site
+ * added later to forget. A test that passes its own `userAgent` keeps it.
+ *
+ * Constructed by hand in a `useFactory` rather than `useClass`: this
+ * subclass carries no `@Injectable()` decorator of its own, so it has no
+ * `design:paramtypes` metadata for Nest to resolve constructor arguments
+ * from.
+ */
+class NamespacedAuthAuditService extends AuthAuditService {
+  override emit(
+    event: AuthAuditEventName,
+    params: EmitAuthAuditEventParams = {},
+  ): Promise<void> {
+    return super.emit(event, {
+      ...params,
+      userAgent: params.userAgent ?? SPEC_AUDIT_USER_AGENT,
+    });
+  }
+}
+
 describe('AuthIdentityService', () => {
   let identityService: AuthIdentityService;
   let authService: AuthService;
@@ -162,7 +216,15 @@ describe('AuthIdentityService', () => {
         WhatsAppOtpService,
         PrismaService,
         AccountLockoutService,
-        AuthAuditService,
+        {
+          provide: AuthAuditService,
+          inject: [PrismaService, ConfigService],
+          useFactory: (
+            prisma: PrismaService,
+            configService: ConfigService<RootConfig>,
+          ): AuthAuditService =>
+            new NamespacedAuthAuditService(prisma, configService),
+        },
         {
           provide: ConfigService,
           useValue: {
@@ -193,7 +255,16 @@ describe('AuthIdentityService', () => {
     await prisma.authAuditEvent.deleteMany({
       where: { user: { email: { startsWith: emailPrefix } } },
     });
-    await prisma.authAuditEvent.deleteMany({ where: { userId: null } });
+    // Rows this suite emitted with no `userId` (`otp_requested`, a rejected
+    // Google token's `identity_login_failed`, a `login_failed` for an address
+    // that never resolved). They are found by the namespaced marker
+    // `userAgent` that `NamespacedAuthAuditService` stamps on every row —
+    // NEVER by a bare `{ userId: null }`, which would also delete the rows of
+    // other Jest workers sharing this database. Same predicate shape as
+    // `auth.service.spec.ts`'s orphan cleanup.
+    await prisma.authAuditEvent.deleteMany({
+      where: { userId: null, userAgent: { startsWith: emailPrefix } },
+    });
     // `AuthIdentity` and `Session` both cascade with `User`; the identity
     // sweep is scoped by phone prefix too, because a WhatsApp-only account
     // has no email for the predicate above to match.
@@ -460,8 +531,16 @@ describe('AuthIdentityService', () => {
         identityService.signInWithGoogle({ idToken: 'tok-audit' }),
       ).rejects.toBeInstanceOf(AppException);
 
+      // Scoped to THIS run's marker for the same reason the cleanup above is:
+      // `identity_login_failed`/`userId: null` alone also matches rows another
+      // concurrent Jest worker is writing, which could fill the `take: 5`
+      // window and hide the row this test just caused.
       const events = await prisma.authAuditEvent.findMany({
-        where: { event: 'identity_login_failed', userId: null },
+        where: {
+          event: 'identity_login_failed',
+          userId: null,
+          userAgent: { startsWith: emailPrefix },
+        },
         orderBy: { createdAt: 'desc' },
         take: 5,
       });

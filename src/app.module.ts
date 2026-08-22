@@ -24,6 +24,7 @@ import { PaymentsModule } from './payments/payments.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { ProgressModule } from './progress/progress.module';
 import { RetentionModule } from './retention/retention.module';
+import { RewardsModule } from './rewards/rewards.module';
 import { SeriesModule } from './series/series.module';
 import { StorageModule } from './storage/storage.module';
 import { VideosModule } from './videos/videos.module';
@@ -80,6 +81,13 @@ import { VideosModule } from './videos/videos.module';
     // answers 503 PAYMENTS_DISABLED and the provider gateway is an inert
     // no-credential stub — see `PaymentsModule`'s own doc comment.
     PaymentsModule,
+    // Work unit "REWARDS BACKEND FOUNDATION": env-gated (`REWARDS_ENABLED`,
+    // default OFF) points economy — an append-only ledger with a derived
+    // balance projection, daily check-in, and redemption into the existing
+    // premium entitlement. While the flag is off (this repo's shipped
+    // default) every `/rewards/*` route answers 503 REWARDS_DISABLED — see
+    // `RewardsModule`'s own doc comment.
+    RewardsModule,
   ],
   controllers: [AppController],
   providers: [AppService, { provide: APP_GUARD, useClass: ThrottlerGuard }],

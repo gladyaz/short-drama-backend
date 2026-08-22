@@ -333,3 +333,47 @@ export const WHATSAPP_OTP_REQUEST_RATE_TTL_MS = minutes(10);
  */
 export const WHATSAPP_OTP_VERIFY_RATE_LIMIT = 5;
 export const WHATSAPP_OTP_VERIFY_RATE_TTL_MS = seconds(60);
+
+/**
+ * Work unit "REWARDS BACKEND FOUNDATION". `POST /rewards/check-in` and
+ * `POST /rewards/redemptions` are AUTHENTICATED routes that both open a
+ * database transaction taking a per-account row lock, so they follow the
+ * `ACCOUNT_DELETION_RATE_LIMIT` / `DATA_EXPORT_RATE_LIMIT` precedent of
+ * "authenticated, but still gets a dedicated tighter override for a specific
+ * reason" rather than inheriting the generous 300/min default.
+ *
+ * The reason here is NOT that the endpoints are dangerous to call twice —
+ * they are idempotent by construction, which is the whole design, and a
+ * replay writes nothing. It is that each call is a WRITE TRANSACTION that
+ * serialises on the caller's `User` row. Left on the default, one stolen
+ * token could hold that account's lock in a 300/min loop and make every
+ * other transaction for the same account (login, password change, deletion)
+ * queue behind it. The limit bounds lock pressure, not fraud — the ledger's
+ * unique keys already make fraud a no-op.
+ *
+ * 30/minute for check-in is roughly an order of magnitude above any real
+ * usage (a genuine user checks in ONCE A DAY; the only legitimate repeats
+ * are a double-tap and a retry after a dropped connection) while leaving a
+ * flaky-network client comfortable room.
+ */
+export const REWARD_CHECK_IN_RATE_LIMIT = 30;
+export const REWARD_CHECK_IN_RATE_TTL_MS = minutes(1);
+
+/**
+ * `POST /rewards/redemptions`: 10 per minute. Tighter than check-in because
+ * a redemption does strictly more work in its transaction — a ledger debit,
+ * a receipt row, AND an `Entitlement` grant — and because, unlike check-in,
+ * each accepted call legitimately CHANGES state (a user can hold several
+ * redemptions), so retries are not automatically no-ops. Still far above a
+ * real purchase pattern: a user redeeming ten times in one minute is not a
+ * user.
+ *
+ * Same honest limit as every other override in this file: `ThrottlerGuard`
+ * keys on client IP, not on the authenticated user id, so an attacker
+ * rotating source addresses is not bounded by it, and users sharing one NAT
+ * share a bucket. The load-bearing controls for this domain are the
+ * database-backed ones — the unique idempotency keys and the balance floor —
+ * not this.
+ */
+export const REWARD_REDEEM_RATE_LIMIT = 10;
+export const REWARD_REDEEM_RATE_TTL_MS = minutes(1);

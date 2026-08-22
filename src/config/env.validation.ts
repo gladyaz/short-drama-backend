@@ -90,7 +90,56 @@ export function validateEnv(
 
   validateIdentityProvidersConfig(config);
 
+  validateRewardsConfig(config);
+
   return config;
+}
+
+/**
+ * Work unit "REWARDS BACKEND FOUNDATION". `REWARDS_ENABLED` needs no
+ * validation of its own — like every other feature flag in this file it is
+ * "the literal string `true` or it is off", which cannot be malformed.
+ *
+ * `REWARDS_TIMEZONE` is OPTIONAL (it has a documented default,
+ * `DEFAULT_REWARDS_TIMEZONE`), mirroring the `TRANSCODE_MAX_ATTEMPTS` /
+ * `HLS_TOKEN_TTL_SECONDS` "optional, but must be well-formed if present"
+ * pattern. What it must not be is a value `Intl` cannot resolve.
+ *
+ * WHY THIS IS CHECKED AT BOOT AND NOT AT FIRST USE. `Intl.DateTimeFormat`
+ * throws `RangeError` for an unknown zone, and the ONLY places that
+ * construct one are on the check-in and snapshot paths. Without this gate a
+ * typo like `Asia/Jakata` would start the process cleanly and then fail
+ * every rewards request at runtime with an opaque 500 — the daily boundary
+ * that the entire anti-farming design rests on would be broken, and the
+ * first symptom would be user-facing. Failing the boot instead makes a
+ * misconfiguration impossible to deploy unnoticed.
+ *
+ * VALIDATED UNCONDITIONALLY, not only when `REWARDS_ENABLED=true`: a
+ * deployment that sets a broken timezone while the feature is dark should
+ * find out when it sets it, not weeks later when someone flips the flag.
+ */
+function validateRewardsConfig(config: Record<string, unknown>): void {
+  // Narrowed to `string` explicitly rather than coerced with `String()`.
+  // Config values are always strings in practice; a non-string here is an
+  // unexpected shape, not something to stringify — the same discipline
+  // `assertPositiveIntEnvIfPresent` above uses, and it sidesteps the
+  // `no-base-to-string` trap that the `rawRedisUrl` comment documents.
+  const raw = config.REWARDS_TIMEZONE;
+
+  if (typeof raw !== 'string' || raw.trim().length === 0) {
+    return;
+  }
+
+  const timezone = raw.trim();
+
+  try {
+    new Intl.DateTimeFormat('en-CA', { timeZone: timezone });
+  } catch {
+    throw new Error(
+      `REWARDS_TIMEZONE is not a valid IANA timezone: "${timezone}". ` +
+        'Use a zone name such as "Asia/Jakarta", or unset it to use the default.',
+    );
+  }
 }
 
 /**

@@ -274,6 +274,43 @@ export interface IdentityProvidersConfig {
   whatsappOtpDriver: string | undefined;
 }
 
+/**
+ * Work unit "REWARDS BACKEND FOUNDATION". `enabled` defaults OFF, matching
+ * `PaymentsConfig`/`TranscodeConfig`'s precedent — a feature ships dark and
+ * an operator turns it on deliberately. The local Android demo sets
+ * `REWARDS_ENABLED=true` in its own `.env`; nothing in this repository ships
+ * it on.
+ *
+ * `timezone` is the IANA zone whose calendar day defines a reward day. It is
+ * resolved permissively here (absent/blank falls back to the documented
+ * default) and validated strictly in `env.validation.ts`, matching the
+ * "validate elsewhere, resolve permissively here" split the storage and
+ * transcode config already use.
+ */
+/**
+ * The IANA timezone whose calendar day defines a "reward day".
+ *
+ * Pinned to one SERVER-SIDE zone rather than read from the device, because a
+ * device-derived boundary is trivially farmed: set the phone clock forward,
+ * collect another day's check-in, repeat. The mobile domain contract states
+ * the rule directly — "never trust a device clock or device timezone: both
+ * are user-settable". `Asia/Jakarta` is the app's audience timezone and the
+ * assumption that contract already records.
+ *
+ * Declared here beside `DEFAULT_STORAGE_DRIVER` and
+ * `DEFAULT_TRANSCODE_MAX_ATTEMPTS` rather than in `rewards.constants.ts`,
+ * following this file's existing convention: config defaults live with the
+ * config factory (which deliberately imports nothing), while
+ * `rewards.constants.ts` owns the ECONOMICS. A timezone is deployment
+ * configuration, not a reward value.
+ */
+export const DEFAULT_REWARDS_TIMEZONE = 'Asia/Jakarta';
+
+export interface RewardsConfig {
+  enabled: boolean;
+  timezone: string;
+}
+
 export interface RootConfig {
   app: AppConfig;
   auth: AuthConfig;
@@ -282,6 +319,7 @@ export interface RootConfig {
   hlsGateway: HlsGatewayConfig;
   payments: PaymentsConfig;
   identityProviders: IdentityProvidersConfig;
+  rewards: RewardsConfig;
 }
 
 export default (): RootConfig => ({
@@ -337,6 +375,10 @@ export default (): RootConfig => ({
     enabled: process.env.PAYMENTS_ENABLED === 'true',
     midtransServerKey: process.env.MIDTRANS_SERVER_KEY,
     midtransIsProduction: process.env.MIDTRANS_IS_PRODUCTION === 'true',
+  },
+  rewards: {
+    enabled: process.env.REWARDS_ENABLED === 'true',
+    timezone: process.env.REWARDS_TIMEZONE ?? DEFAULT_REWARDS_TIMEZONE,
   },
   identityProviders: {
     googleEnabled: process.env.GOOGLE_AUTH_ENABLED === 'true',

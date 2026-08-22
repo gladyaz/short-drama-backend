@@ -182,6 +182,36 @@ export class EntitlementsService {
     durationDays: number,
     source: string,
   ): Promise<{ id: string; expiresAt: Date } | null> {
+    return this.grantTimedPremium(tx, userId, durationDays, source);
+  }
+
+  /**
+   * Work unit "REWARDS BACKEND FOUNDATION": the general, funding-agnostic
+   * time-bound premium grant. This is the body `grantPaidPremium` has always
+   * had, lifted verbatim behind a name that does not claim to know WHY the
+   * premium was granted — `grantPaidPremium` now delegates to it unchanged,
+   * so payment behavior is byte-identical to before this extraction.
+   *
+   * WHY EXTRACT INSTEAD OF ADDING A SECOND GRANT METHOD. Reward redemption
+   * needs exactly these semantics — lock the user, stack onto any active
+   * dated expiry, create one audit row — and the one thing this domain must
+   * never grow is a SECOND way to become premium. The mobile domain contract
+   * is explicit that redeeming "grants an entitlement through the same
+   * system everything else uses", and this module's own doc comment already
+   * committed to being the single owner of premium semantics. Two nearly
+   * identical grant paths is how that ownership rots: they drift, and then
+   * "am I premium?" depends on how you got there.
+   *
+   * The caller supplies `source` (`"reward-redemption"`, a payment plan id,
+   * `"dev-grant"`), which is what keeps the funding story auditable from the
+   * `Entitlement` row alone without encoding it in the method name.
+   */
+  async grantTimedPremium(
+    tx: Prisma.TransactionClient,
+    userId: string,
+    durationDays: number,
+    source: string,
+  ): Promise<{ id: string; expiresAt: Date } | null> {
     const lockedUser = await tx.$queryRaw<{ id: string }[]>`
       SELECT "id" FROM "User" WHERE "id" = ${userId} FOR UPDATE`;
 

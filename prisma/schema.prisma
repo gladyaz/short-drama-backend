@@ -112,6 +112,28 @@ model User {
   /// would leave a live Google `sub` / phone number in the database pointing
   /// at nothing. See `AuthIdentity` below for the full design rationale.
   authIdentities      AuthIdentity[]
+  /// Work unit "REWARDS BACKEND FOUNDATION": the user's points economy.
+  /// All four cascade with the `User` (`onDelete: Cascade`), following the
+  /// `Session`/`AccountLockout`/`PasswordResetToken` precedent rather than
+  /// `PaymentOrder`/`AuthAuditEvent`'s survive-and-anonymize one. The
+  /// distinction is deliberate: a `PaymentOrder` is a FINANCIAL record of
+  /// real money that must outlive the account, whereas reward points are an
+  /// internal, non-monetary loyalty balance with no external counterparty —
+  /// once the account is gone there is no one to owe them to, nothing to
+  /// reconcile against a bank, and no dispute that could be raised. Keeping
+  /// an orphaned ledger would preserve a behavioral history (what someone
+  /// watched and when they opened the app) for no operational benefit, which
+  /// is the opposite of what account deletion is for.
+  ///
+  /// Cascade order is safe against `AuthService.deleteAccount`: that
+  /// transaction locks the `User` row FIRST (see the CANONICAL AUTH LOCK
+  /// ORDER block in `auth.service.ts`), and every rewards transaction locks
+  /// the same `User` row first too, so the two can never interleave into a
+  /// cycle.
+  rewardWallet        RewardWallet?
+  rewardLedgerEntries RewardLedgerEntry[]
+  rewardCheckIn       RewardCheckIn?
+  rewardRedemptions   RewardRedemption[]
 }
 
 // Phase 12, work unit 12A-B1: persistent (PostgreSQL, survives restart)
@@ -1056,4 +1078,164 @@ model PhoneOtpChallenge {
 
   @@index([phoneE164, createdAt])
   @@index([expiresAt])
+}
+
+// ===========================================================================
+// REWARDS — work unit "REWARDS BACKEND FOUNDATION"
+// ===========================================================================
+//
+// THE ONE INVARIANT THIS SCHEMA EXISTS TO ENFORCE:
+//
+//     A balance is a PROJECTION OF A LEDGER, never a stored number that
+//     code is free to overwrite.
+//
+// (Mobile `docs/rewards-domain-contract.md` §1.) The failure mode being
+// designed out is `user.points = user.points + 50` — a bare mutable counter
+// that cannot answer where points came from, whether a reward was already
+// paid, whether a retry double-paid, or how to reverse any of it.
+//
+// So: `RewardLedgerEntry` is append-only and is the source of truth.
+// `RewardWallet.balancePoints` is a derived cache maintained by the SAME
+// transaction that appends the entry. If the two ever disagree, the ledger
+// wins and the wallet is rebuilt by summing it — which is possible at any
+// time precisely because no entry is ever updated or deleted.
+
+/// Read-optimised projection over `RewardLedgerEntry`. One row per user,
+/// created lazily on first read/mutation (`RewardsWalletService.ensureWallet`).
+///
+/// `balancePoints` and `lifetimeEarnedPoints` are guarded by Postgres CHECK
+/// constraints (`balancePoints >= 0`, `lifetimeEarnedPoints >= 0`) added in
+/// this model's migration — Prisma has no schema syntax for CHECK, so they
+/// live in the migration SQL. They are a LAST-RESORT backstop, not the
+/// primary control: `RewardsWalletService.appendEntry` refuses an
+/// overdrawing debit in application code with a clean
+/// `INSUFFICIENT_REWARD_POINTS` error. The constraints exist so that if a
+/// future writer ever forgets that check, the database refuses the write
+/// instead of silently minting a negative balance.
+///
+/// `version` is an optimistic-concurrency counter, incremented on every
+/// mutation. It is NOT the concurrency control (a `SELECT ... FOR UPDATE`
+/// row lock is — see `appendEntry`); it is an observable audit signal, and
+/// it is surfaced to the client so a stale snapshot is detectable.
+model RewardWallet {
+  id                   String              @id @default(cuid())
+  userId               String              @unique
+  user                 User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  balancePoints        Int                 @default(0)
+  lifetimeEarnedPoints Int                 @default(0)
+  version              Int                 @default(0)
+  createdAt            DateTime            @default(now())
+  updatedAt            DateTime            @updatedAt
+  ledgerEntries        RewardLedgerEntry[]
+
+  @@index([userId])
+}
+
+/// APPEND-ONLY. No updates, no deletes — a correction is a new compensating
+/// entry (`REVERSAL`), never an edit. Nothing in this codebase issues an
+/// `update` or `delete` against this table, and `rewards-wallet.service.spec.ts`
+/// asserts a replayed action adds no second row rather than mutating one.
+///
+/// `idempotencyKey` IS THE ANTI-DOUBLE-PAY CONTROL. Unique per user, enforced
+/// by a database constraint rather than an application-level "check then
+/// insert" — that check-then-act races under concurrency and WILL double-pay
+/// (mobile contract §4, "Idempotency"). Two concurrent identical claims both
+/// attempt the insert; Postgres admits exactly one and the loser gets `P2002`,
+/// which `appendEntry` converts into a replay of the winner's result. The key
+/// is composed server-side for server-decided actions — a daily check-in is
+/// keyed `DAILY_CHECK_IN:<periodKey>`, so a client cannot obtain a second
+/// payout for the same calendar day by varying a key it supplies.
+///
+/// `balanceAfter` snapshots the projection immediately after this entry, so a
+/// statement view renders without a running sum and an auditor can spot a
+/// divergence between ledger and wallet by inspecting one row.
+///
+/// `deltaPoints` is signed and never zero (CHECK constraint in the migration):
+/// a zero-delta entry would be an audit record of nothing having happened,
+/// which belongs in a log, not in a ledger.
+model RewardLedgerEntry {
+  id             String       @id @default(cuid())
+  userId         String
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  walletId       String
+  wallet         RewardWallet @relation(fields: [walletId], references: [id], onDelete: Cascade)
+  deltaPoints    Int
+  reason         String
+  sourceType     String
+  sourceId       String?
+  idempotencyKey String
+  balanceAfter   Int
+  metadata       Json?
+  createdAt      DateTime     @default(now())
+
+  @@unique([userId, idempotencyKey])
+  @@index([userId, createdAt])
+  @@index([walletId])
+  @@index([reason])
+}
+
+/// Per-user daily check-in state. One row per user, updated in place — this
+/// is DERIVED state (like `RewardWallet`), not history: the immutable history
+/// of which days were claimed lives in the `DAILY_CHECK_IN` ledger entries,
+/// whose `idempotencyKey` carries the period key. That is why the mobile
+/// contract's proposed `checkInDates` array is absent here: it would be a
+/// second, drift-prone copy of what the ledger already records exactly.
+///
+/// `lastCheckInDate` is a `YYYY-MM-DD` CALENDAR DATE in the service timezone,
+/// stored as `String` and NOT as a `DateTime` — a reward day is a calendar
+/// date in one pinned zone, not an instant, and a `DateTime` column would
+/// silently mean a different 24 hours depending on which code path last wrote
+/// it. See `reward-period.util.ts` for the full reasoning.
+model RewardCheckIn {
+  id                String    @id @default(cuid())
+  userId            String    @unique
+  user              User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  currentStreakDays Int       @default(0)
+  longestStreakDays Int       @default(0)
+  totalCheckInDays  Int       @default(0)
+  lastCheckInDate   String?
+  lastCheckInAt     DateTime?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  @@index([userId])
+}
+
+/// The record of converting points into premium time. Distinct from the
+/// ledger entry it produces: a redemption is an ACTION with an outcome that
+/// can fail, while the ledger entry is the immutable financial fact of the
+/// debit. Keeping them separate means a failed redemption leaves an audit
+/// trail without moving any points (mobile contract §2, `RewardClaim`).
+///
+/// `costPoints`/`grantsDays` are SNAPSHOTTED from the catalog at redemption
+/// time, so retuning `REWARD_REDEMPTION_OFFERS` never rewrites history.
+///
+/// `ledgerEntryId` and `entitlementId` are both `@unique`: each debit funds
+/// at most one redemption and each redemption grants at most one entitlement,
+/// so a double-grant is refused by the database and not merely by a code path
+/// — the same discipline `PaymentOrder.entitlementId` already uses.
+///
+/// `idempotencyKey` is CLIENT-supplied here (unlike check-in, whose key the
+/// server derives): redeeming the same offer twice is a legitimate action, so
+/// the client is the only party that knows whether a second request is a new
+/// purchase or a retry of the first.
+model RewardRedemption {
+  id                   String    @id @default(cuid())
+  userId               String
+  user                 User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  offerId              String
+  costPoints           Int
+  grantsDays           Int
+  status               String
+  idempotencyKey       String
+  ledgerEntryId        String?   @unique
+  entitlementId        String?   @unique
+  entitlementExpiresAt DateTime?
+  failureReason        String?
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+
+  @@unique([userId, idempotencyKey])
+  @@index([userId, createdAt])
+  @@index([status])
 }

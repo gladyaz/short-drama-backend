@@ -614,4 +614,61 @@ export enum AppErrorCode {
    * another account's linked providers.
    */
   AUTH_IDENTITY_NOT_FOUND = 'AUTH_IDENTITY_NOT_FOUND',
+  // Work unit "REWARDS BACKEND FOUNDATION"
+  /**
+   * Returned (503) by every `/rewards/*` route while `REWARDS_ENABLED` is
+   * off — this repository's shipped default. Mirrors `PAYMENTS_DISABLED`'s
+   * shape exactly: a feature that is deliberately dark answers "not
+   * available here", not 404 (which would imply the route does not exist and
+   * send a client hunting for a different path) and not 403 (which would
+   * imply the caller lacks permission and could be fixed by signing in
+   * differently).
+   */
+  REWARDS_DISABLED = 'REWARDS_DISABLED',
+  /**
+   * Returned (409) when a debit would take the balance below zero — a
+   * redemption the caller cannot afford. Carries no balance figure in the
+   * message: the client already has the authoritative balance from
+   * `GET /rewards/snapshot`, and restating it in an error string invites a
+   * client to parse it back out and treat the error as a data source.
+   */
+  INSUFFICIENT_REWARD_POINTS = 'INSUFFICIENT_REWARD_POINTS',
+  /** Returned (404) when the requested redemption offer id is not in the catalog. */
+  REWARD_OFFER_NOT_FOUND = 'REWARD_OFFER_NOT_FOUND',
+  /**
+   * Returned (409) for a catalog offer that exists but is not currently
+   * purchasable (`isEnabled: false` — the mobile `COMING_SOON` state).
+   * Deliberately DISTINCT from `REWARD_OFFER_NOT_FOUND`: a client showing a
+   * coming-soon tile should be told its tile is real but not yet live, not
+   * that it is rendering something that does not exist. Enforced
+   * server-side, so a client that ignores the flag still cannot buy it.
+   */
+  REWARD_OFFER_UNAVAILABLE = 'REWARD_OFFER_UNAVAILABLE',
+  /**
+   * Returned (409) when a client reuses an `idempotencyKey` it previously
+   * used for a DIFFERENT action (e.g. the same key for two different
+   * offers).
+   *
+   * This is the one case where replaying the original result would be
+   * actively wrong: the caller asked for offer B and the key belongs to
+   * offer A, so answering with A's receipt would report a purchase they did
+   * not request — and silently charging them for B under A's key would
+   * corrupt the idempotency contract in the other direction. Refusing is the
+   * only honest outcome, and it is a client bug worth surfacing loudly.
+   */
+  REWARD_IDEMPOTENCY_KEY_REUSED = 'REWARD_IDEMPOTENCY_KEY_REUSED',
+  /**
+   * A reward movement was rejected because its point delta is not a usable
+   * non-zero integer. Carries TWO statuses, which is deliberate rather than
+   * sloppy — the same defect means different things depending on who
+   * supplied the number:
+   *
+   * - **500**, from `RewardsWalletService.appendEntry`. Every real earn/spend
+   *   delta is server-computed from `rewards.constants.ts` and is never read
+   *   from a request, so a bad one there can only mean a bug in this backend
+   *   — not something a caller did wrong or could fix by retrying.
+   * - **400**, from the dev-only point grant, whose amount IS caller-supplied.
+   *   There the same condition is an ordinary bad request.
+   */
+  REWARD_LEDGER_INVALID_DELTA = 'REWARD_LEDGER_INVALID_DELTA',
 }

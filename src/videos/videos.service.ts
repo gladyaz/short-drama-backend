@@ -8,6 +8,7 @@ import {
 } from '../config/configuration';
 import { AppErrorCode } from '../common/errors/app-error-code';
 import { AppException } from '../common/errors/app.exception';
+import { resolveAccessTier } from '../entitlements/entitlement.constants';
 import { MediaLifecycleState } from '../media/media-lifecycle.types';
 import { PrismaService } from '../prisma/prisma.service';
 import { PLAYBACK_URL_EXPIRY_SECONDS } from '../storage/storage.constants';
@@ -175,7 +176,37 @@ export class VideosService {
         expiresAt: new Date(
           Date.now() + PLAYBACK_URL_EXPIRY_SECONDS * 1000,
         ).toISOString(),
-        requiresAuthHeader: true,
+        // Work unit "ANONYMOUS FREE-EPISODE PLAYBACK": was hardcoded `true`.
+        // It is now DERIVED from this row's authoritative effective access
+        // tier, because that hardcoded `true` became a lie the moment
+        // `/videos/:id/stream` accepted anonymous callers for free content:
+        // a guest told `requiresAuthHeader: true` has no token to attach and
+        // would either send `Bearer undefined` or give up, so `/playback`
+        // would answer 200 for a source the guest still cannot fetch — the
+        // exact "authorized but no bytes" failure this work unit exists to
+        // prevent.
+        //
+        // Resolved through the SAME `resolveAccessTier` the gate
+        // (`VideosController#enforceEntitlementGate`, via
+        // `resolveEpisodePremium`) and the public `VideoResponseDto
+        // .accessTier` field already use, from the SAME row this method
+        // already loaded — so this flag can never contradict the
+        // authorization decision `/stream` will actually make.
+        //
+        // Deliberately a function of the CONTENT only, never of the caller:
+        // the same row yields the same value for a guest, a signed-in
+        // non-entitled user, and a Premium subscriber. It leaks nothing
+        // about who asked, and stays cacheable/uniform per video.
+        //   free    -> false: `/stream` serves this row to anyone, so no
+        //              header is REQUIRED. A client that attaches a valid
+        //              token anyway is still accepted.
+        //   premium -> true: `/stream` still refuses this row without an
+        //              active entitlement, exactly as before.
+        requiresAuthHeader:
+          resolveAccessTier({
+            accessTierOverride: record.accessTierOverride,
+            episodeNumber: record.episodeNumber,
+          }) === 'premium',
       };
     }
 

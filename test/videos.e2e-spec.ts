@@ -1,5 +1,6 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { HttpStatus, INestApplication, ValidationPipe } from '@nestjs/common';
+import { JwtService } from '@nestjs/jwt';
 import request from 'supertest';
 import { App } from 'supertest/types';
 import { AppModule } from './../src/app.module';
@@ -270,13 +271,42 @@ describe('Videos (e2e)', () => {
   });
 
   describe('GET /videos/:id/stream (Phase 10, work unit 10-B3)', () => {
-    it('returns 401 for an unauthenticated request, even for a free episode', async () => {
+    /**
+     * Work unit "ANONYMOUS FREE-EPISODE PLAYBACK" SUPERSEDES the Phase 10
+     * assertion that used to live here ("returns 401 for an unauthenticated
+     * request, even for a free episode"). That 401 was the exact product
+     * defect this work unit removes: a signed-out guest must be able to
+     * watch FREE content. The premium half of the Phase 10 contract is
+     * unchanged and is still asserted below (and exhaustively in the
+     * dedicated guest-matrix describe further down).
+     */
+    it('serves a FREE episode to an anonymous request (no Authorization header at all)', async () => {
       const response = await request(app.getHttpServer())
         .get(`/videos/${freeEpisodeId}/stream`)
+        .set('Range', 'bytes=0-1023')
+        .expect(HttpStatus.PARTIAL_CONTENT);
+
+      expect(response.headers['content-range']).toMatch(/^bytes 0-1023\/\d+$/);
+      expect(response.headers['content-type']).toBe('video/mp4');
+    });
+
+    it('still returns 401 for an anonymous request carrying a MALFORMED Authorization header, even for a free episode', async () => {
+      const response = await request(app.getHttpServer())
+        .get(`/videos/${freeEpisodeId}/stream`)
+        .set('Authorization', 'Bearer not-a-real-token')
         .expect(HttpStatus.UNAUTHORIZED);
 
       const body = response.body as ErrorResponseBody;
       expect(body.code).toBe('INVALID_ACCESS_TOKEN');
+    });
+
+    it('returns 403 ENTITLEMENT_REQUIRED for an anonymous request to a PREMIUM episode', async () => {
+      const response = await request(app.getHttpServer())
+        .get(`/videos/${premiumEpisodeId}/stream`)
+        .expect(HttpStatus.FORBIDDEN);
+
+      const body = response.body as ErrorResponseBody;
+      expect(body.code).toBe('ENTITLEMENT_REQUIRED');
     });
 
     it('returns 206 Partial Content for an authenticated request to a free episode', async () => {
@@ -784,14 +814,41 @@ describe('Videos (e2e)', () => {
       });
     });
 
-    it('returns 401 for an unauthenticated request', async () => {
+    /**
+     * Work unit "ANONYMOUS FREE-EPISODE PLAYBACK" SUPERSEDES the Slice 11M
+     * assertion that used to live here ("returns 401 for an unauthenticated
+     * request"), which used a fixture defaulting to `accessTierOverride:
+     * 'free'`. A guest asking for FREE content is now a legitimate request
+     * (asserted in the guest-matrix describe below). What this test still
+     * pins is the half that must NOT change: a guest gets NO presigned URL
+     * for PREMIUM content — the signer is never even reached.
+     */
+    it('returns 403 ENTITLEMENT_REQUIRED for an anonymous request to a PREMIUM row — no signing attempted', async () => {
       const id = await createFixture({
         lifecycleState: 'published',
         objectStorageKey: 'r2/unauth/source.mp4',
+        accessTierOverride: 'premium',
       });
 
       const response = await request(app.getHttpServer())
         .get(`/videos/${id}/playback`)
+        .expect(HttpStatus.FORBIDDEN);
+
+      expect((response.body as ErrorResponseBody).code).toBe(
+        'ENTITLEMENT_REQUIRED',
+      );
+      expect(mockStorageService.createPresignedGetUrl).not.toHaveBeenCalled();
+    });
+
+    it('returns 401 INVALID_ACCESS_TOKEN when a MALFORMED credential is supplied — never a guest fallback, and no signing attempted', async () => {
+      const id = await createFixture({
+        lifecycleState: 'published',
+        objectStorageKey: 'r2/bad-token/source.mp4',
+      });
+
+      const response = await request(app.getHttpServer())
+        .get(`/videos/${id}/playback`)
+        .set('Authorization', 'Bearer this.is.not-a-jwt')
         .expect(HttpStatus.UNAUTHORIZED);
 
       expect((response.body as ErrorResponseBody).code).toBe(
@@ -867,7 +924,7 @@ describe('Videos (e2e)', () => {
       );
     });
 
-    it('published LOCAL media: 200, the existing /stream URL, requiresAuthHeader true', async () => {
+    it('published LOCAL media (FREE): 200, the existing /stream URL, requiresAuthHeader false', async () => {
       const id = await createFixture({
         lifecycleState: 'published',
         storageKey: 'series/local-episode.mp4',
@@ -885,7 +942,13 @@ describe('Videos (e2e)', () => {
       expect(playback.playbackUrl).toBe(
         `${process.env.PUBLIC_BASE_URL}/videos/${id}/stream`,
       );
-      expect(playback.requiresAuthHeader).toBe(true);
+      // Work unit "ANONYMOUS FREE-EPISODE PLAYBACK": this fixture is FREE
+      // (`createFixture` defaults `accessTierOverride` to `'free'`), and
+      // `/videos/:id/stream` now serves FREE rows to anonymous callers — so
+      // telling the client a header is REQUIRED would be false, and would
+      // strand a guest with a URL it believes it cannot use. The premium
+      // counterpart immediately below still reports `true`.
+      expect(playback.requiresAuthHeader).toBe(false);
       // Tightly windowed (not just "is a valid date"): pins the local
       // branch to the dedicated 15-minute `PLAYBACK_URL_EXPIRY_SECONDS`
       // constant, not the 1-hour `DEFAULT_GET_URL_EXPIRY_SECONDS` — the
@@ -896,6 +959,34 @@ describe('Videos (e2e)', () => {
       expect(expiresAtMs).toBeGreaterThanOrEqual(before + 15 * 60 * 1000);
       expect(expiresAtMs).toBeLessThanOrEqual(after + 15 * 60 * 1000);
       expect(mockStorageService.createPresignedGetUrl).not.toHaveBeenCalled();
+    });
+
+    it('published LOCAL media (PREMIUM): requiresAuthHeader stays true for an entitled caller — unchanged from before this work unit', async () => {
+      const id = await createFixture({
+        lifecycleState: 'published',
+        episodeNumber: 6,
+        storageKey: 'series/local-premium-episode.mp4',
+        objectStorageKey: null,
+        accessTierOverride: 'premium',
+      });
+      await prisma.entitlement.create({
+        data: { userId, tier: 'premium', source: 'dev-grant' },
+      });
+
+      try {
+        const response = await request(app.getHttpServer())
+          .get(`/videos/${id}/playback`)
+          .set('Authorization', `Bearer ${accessToken}`)
+          .expect(HttpStatus.OK);
+
+        const playback = response.body as VideoPlaybackResponseDto;
+        expect(playback.playbackUrl).toBe(
+          `${process.env.PUBLIC_BASE_URL}/videos/${id}/stream`,
+        );
+        expect(playback.requiresAuthHeader).toBe(true);
+      } finally {
+        await prisma.entitlement.deleteMany({ where: { userId } });
+      }
     });
 
     it('an R2 row with objectStorageKey empty and no local storageKey either fails closed — no signing attempted', async () => {
@@ -1341,6 +1432,95 @@ describe('Videos (e2e)', () => {
       expect(mockStorageService.createPresignedGetUrl).not.toHaveBeenCalled();
     });
 
+    /**
+     * Work unit "ANONYMOUS FREE-EPISODE PLAYBACK", fix cycle 2 (Reviewer B,
+     * MEDIUM finding). Every other test in this HLS block authenticates,
+     * and the guest-matrix block's own fixtures are never HLS-ready — so
+     * until now the single most important HLS cell of the guest matrix was
+     * unasserted: a signed-out viewer reaching a FREE, HLS-ready episode.
+     *
+     * The code path is caller-independent today by construction
+     * (`getPlaybackUrl`/`tryBuildHlsPlaybackResponse` take a row, never a
+     * user), which is exactly why this needs a test rather than an argument:
+     * a future change that threaded the caller into the HLS branch — a
+     * per-user audit claim in the token, say — would silently break guest
+     * playback for every HLS episode, and nothing would have caught it.
+     */
+    it('GUEST + FREE + HLS-ready: an anonymous request gets a real minted token, no Authorization header involved', async () => {
+      const { id, prefix } = await createHlsFixture({
+        accessTierOverride: 'free',
+      });
+      const mintSpy = jest.spyOn(hlsPlaybackTokenUtil, 'mintHlsToken');
+
+      try {
+        const response = await request(app.getHttpServer())
+          .get(`/videos/${id}/playback`)
+          .expect(HttpStatus.OK);
+
+        const body = response.body as HlsPlaybackResponseDto;
+        expect(body.type).toBe('hls');
+        expect(
+          body.masterUrl.startsWith(`${process.env.HLS_GATEWAY_BASE_URL}/t/`),
+        ).toBe(true);
+        expect(body.renditions.length).toBeGreaterThan(0);
+
+        // A token really was minted FOR THIS ROW, for an anonymous caller —
+        // not a cached/empty/placeholder response that merely looks right.
+        expect(mintSpy).toHaveBeenCalledTimes(1);
+        expect(mintSpy).toHaveBeenCalledWith(
+          expect.objectContaining({ mediaId: id, prefix }),
+        );
+
+        // The HLS shape carries no `requiresAuthHeader` at all — the gateway
+        // token is the authorization, so there is nothing for a guest to
+        // attach and nothing that could tell it to attach one.
+        expect(body).not.toHaveProperty('requiresAuthHeader');
+        expect(mockStorageService.createPresignedGetUrl).not.toHaveBeenCalled();
+      } finally {
+        mintSpy.mockRestore();
+      }
+    });
+
+    it('GUEST + PREMIUM + HLS-ready: denied with 403 and NO token is minted', async () => {
+      const { id } = await createHlsFixture({
+        episodeNumber: 1,
+        accessTierOverride: 'premium',
+      });
+      const mintSpy = jest.spyOn(hlsPlaybackTokenUtil, 'mintHlsToken');
+
+      try {
+        const response = await request(app.getHttpServer())
+          .get(`/videos/${id}/playback`)
+          .expect(HttpStatus.FORBIDDEN);
+
+        expect((response.body as ErrorResponseBody).code).toBe(
+          'ENTITLEMENT_REQUIRED',
+        );
+        expect(mintSpy).not.toHaveBeenCalled();
+      } finally {
+        mintSpy.mockRestore();
+      }
+    });
+
+    it('a MALFORMED credential on a FREE HLS-ready row is still a 401, never a guest fallback into the HLS branch', async () => {
+      const { id } = await createHlsFixture({ accessTierOverride: 'free' });
+      const mintSpy = jest.spyOn(hlsPlaybackTokenUtil, 'mintHlsToken');
+
+      try {
+        const response = await request(app.getHttpServer())
+          .get(`/videos/${id}/playback`)
+          .set('Authorization', 'Bearer not-a-jwt')
+          .expect(HttpStatus.UNAUTHORIZED);
+
+        expect((response.body as ErrorResponseBody).code).toBe(
+          'INVALID_ACCESS_TOKEN',
+        );
+        expect(mintSpy).not.toHaveBeenCalled();
+      } finally {
+        mintSpy.mockRestore();
+      }
+    });
+
     it('returns 404 VIDEO_NOT_FOUND for a nonexistent id, exactly like the legacy branch (no HLS-specific behavior change to that guard)', async () => {
       const response = await request(app.getHttpServer())
         .get('/videos/does-not-exist-hls/playback')
@@ -1348,6 +1528,541 @@ describe('Videos (e2e)', () => {
         .expect(HttpStatus.NOT_FOUND);
 
       expect((response.body as ErrorResponseBody).code).toBe('VIDEO_NOT_FOUND');
+    });
+  });
+
+  /**
+   * ==========================================================================
+   * Work unit "ANONYMOUS FREE-EPISODE PLAYBACK" — the complete security matrix
+   * ==========================================================================
+   *
+   * The single reason this describe block exists as one contiguous, exhaustive
+   * table rather than as assertions scattered through the file: optional auth
+   * is only safe if EVERY cell below holds simultaneously. A regression that
+   * flips any one of them (most dangerously "invalid token silently becomes a
+   * guest") is an authentication bypass, not a UX change, and would otherwise
+   * be invisible because the happy path would keep passing.
+   *
+   *   caller                  content    expected
+   *   ----------------------  ---------  -----------------------------------
+   *   guest (no header)       FREE       200/206 — playable
+   *   guest (no header)       PREMIUM    403 ENTITLEMENT_REQUIRED
+   *   valid user, no premium  FREE       200/206 — playable
+   *   valid user, no premium  PREMIUM    403 ENTITLEMENT_REQUIRED
+   *   valid user, premium     PREMIUM    200/206 — playable
+   *   invalid token           FREE       401 INVALID_ACCESS_TOKEN
+   *   expired token           FREE       401 INVALID_ACCESS_TOKEN
+   *   malformed Authorization FREE       401 INVALID_ACCESS_TOKEN
+   *
+   * Run against BOTH `/playback` (the authorization endpoint) and, for local
+   * media, `/stream` (the bytes endpoint) — a guest authorized at the first
+   * and refused at the second would be a broken feature, not a shipped one.
+   */
+  describe('ANONYMOUS FREE-EPISODE PLAYBACK — guest/premium authorization matrix', () => {
+    const guestSeriesId = `${emailPrefix}-guest-matrix`;
+    let guestFixtureCounter = 0;
+    /** A second, independent account: never entitled, used for the "signed-in but not premium" row. */
+    let plainUserToken: string;
+    let plainUserId: string;
+    /** A third account holding a live entitlement, used for the "signed-in premium" row. */
+    let premiumUserToken: string;
+    let premiumUserId: string;
+
+    async function createGuestFixture(overrides: {
+      episodeNumber: number;
+      accessTierOverride: string | null;
+      storageKey?: string;
+      objectStorageKey?: string | null;
+    }): Promise<string> {
+      guestFixtureCounter += 1;
+      const id = `${guestSeriesId}-${guestFixtureCounter}`;
+      await prisma.video.create({
+        data: {
+          id,
+          seriesId: guestSeriesId,
+          title: `Guest matrix fixture ${id}`,
+          episodeNumber: overrides.episodeNumber,
+          channelName: 'E2E Channel',
+          caption: 'Guest matrix fixture caption',
+          category: 'drama',
+          storageKey: overrides.storageKey ?? '',
+          sourceLanguage: 'zh',
+          hasEmbeddedIndonesianSubtitle: true,
+          likeCount: 0,
+          lifecycleState: 'published',
+          objectStorageKey: overrides.objectStorageKey ?? null,
+          accessTierOverride: overrides.accessTierOverride,
+        },
+      });
+      return id;
+    }
+
+    beforeAll(async () => {
+      const plain = (
+        await request(app.getHttpServer())
+          .post('/auth/register')
+          .send({
+            email: uniqueEmail('gm-plain'),
+            password: 'correct-horse-battery',
+          })
+          .expect(HttpStatus.CREATED)
+      ).body as AuthResponseDto;
+      plainUserToken = plain.accessToken;
+      plainUserId = plain.user.id;
+
+      const premium = (
+        await request(app.getHttpServer())
+          .post('/auth/register')
+          .send({
+            email: uniqueEmail('gm-prem'),
+            password: 'correct-horse-battery',
+          })
+          .expect(HttpStatus.CREATED)
+      ).body as AuthResponseDto;
+      premiumUserToken = premium.accessToken;
+      premiumUserId = premium.user.id;
+
+      await prisma.entitlement.create({
+        data: { userId: premiumUserId, tier: 'premium', source: 'dev-grant' },
+      });
+    });
+
+    afterAll(async () => {
+      await prisma.video.deleteMany({ where: { seriesId: guestSeriesId } });
+      await prisma.entitlement.deleteMany({
+        where: { userId: { in: [plainUserId, premiumUserId] } },
+      });
+      await prisma.user.deleteMany({
+        where: { id: { in: [plainUserId, premiumUserId] } },
+      });
+    });
+
+    describe('GET /videos/:id/playback — the authorization decision', () => {
+      it('GUEST + FREE -> 200 with a playable source (the product requirement)', async () => {
+        const id = await createGuestFixture({
+          episodeNumber: 1,
+          accessTierOverride: 'free',
+          objectStorageKey: 'r2/guest-free/source.mp4',
+        });
+        mockStorageService.createPresignedGetUrl.mockResolvedValueOnce({
+          url: 'https://signed.example.test/guest-free',
+          key: 'r2/guest-free/source.mp4',
+          expiresAt: new Date(Date.now() + 15 * 60 * 1000),
+        });
+
+        const response = await request(app.getHttpServer())
+          .get(`/videos/${id}/playback`)
+          .expect(HttpStatus.OK);
+
+        const playback = response.body as VideoPlaybackResponseDto;
+        expect(playback.playbackUrl).toBe(
+          'https://signed.example.test/guest-free',
+        );
+        // A guest has no token to attach, so a presigned URL that needs
+        // none is the only kind of source that is actually usable here.
+        expect(playback.requiresAuthHeader).toBe(false);
+      });
+
+      it('GUEST + PREMIUM -> 403 ENTITLEMENT_REQUIRED, and no URL is ever minted', async () => {
+        const id = await createGuestFixture({
+          episodeNumber: 6,
+          accessTierOverride: 'premium',
+          objectStorageKey: 'r2/guest-premium/source.mp4',
+        });
+
+        const response = await request(app.getHttpServer())
+          .get(`/videos/${id}/playback`)
+          .expect(HttpStatus.FORBIDDEN);
+
+        expect((response.body as ErrorResponseBody).code).toBe(
+          'ENTITLEMENT_REQUIRED',
+        );
+        expect(mockStorageService.createPresignedGetUrl).not.toHaveBeenCalled();
+      });
+
+      it('SIGNED-IN NON-PREMIUM + FREE -> 200 (unchanged from before this work unit)', async () => {
+        const id = await createGuestFixture({
+          episodeNumber: 1,
+          accessTierOverride: 'free',
+          objectStorageKey: 'r2/user-free/source.mp4',
+        });
+        mockStorageService.createPresignedGetUrl.mockResolvedValueOnce({
+          url: 'https://signed.example.test/user-free',
+          key: 'r2/user-free/source.mp4',
+          expiresAt: new Date(Date.now() + 15 * 60 * 1000),
+        });
+
+        await request(app.getHttpServer())
+          .get(`/videos/${id}/playback`)
+          .set('Authorization', `Bearer ${plainUserToken}`)
+          .expect(HttpStatus.OK);
+      });
+
+      it('SIGNED-IN NON-PREMIUM + PREMIUM -> 403 ENTITLEMENT_REQUIRED (unchanged — the paywall still holds)', async () => {
+        const id = await createGuestFixture({
+          episodeNumber: 6,
+          accessTierOverride: 'premium',
+          objectStorageKey: 'r2/user-premium-denied/source.mp4',
+        });
+
+        const response = await request(app.getHttpServer())
+          .get(`/videos/${id}/playback`)
+          .set('Authorization', `Bearer ${plainUserToken}`)
+          .expect(HttpStatus.FORBIDDEN);
+
+        expect((response.body as ErrorResponseBody).code).toBe(
+          'ENTITLEMENT_REQUIRED',
+        );
+        expect(mockStorageService.createPresignedGetUrl).not.toHaveBeenCalled();
+      });
+
+      it('SIGNED-IN PREMIUM + PREMIUM -> 200 (no regression for paying users)', async () => {
+        const id = await createGuestFixture({
+          episodeNumber: 6,
+          accessTierOverride: 'premium',
+          objectStorageKey: 'r2/premium-allowed/source.mp4',
+        });
+        mockStorageService.createPresignedGetUrl.mockResolvedValueOnce({
+          url: 'https://signed.example.test/premium-allowed',
+          key: 'r2/premium-allowed/source.mp4',
+          expiresAt: new Date(Date.now() + 15 * 60 * 1000),
+        });
+
+        const response = await request(app.getHttpServer())
+          .get(`/videos/${id}/playback`)
+          .set('Authorization', `Bearer ${premiumUserToken}`)
+          .expect(HttpStatus.OK);
+
+        expect((response.body as VideoPlaybackResponseDto).playbackUrl).toBe(
+          'https://signed.example.test/premium-allowed',
+        );
+      });
+
+      it('the GUEST and the SIGNED-IN NON-PREMIUM premium refusals are byte-identical — the response leaks nothing about whether a session existed', async () => {
+        const id = await createGuestFixture({
+          episodeNumber: 6,
+          accessTierOverride: 'premium',
+          objectStorageKey: 'r2/refusal-parity/source.mp4',
+        });
+
+        const guestRefusal = await request(app.getHttpServer())
+          .get(`/videos/${id}/playback`)
+          .expect(HttpStatus.FORBIDDEN);
+        const userRefusal = await request(app.getHttpServer())
+          .get(`/videos/${id}/playback`)
+          .set('Authorization', `Bearer ${plainUserToken}`)
+          .expect(HttpStatus.FORBIDDEN);
+
+        expect(guestRefusal.body).toEqual(userRefusal.body);
+      });
+    });
+
+    /**
+     * The anti-bypass half. Every case here supplies SOMETHING in the
+     * `Authorization` header and must fail with 401 — never be quietly
+     * downgraded into the (now-permitted) anonymous path, which would let a
+     * revoked/expired session keep reading free content indefinitely and,
+     * worse, would prove the optional-auth mechanism swallows auth failures.
+     */
+    describe('a supplied-but-unusable credential is NEVER a guest fallback', () => {
+      let freeId: string;
+
+      beforeAll(async () => {
+        freeId = await createGuestFixture({
+          episodeNumber: 1,
+          accessTierOverride: 'free',
+          objectStorageKey: 'r2/bad-credential/source.mp4',
+        });
+      });
+
+      it.each([
+        ['an invalid/garbage bearer token', 'Bearer totally-invalid-token'],
+        [
+          'a structurally valid but forged JWT',
+          `Bearer ${'a'.repeat(20)}.${'b'.repeat(20)}.${'c'.repeat(20)}`,
+        ],
+        ['a non-Bearer scheme', 'Token abc.def.ghi'],
+        ['Basic credentials', 'Basic dXNlcjpwYXNz'],
+        ['"Bearer" with no token', 'Bearer '],
+      ])(
+        'FREE content + %s -> 401 INVALID_ACCESS_TOKEN, no signing attempted',
+        async (_label: string, authorization: string) => {
+          const response = await request(app.getHttpServer())
+            .get(`/videos/${freeId}/playback`)
+            .set('Authorization', authorization)
+            .expect(HttpStatus.UNAUTHORIZED);
+
+          expect((response.body as ErrorResponseBody).code).toBe(
+            'INVALID_ACCESS_TOKEN',
+          );
+          expect(
+            mockStorageService.createPresignedGetUrl,
+          ).not.toHaveBeenCalled();
+        },
+      );
+
+      /**
+       * The expired-token case gets its own test because it is the one an
+       * ordinary client actually hits: a real, correctly-signed token for a
+       * real user that simply aged out. It is signed here with the SAME
+       * `JWT_ACCESS_SECRET` the app verifies against, so nothing but the
+       * `exp` claim distinguishes it from a working session — which is
+       * precisely why a guest fallback here would be so easy to ship by
+       * accident.
+       */
+      it('FREE content + a genuinely EXPIRED (but correctly signed) token -> 401 INVALID_ACCESS_TOKEN', async () => {
+        const jwtService = new JwtService({});
+        const expiredToken = await jwtService.signAsync(
+          { sub: plainUserId },
+          { secret: process.env.JWT_ACCESS_SECRET!, expiresIn: '-1s' },
+        );
+
+        const response = await request(app.getHttpServer())
+          .get(`/videos/${freeId}/playback`)
+          .set('Authorization', `Bearer ${expiredToken}`)
+          .expect(HttpStatus.UNAUTHORIZED);
+
+        expect((response.body as ErrorResponseBody).code).toBe(
+          'INVALID_ACCESS_TOKEN',
+        );
+        expect(mockStorageService.createPresignedGetUrl).not.toHaveBeenCalled();
+      });
+
+      it('FREE content + a token signed with the WRONG secret -> 401 INVALID_ACCESS_TOKEN', async () => {
+        const jwtService = new JwtService({});
+        const forged = await jwtService.signAsync(
+          { sub: plainUserId },
+          { secret: 'not-the-real-access-secret', expiresIn: '15m' },
+        );
+
+        const response = await request(app.getHttpServer())
+          .get(`/videos/${freeId}/playback`)
+          .set('Authorization', `Bearer ${forged}`)
+          .expect(HttpStatus.UNAUTHORIZED);
+
+        expect((response.body as ErrorResponseBody).code).toBe(
+          'INVALID_ACCESS_TOKEN',
+        );
+      });
+
+      it('the SAME free row IS served when the header is simply absent — proving the 401s above are about the credential, not the content', async () => {
+        mockStorageService.createPresignedGetUrl.mockResolvedValueOnce({
+          url: 'https://signed.example.test/bad-credential-control',
+          key: 'r2/bad-credential/source.mp4',
+          expiresAt: new Date(Date.now() + 15 * 60 * 1000),
+        });
+
+        await request(app.getHttpServer())
+          .get(`/videos/${freeId}/playback`)
+          .expect(HttpStatus.OK);
+      });
+    });
+
+    /**
+     * ACCESS-TIER AUTHORITY REGRESSION. Deliberately INVERTED fixtures: the
+     * EARLY episode is PREMIUM and the LATE episode is FREE, the exact
+     * opposite of what `episodeNumber > FREE_EPISODE_LIMIT` would produce.
+     * If any authorization decision ever regressed to reading the episode
+     * number, both assertions below would flip — which no amount of
+     * conventionally-numbered fixtures could ever detect.
+     */
+    describe('access is decided by accessTier ONLY — never by episode number', () => {
+      it('episode 1 forced PREMIUM: a guest is DENIED (a low episode number grants nothing)', async () => {
+        const id = await createGuestFixture({
+          episodeNumber: 1,
+          accessTierOverride: 'premium',
+          objectStorageKey: 'r2/inverted-early-premium/source.mp4',
+        });
+
+        const response = await request(app.getHttpServer())
+          .get(`/videos/${id}/playback`)
+          .expect(HttpStatus.FORBIDDEN);
+
+        expect((response.body as ErrorResponseBody).code).toBe(
+          'ENTITLEMENT_REQUIRED',
+        );
+        expect(mockStorageService.createPresignedGetUrl).not.toHaveBeenCalled();
+      });
+
+      it('episode 99 forced FREE: a guest is ALLOWED (a high episode number denies nothing)', async () => {
+        const id = await createGuestFixture({
+          episodeNumber: 99,
+          accessTierOverride: 'free',
+          objectStorageKey: 'r2/inverted-late-free/source.mp4',
+        });
+        mockStorageService.createPresignedGetUrl.mockResolvedValueOnce({
+          url: 'https://signed.example.test/inverted-late-free',
+          key: 'r2/inverted-late-free/source.mp4',
+          expiresAt: new Date(Date.now() + 15 * 60 * 1000),
+        });
+
+        await request(app.getHttpServer())
+          .get(`/videos/${id}/playback`)
+          .expect(HttpStatus.OK);
+      });
+
+      it('the public accessTier field and the guest authorization outcome agree on both inverted rows', async () => {
+        const earlyPremiumId = await createGuestFixture({
+          episodeNumber: 2,
+          accessTierOverride: 'premium',
+          storageKey: 'series/inverted-early.mp4',
+        });
+        const latePremiumFreeId = await createGuestFixture({
+          episodeNumber: FREE_EPISODE_LIMIT + 20,
+          accessTierOverride: 'free',
+          storageKey: 'series/inverted-late.mp4',
+        });
+
+        const early = (
+          await request(app.getHttpServer())
+            .get(`/videos/${earlyPremiumId}`)
+            .expect(HttpStatus.OK)
+        ).body as VideoResponseDto;
+        const late = (
+          await request(app.getHttpServer())
+            .get(`/videos/${latePremiumFreeId}`)
+            .expect(HttpStatus.OK)
+        ).body as VideoResponseDto;
+
+        // The metadata a guest can already read, unauthenticated, matches
+        // exactly what the authorization gate then does.
+        expect(early.accessTier).toBe('premium');
+        expect(late.accessTier).toBe('free');
+        expect(early.accessTier).not.toBe(
+          deriveAccessTier(early.episodeNumber),
+        );
+        expect(late.accessTier).not.toBe(deriveAccessTier(late.episodeNumber));
+
+        await request(app.getHttpServer())
+          .get(`/videos/${earlyPremiumId}/playback`)
+          .expect(HttpStatus.FORBIDDEN);
+        await request(app.getHttpServer())
+          .get(`/videos/${latePremiumFreeId}/playback`)
+          .expect(HttpStatus.OK);
+      });
+    });
+
+    /**
+     * MEDIA DELIVERY. `/playback` answering 200 is worthless if the URL it
+     * hands back cannot then be fetched. For LOCAL-storage rows that URL is
+     * `/videos/:id/stream`, which is why that route had to become
+     * optional-auth too — this block walks the guest all the way to real
+     * bytes, and re-proves the premium refusal at the bytes endpoint itself
+     * (not merely at the authorization endpoint).
+     */
+    describe('GET /videos/:id/stream — the bytes actually arrive (or are refused) for a guest', () => {
+      it('GUEST + FREE local media: the /playback URL is fetchable with NO Authorization header and returns real bytes', async () => {
+        // Uses a real seeded row (`freeEpisodeId`), because this assertion
+        // is specifically about bytes coming off disk — a synthetic fixture
+        // with an empty storageKey could never prove it.
+        const playback = (
+          await request(app.getHttpServer())
+            .get(`/videos/${freeEpisodeId}/playback`)
+            .expect(HttpStatus.OK)
+        ).body as VideoPlaybackResponseDto;
+
+        // The contract the client acts on must itself say "no header
+        // needed" — otherwise a guest would attach a token it does not have.
+        expect(playback.requiresAuthHeader).toBe(false);
+        expect(playback.playbackUrl).toBe(
+          `${process.env.PUBLIC_BASE_URL}/videos/${freeEpisodeId}/stream`,
+        );
+
+        const streamPath = new URL(playback.playbackUrl).pathname;
+        const streamed = await request(app.getHttpServer())
+          .get(streamPath)
+          .set('Range', 'bytes=0-1023')
+          .expect(HttpStatus.PARTIAL_CONTENT);
+
+        expect(streamed.headers['content-type']).toBe('video/mp4');
+        expect(streamed.headers['content-range']).toMatch(
+          /^bytes 0-1023\/\d+$/,
+        );
+        expect(Number(streamed.headers['content-length'])).toBe(1024);
+      });
+
+      it('GUEST + PREMIUM local media: the bytes endpoint itself refuses with 403, not just the authorization endpoint', async () => {
+        const response = await request(app.getHttpServer())
+          .get(`/videos/${premiumEpisodeId}/stream`)
+          .expect(HttpStatus.FORBIDDEN);
+
+        expect((response.body as ErrorResponseBody).code).toBe(
+          'ENTITLEMENT_REQUIRED',
+        );
+      });
+
+      it('GUEST + FREE: a full (non-Range) request also succeeds', async () => {
+        const response = await request(app.getHttpServer())
+          .get(`/videos/${freeEpisodeId}/stream`)
+          .expect(HttpStatus.OK);
+
+        expect(response.headers['accept-ranges']).toBe('bytes');
+        expect(Number(response.headers['content-length'])).toBeGreaterThan(0);
+      });
+
+      it('SIGNED-IN PREMIUM + PREMIUM local media: still streams, exactly as before', async () => {
+        const response = await request(app.getHttpServer())
+          .get(`/videos/${premiumEpisodeId}/stream`)
+          .set('Authorization', `Bearer ${premiumUserToken}`)
+          .set('Range', 'bytes=0-511')
+          .expect(HttpStatus.PARTIAL_CONTENT);
+
+        expect(response.headers['content-type']).toBe('video/mp4');
+      });
+
+      it('an expired token on a FREE stream request is rejected rather than downgraded to guest — the bytes endpoint enforces this too', async () => {
+        const jwtService = new JwtService({});
+        const expiredToken = await jwtService.signAsync(
+          { sub: plainUserId },
+          { secret: process.env.JWT_ACCESS_SECRET!, expiresIn: '-1s' },
+        );
+
+        const response = await request(app.getHttpServer())
+          .get(`/videos/${freeEpisodeId}/stream`)
+          .set('Authorization', `Bearer ${expiredToken}`)
+          .expect(HttpStatus.UNAUTHORIZED);
+
+        expect((response.body as ErrorResponseBody).code).toBe(
+          'INVALID_ACCESS_TOKEN',
+        );
+      });
+
+      it('a valid token on FREE content is still honored (optional auth accepts, it does not ignore, a good credential)', async () => {
+        await request(app.getHttpServer())
+          .get(`/videos/${freeEpisodeId}/stream`)
+          .set('Authorization', `Bearer ${plainUserToken}`)
+          .set('Range', 'bytes=0-255')
+          .expect(HttpStatus.PARTIAL_CONTENT);
+      });
+    });
+
+    /**
+     * The unauthenticated metadata surface a guest-first client needs BEFORE
+     * it can ask for playback at all. Both routes were already public; these
+     * assertions pin that they stay that way and that they hand the client
+     * the same `accessTier` the gate enforces.
+     */
+    describe('the guest-first discovery path stays open', () => {
+      it('GET /videos/feed and GET /videos/:id are reachable with no Authorization header and carry accessTier', async () => {
+        const feed = (
+          await request(app.getHttpServer())
+            .get('/videos/feed')
+            .expect(HttpStatus.OK)
+        ).body as VideoResponseDto[];
+
+        expect(feed.length).toBeGreaterThan(0);
+        for (const video of feed) {
+          expect(['free', 'premium']).toContain(video.accessTier);
+        }
+
+        const single = (
+          await request(app.getHttpServer())
+            .get(`/videos/${freeEpisodeId}`)
+            .expect(HttpStatus.OK)
+        ).body as VideoResponseDto;
+
+        expect(single.accessTier).toBe('free');
+      });
     });
   });
 });

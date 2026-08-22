@@ -201,6 +201,40 @@ export const VIDEO_PLAYBACK_URL_RATE_LIMIT = 60;
 export const VIDEO_PLAYBACK_URL_RATE_TTL_MS = minutes(1);
 
 /**
+ * Work unit "ANONYMOUS FREE-EPISODE PLAYBACK" (Reviewer A, MEDIUM finding).
+ * `GET /videos/:id/stream` became optional-auth in the same change that gave
+ * `/videos/:id/playback` its override above, but was left on the generous
+ * app-wide 300/min default — an inconsistency worth closing, because
+ * `/stream` is the more expensive of the two: `/playback` is a DB read plus
+ * string/signature construction, while `/stream` does real filesystem I/O
+ * (`existsSync`/`statSync`/`createReadStream`) and, for a request with NO
+ * `Range` header, streams an entire episode file.
+ *
+ * Honest about what actually changed: this route was never truly
+ * registration-gated in any meaningful sense — one account (a single
+ * `/auth/register` call) already yielded a token that could stream at the
+ * full 300/min. So dropping the token requirement removes a thin barrier,
+ * not a real one. This constant is therefore a genuine tightening for
+ * EVERY caller — anonymous and authenticated alike — rather than a
+ * guest-specific penalty, which is also why it is not set to `/playback`'s
+ * 60: that ceiling is calibrated for one-URL-per-episode-view minting,
+ * whereas a media player legitimately issues MANY requests for a single
+ * episode (initial probe, buffer fills, one more per seek).
+ *
+ * 120/minute is roughly 4x the busiest minute a real viewer can produce (a
+ * human cannot seek twice a second for a solid minute) while cutting the
+ * worst-case unauthenticated bandwidth amplification from one IP by 60%.
+ *
+ * Carries the SAME caveat as `VIDEO_PLAYBACK_URL_RATE_LIMIT` above, for the
+ * same reason: `ThrottlerGuard` keys on client IP, so an attacker rotating
+ * source addresses is not bounded by this, and legitimate users behind one
+ * NAT share a bucket. Bandwidth-level abuse protection belongs at the CDN/
+ * edge, not here; this is a floor, not the defense.
+ */
+export const VIDEO_STREAM_RATE_LIMIT = 120;
+export const VIDEO_STREAM_RATE_TTL_MS = minutes(1);
+
+/**
  * Work unit "MIDTRANS PAYMENT BACKEND FOUNDATION": `POST /payments/checkout`
  * creates a real transaction at an external payment provider on every
  * non-idempotent call — the exact `ADMIN_MEDIA_UPLOAD_INITIATE_RATE_LIMIT`

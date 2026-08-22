@@ -128,13 +128,33 @@ export interface VideoPlaybackResponseDto {
    */
   expiresAt: string;
   /**
-   * `true` for local-backed media, which is still gated by
-   * `JwtAuthGuard`/the entitlement check on every request to `/stream` —
-   * the client must attach `Authorization: Bearer <accessToken>`.
+   * Whether the client MUST attach `Authorization: Bearer <accessToken>` to
+   * the `playbackUrl` request itself.
+   *
    * `false` for R2-backed media: the presigned URL itself carries all the
    * authorization R2 needs: attaching an `Authorization` header alongside
    * it would break AWS SigV4 signing (see DECISIONS.md's Option B
    * rejection rationale).
+   *
+   * For local-backed media (the `/videos/:id/stream` URL) this was
+   * hardcoded `true` until the work unit "ANONYMOUS FREE-EPISODE PLAYBACK",
+   * and is now derived from the episode's authoritative effective access
+   * tier (`resolveAccessTier` — the SAME resolver the `/stream` and
+   * `/playback` authorization gate and the public `VideoResponseDto
+   * .accessTier` field use, so the three can never disagree):
+   *
+   *   - `accessTier: "free"`    -> `false`. `/stream` now accepts an
+   *     anonymous request for free content, so no header is REQUIRED. A
+   *     client that has a valid token and attaches it anyway is still
+   *     accepted — this field is a floor, not a prohibition.
+   *   - `accessTier: "premium"` -> `true`, exactly as before: `/stream`
+   *     still refuses this row without an active entitlement, re-checked on
+   *     every single request.
+   *
+   * It depends ONLY on the content, never on who asked — the same video
+   * yields the same value for a guest, a signed-in non-entitled user, and a
+   * Premium subscriber — so it reveals nothing about the caller's session or
+   * entitlement state.
    */
   requiresAuthHeader: boolean;
 }

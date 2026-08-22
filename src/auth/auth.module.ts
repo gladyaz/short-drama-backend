@@ -8,6 +8,7 @@ import { AuthAuditService } from './auth-audit.service';
 import { AuthController } from './auth.controller';
 import { AuthService } from './auth.service';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
+import { OptionalJwtAuthGuard } from './guards/optional-jwt-auth.guard';
 import { AuthIdentityController } from './identity/auth-identity.controller';
 import { AuthIdentityService } from './identity/auth-identity.service';
 import { DisabledGoogleIdentityVerifier } from './identity/google/google-disabled.verifier';
@@ -66,6 +67,13 @@ import {
   providers: [
     AuthService,
     JwtAuthGuard,
+    // Work unit "ANONYMOUS FREE-EPISODE PLAYBACK": registered alongside
+    // `JwtAuthGuard` (never instead of it) — it is a SUBCLASS that reuses the
+    // same constructor dependencies, so Nest resolves it from this same
+    // container. Adding it changes nothing for any existing route: a route
+    // only becomes optional-auth by explicitly naming this class in its own
+    // `@UseGuards()`.
+    OptionalJwtAuthGuard,
     AccountLockoutService,
     AuthAuditService,
     AuthIdentityService,
@@ -150,6 +158,17 @@ import {
   // exercising the same "the user read the message" step a real client
   // performs instead of reaching into the database. Nothing in production
   // code imports it from outside this module.
-  exports: [JwtAuthGuard, JwtModule, AuthAuditService, WhatsAppOtpService],
+  //
+  // Work unit "ANONYMOUS FREE-EPISODE PLAYBACK": `OptionalJwtAuthGuard` is
+  // exported for the same reason `JwtAuthGuard` is — `VideosModule` already
+  // imports `AuthModule` purely to reference an auth guard by class in its
+  // own controller's `@UseGuards()`.
+  exports: [
+    JwtAuthGuard,
+    OptionalJwtAuthGuard,
+    JwtModule,
+    AuthAuditService,
+    WhatsAppOtpService,
+  ],
 })
 export class AuthModule {}

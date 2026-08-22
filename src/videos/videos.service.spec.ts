@@ -5,6 +5,7 @@ import { readFileSync } from 'fs';
 import { join } from 'path';
 import { AppErrorCode } from '../common/errors/app-error-code';
 import { AppException } from '../common/errors/app.exception';
+import { FREE_EPISODE_LIMIT } from '../entitlements/entitlement.constants';
 import { PrismaService } from '../prisma/prisma.service';
 import { PLAYBACK_URL_EXPIRY_SECONDS } from '../storage/storage.constants';
 import { StorageService } from '../storage/storage.service';
@@ -508,7 +509,7 @@ describe('VideosService', () => {
   });
 
   describe('getPlaybackUrl (Phase 11, work unit 11M-B3/B4)', () => {
-    it('returns the existing stream URL with requiresAuthHeader: true for a local-backed row', async () => {
+    it('returns the existing stream URL for a local-backed row', async () => {
       // testVideos[0] has a non-empty storageKey and no objectStorageKey
       // from the beforeEach fixture (the baseline local-media shape).
       const result = await service.getPlaybackUrl(testVideos[0].id);
@@ -516,8 +517,61 @@ describe('VideosService', () => {
       expect(result.playbackUrl).toBe(
         `http://localhost:3000/videos/${testVideos[0].id}/stream`,
       );
-      expect(result.requiresAuthHeader).toBe(true);
       expect(storageService.createPresignedGetUrl).not.toHaveBeenCalled();
+    });
+
+    /**
+     * Work unit "ANONYMOUS FREE-EPISODE PLAYBACK": the local branch's
+     * `requiresAuthHeader` is no longer the hardcoded `true` it was through
+     * Slice 11M/11Q — it is derived from the row's authoritative effective
+     * access tier, so it cannot tell a guest to attach a token they do not
+     * have for content `/videos/:id/stream` will now serve them anyway.
+     *
+     * The four cases below are deliberately the SAME four the authorization
+     * gate itself distinguishes, driven by `accessTierOverride` vs
+     * `episodeNumber`, and they double as the access-tier-authority
+     * regression at this layer: an EARLY episode (1) forced `premium` must
+     * report `true`, and a LATE episode (3, and 99 further below) forced
+     * `free` must report `false` — the opposite of what any
+     * episode-number rule would produce.
+     */
+    it.each([
+      ['null override, episode <= FREE_EPISODE_LIMIT (free)', 0, null, false],
+      ['explicit "free" override', 0, 'free', false],
+      ['explicit "premium" override on an EARLY episode', 0, 'premium', true],
+      ['explicit "free" override on a LATER episode', 2, 'free', false],
+    ])(
+      'derives requiresAuthHeader from the effective access tier — %s',
+      async (
+        _label: string,
+        fixtureIndex: number,
+        accessTierOverride: string | null,
+        expected: boolean,
+      ) => {
+        const fixture = testVideos[fixtureIndex];
+        await prisma.video.update({
+          where: { id: fixture.id },
+          data: { accessTierOverride },
+        });
+
+        const result = await service.getPlaybackUrl(fixture.id);
+
+        expect(result.requiresAuthHeader).toBe(expected);
+      },
+    );
+
+    it('a null override on a LATER episode (> FREE_EPISODE_LIMIT) still reports requiresAuthHeader true — the pre-existing default rule is untouched', async () => {
+      await prisma.video.update({
+        where: { id: testVideos[0].id },
+        data: {
+          episodeNumber: FREE_EPISODE_LIMIT + 1,
+          accessTierOverride: null,
+        },
+      });
+
+      const result = await service.getPlaybackUrl(testVideos[0].id);
+
+      expect(result.requiresAuthHeader).toBe(true);
     });
 
     /**

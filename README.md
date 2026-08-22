@@ -41,7 +41,13 @@ mobile app (Expo/React Native)  -->  NestJS backend  -->  local company storage 
 - As of Phase 8, the backend also has a real user database (`User`,
   `Session` tables) and JWT-based authentication (`/auth/*`). Company video
   catalog/streaming (`GET /videos/feed`, `GET /videos/:id`,
-  `GET /videos/:id/stream`) does **not** require authentication. As of Phase
+  `GET /videos/:id/stream`) does **not** require authentication — `feed`/
+  `:id` are fully public, and as of the work unit "ANONYMOUS FREE-EPISODE
+  PLAYBACK" `stream`/`playback` are **optional-auth**: a signed-out guest may
+  play any episode whose authoritative `accessTier` is `free`, premium content
+  still requires an active entitlement, and a supplied-but-invalid token is
+  still rejected (see
+  [`docs/playback-api-contract.md`](docs/playback-api-contract.md)). As of Phase
   9, the new per-video Like/Save routes (`POST`/`DELETE /videos/:id/like`,
   `POST`/`DELETE /videos/:id/save`) and the new per-user routes
   (`GET /users/me/interactions`, `PUT /series/:id/progress`,
@@ -312,19 +318,33 @@ with `Content-Range` when a `Range` header is supplied, or a full `200` with
 the whole file otherwise. Never loads the full file into memory — it streams
 from disk with `fs.createReadStream`.
 
-**Requires `Authorization: Bearer <accessToken>` (Phase 10, work unit
-10-B3).** Previously this route had no guard at all — any client with a
-video id could stream the file directly. Episodes 1-5 (`FREE_EPISODE_LIMIT`)
-stream for any authenticated user; episode 6+ additionally requires an
-active premium entitlement (see "Entitlements API" below), checked before
-the file is even opened. A denied request returns `403
-ENTITLEMENT_REQUIRED`. This is the outcome for every video today, but as
-of work unit 11F-4 it is actually decided by the row's explicit
-`Video.accessTierOverride` DB value (which every row carries, backfilled
-to match this exact rule for existing content), not derived solely from
-`episodeNumber` at request time — see "`PATCH
-/admin/media/:id/access-tier`" under the admin content-management API
-below for the full explanation.
+**Optional auth (work unit "ANONYMOUS FREE-EPISODE PLAYBACK").** Through
+Phase 10 this route required `Authorization: Bearer <accessToken>` for every
+request, including free episodes — so a signed-out guest could not watch
+anything at all. It now accepts an anonymous request and lets the
+**authorization gate**, not the presence of a session, decide:
+
+| Caller | `accessTier` | Result |
+| --- | --- | --- |
+| guest (no header) | `free` | 200/206 — bytes served |
+| guest (no header) | `premium` | 403 `ENTITLEMENT_REQUIRED` |
+| authenticated, no entitlement | `free` | 200/206 |
+| authenticated, no entitlement | `premium` | 403 `ENTITLEMENT_REQUIRED` |
+| authenticated, active entitlement | `premium` | 200/206 |
+| **invalid / expired / malformed credential supplied** | any | **401 `INVALID_ACCESS_TOKEN`** |
+
+That last row is the point: **no token is not the same as a bad token.** A
+missing `Authorization` header is a legitimate guest; a header that is present
+but unusable is still an authentication failure and is never downgraded to a
+guest. See `OptionalJwtAuthGuard`
+(`src/auth/guards/optional-jwt-auth.guard.ts`).
+
+The free/premium decision itself is UNCHANGED and still comes from the row's
+explicit `Video.accessTierOverride` DB value via the single authoritative
+`resolveAccessTier` (episode number never decides on its own) — see "`PATCH
+/admin/media/:id/access-tier`" under the admin content-management API below.
+The gate runs before the file is even opened, so a denied request never opens
+a file handle.
 
 Error codes used across the video API: `VIDEO_NOT_FOUND`, `MEDIA_FILE_NOT_FOUND`,
 `INVALID_MEDIA_RANGE`, `INVALID_STORAGE_PATH`, `INVALID_ACCESS_TOKEN`,
@@ -332,8 +352,12 @@ Error codes used across the video API: `VIDEO_NOT_FOUND`, `MEDIA_FILE_NOT_FOUND`
 filesystem paths.
 
 `GET /videos/feed` and `GET /videos/:id` (metadata only) remain
-unauthenticated — only the stream route (the protected asset itself)
-requires a token.
+unauthenticated, and both carry `accessTier`, so a guest-first client can
+render the catalog and know which episodes will play before it asks.
+
+> **Full contract:** [`docs/playback-api-contract.md`](docs/playback-api-contract.md)
+> — the complete guest/premium/invalid-token matrix, the `requiresAuthHeader`
+> rules for `GET /videos/:id/playback`, and the storage-security implications.
 
 ### Public catalog: `GET /series` and `GET /series/:id`
 
@@ -2714,8 +2738,10 @@ WebCrypto HMAC-SHA256 interop, not a mocked stand-in for either side.
 
 ### Backend: `GET /videos/:id/playback` extension
 
-Same route, same `JwtAuthGuard` + `enforceEntitlementGate` (no parallel auth
-system). A row with `processingState === 'ready'` and a non-null
+Same route, same auth guard + `enforceEntitlementGate` (no parallel auth
+system; the guard became `OptionalJwtAuthGuard` in the work unit "ANONYMOUS
+FREE-EPISODE PLAYBACK" — the gate below is unchanged, and no HLS token is ever
+minted for a caller it refuses). A row with `processingState === 'ready'` and a non-null
 `hlsMasterKey` now returns a SEPARATE response shape instead of the existing
 one:
 

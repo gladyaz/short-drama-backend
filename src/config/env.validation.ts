@@ -94,6 +94,14 @@ export function validateEnv(
 
   validateRewardsConfig(config);
 
+  // DELIBERATELY LAST. This check fires only under NODE_ENV=production, which
+  // is exactly the condition several guards above also key on
+  // (`validateDevToolsNodeEnv`, `validatePaymentsConfig`). Running it earlier
+  // made it PREEMPT them: a config with both DEV_TOOLS_ENABLED=true and an
+  // http base URL reported the base URL and hid the privilege-escalation
+  // problem. A security guard must always be the error an operator sees first.
+  validateProductionPublicBaseUrl(config);
+
   return config;
 }
 
@@ -140,6 +148,68 @@ function validateRewardsConfig(config: Record<string, unknown>): void {
     throw new Error(
       `REWARDS_TIMEZONE is not a valid IANA timezone: "${timezone}". ` +
         'Use a zone name such as "Asia/Jakarta", or unset it to use the default.',
+    );
+  }
+}
+
+/**
+ * PRODUCTION HTTPS READINESS: in production, `PUBLIC_BASE_URL` must be an
+ * absolute **https** origin.
+ *
+ * `PUBLIC_BASE_URL` is already required unconditionally by `REQUIRED_KEYS`,
+ * but presence alone is not enough, because this value is not decorative:
+ * `VideosService.getPlaybackUrl` stamps it into the `playbackUrl` of every
+ * LOCAL-storage row. An `http://` value therefore does not fail here — it
+ * fails on the DEVICE, where Android 9+ blocks cleartext, and it fails
+ * silently: the API answers 200, the mobile release preflight passes
+ * (it validates `EXPO_PUBLIC_API_BASE_URL`, not the URLs the API returns),
+ * and playback simply never starts.
+ *
+ * GATED ON `NODE_ENV === 'production'`, and deliberately the OPPOSITE
+ * polarity to `validateDevToolsNodeEnv`'s allowlist. That guard asks "is
+ * this definitely a dev environment?" and treats an unrecognized `NODE_ENV`
+ * as unsafe. This one asks "is this definitely production?" and treats an
+ * unrecognized value as NOT production — which is the safe direction here,
+ * because the rule must not fire on the LAN URL every developer and CI run
+ * legitimately uses (`http://YOUR_MAC_IP:3000`, `http://localhost:3000`).
+ * A deployment that forgets `NODE_ENV=production` loses this check, but it
+ * also loses the dev-tools and Midtrans guards, which is why that variable
+ * is listed as mandatory in `.env.production.example`.
+ *
+ * The value is echoed in the error. A public base URL is not a secret — it
+ * is the origin the app is about to publish to a store listing — and naming
+ * it is what makes the failure obvious at a glance.
+ */
+function validateProductionPublicBaseUrl(
+  config: Record<string, unknown>,
+): void {
+  if (config.NODE_ENV !== 'production') {
+    return;
+  }
+
+  const raw = config.PUBLIC_BASE_URL;
+  if (typeof raw !== 'string') {
+    throw new Error(
+      'Invalid PUBLIC_BASE_URL: must be an absolute https URL when NODE_ENV=production.',
+    );
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error(
+      `Invalid PUBLIC_BASE_URL=${JSON.stringify(raw)}: must be an absolute URL ` +
+        '(for example https://api.example.com) when NODE_ENV=production.',
+    );
+  }
+
+  if (parsed.protocol !== 'https:') {
+    throw new Error(
+      `Refusing to boot with NODE_ENV=production and PUBLIC_BASE_URL=${JSON.stringify(raw)}: ` +
+        'it must use https. This value is stamped into the playbackUrl of every ' +
+        'local-storage video row, and Android 9+ refuses cleartext media — so an ' +
+        'http:// value produces an API that answers 200 while no episode can play.',
     );
   }
 }

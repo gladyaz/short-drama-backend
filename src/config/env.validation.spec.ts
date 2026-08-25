@@ -78,6 +78,13 @@ describe('validateEnv — DEV_TOOLS_ENABLED / NODE_ENV interaction (Phase 12, 12
     const config: Record<string, unknown> = {
       ...VALID_CONFIG,
       DEV_TOOLS_ENABLED: devToolsEnabled,
+      // Production additionally requires an https PUBLIC_BASE_URL (see the
+      // "PUBLIC_BASE_URL https in production" block at the end of this file).
+      // VALID_CONFIG's http://localhost:3000 baseline is not production-valid,
+      // and this block's subject is the DEV_TOOLS_ENABLED x NODE_ENV matrix —
+      // so it uses a base URL that is valid under EVERY NODE_ENV, keeping the
+      // one variable under test the only thing that decides the outcome.
+      PUBLIC_BASE_URL: 'https://api.example.com',
     };
     if (nodeEnv !== undefined) {
       config.NODE_ENV = nodeEnv;
@@ -618,6 +625,9 @@ describe('validateEnv — PAYMENTS_ENABLED / MIDTRANS_* (MIDTRANS PAYMENT BACKEN
           PAYMENTS_ENABLED: 'true',
           MIDTRANS_SERVER_KEY: SECRET_VALUE,
           MIDTRANS_IS_PRODUCTION: 'true',
+          // As in buildConfig above: production requires an https
+          // PUBLIC_BASE_URL. This test's subject is MIDTRANS_IS_PRODUCTION.
+          PUBLIC_BASE_URL: 'https://api.example.com',
         }),
       ).not.toThrow();
     });
@@ -702,5 +712,72 @@ describe('validateEnv — TRUST_PROXY_HOPS (production HTTPS readiness)', () => 
     expect(() => validateEnv({ ...VALID_CONFIG, TRUST_PROXY_HOPS: 1 })).toThrow(
       /Invalid TRUST_PROXY_HOPS/,
     );
+  });
+});
+
+/**
+ * PRODUCTION HTTPS READINESS: `PUBLIC_BASE_URL` must be https in production,
+ * because it is stamped into every local-storage row's `playbackUrl` and an
+ * http value fails on the device rather than at boot.
+ *
+ * The negative-space tests matter as much as the positive ones: this check
+ * must NOT fire for the LAN/localhost URLs local development and CI both use.
+ */
+describe('validateEnv — PUBLIC_BASE_URL https in production', () => {
+  it('accepts an https origin under NODE_ENV=production', () => {
+    expect(() =>
+      validateEnv({
+        ...VALID_CONFIG,
+        NODE_ENV: 'production',
+        PUBLIC_BASE_URL: 'https://api.example.com',
+      }),
+    ).not.toThrow();
+  });
+
+  it('REFUSES an http origin under NODE_ENV=production', () => {
+    expect(() =>
+      validateEnv({
+        ...VALID_CONFIG,
+        NODE_ENV: 'production',
+        PUBLIC_BASE_URL: 'http://api.example.com',
+      }),
+    ).toThrow(/it must use https/);
+  });
+
+  it('refuses a non-absolute value under NODE_ENV=production', () => {
+    expect(() =>
+      validateEnv({
+        ...VALID_CONFIG,
+        NODE_ENV: 'production',
+        PUBLIC_BASE_URL: 'api.example.com',
+      }),
+    ).toThrow(/must be an absolute URL/);
+  });
+
+  it('leaves local development alone — the default VALID_CONFIG is http://localhost:3000', () => {
+    expect(() => validateEnv({ ...VALID_CONFIG })).not.toThrow();
+  });
+
+  it.each(['development', 'test', undefined, '', 'Production'])(
+    'does not fire for NODE_ENV=%p, so a LAN URL still boots outside production',
+    (nodeEnv) => {
+      expect(() =>
+        validateEnv({
+          ...VALID_CONFIG,
+          NODE_ENV: nodeEnv,
+          PUBLIC_BASE_URL: 'http://192.168.110.144:3000',
+        }),
+      ).not.toThrow();
+    },
+  );
+
+  it('names the offending origin, which is public information, not a secret', () => {
+    expect(() =>
+      validateEnv({
+        ...VALID_CONFIG,
+        NODE_ENV: 'production',
+        PUBLIC_BASE_URL: 'http://api.example.com',
+      }),
+    ).toThrow(/"http:\/\/api\.example\.com"/);
   });
 });

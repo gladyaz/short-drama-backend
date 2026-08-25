@@ -1,3 +1,8 @@
+import {
+  ContentAccessMode,
+  DEFAULT_CONTENT_ACCESS_MODE,
+} from '../config/configuration';
+
 /**
  * Phase 10, work unit 10-B2/10-B3: mirrors mobile's
  * `src/services/videos/series-service.ts::FREE_EPISODE_LIMIT` exactly.
@@ -51,6 +56,39 @@ export function deriveAccessTier(
  * I/O), mirroring `deriveAccessTier`'s own design, specifically so it stays
  * usable from `video-response.util.ts`, which must remain a plain
  * synchronous module with no request-lifecycle dependency.
+ *
+ * ---------------------------------------------------------------------
+ * Work unit "V1 FREE ACCESS POLICY": `accessMode` (see `ContentAccessMode`
+ * in `../config/configuration.ts`) is this function's FIRST question, and
+ * the three lines above are the entire implementation of the Red Panda V1
+ * Google Play access policy. Under `CONTENT_ACCESS_MODE=free` the deployment
+ * has declared that it ships no purchase flow at all, so every episode it
+ * publishes resolves `free` here — and, because every consumer listed above
+ * routes through this one function, that single answer simultaneously opens
+ * the playback gate, sets the public `VideoResponseDto.accessTier`, sets
+ * `requiresAuthHeader`, and clears `SeriesPublicDto.hasPremiumEpisodes`.
+ * They cannot disagree, for the same structural reason they could not
+ * disagree before this parameter existed.
+ *
+ * WHY FREE MODE OUTRANKS AN EXPLICIT PER-ROW `premium` OVERRIDE (rather
+ * than letting the override win). The override is a statement about the
+ * CATALOG ("this episode is premium content"); the mode is a statement
+ * about the DEPLOYMENT ("this build has no way to buy premium"). When the
+ * deployment cannot sell anything, a `premium` row is not gated content, it
+ * is content no user can ever reach by any action available to them — the
+ * exact dead-end this work unit exists to remove, and one that would
+ * silently reappear for every future row an admin marks `premium`. Letting
+ * the override win would therefore leave a catalog cliff that no
+ * configuration could rescue. Note this is a READ-side policy only: nothing
+ * here writes, and `Video.accessTierOverride` keeps its stored `premium`
+ * values untouched, which is precisely what makes flipping the mode back to
+ * `entitlement` restore the previous enforcement exactly.
+ *
+ * DEFAULTS TO `entitlement`, i.e. to today's behavior, so a caller that does
+ * not pass the mode keeps enforcing the paywall. The omission failure mode
+ * is "premium still gated", never "premium given away" — see
+ * `readContentAccessMode` (`../config/content-access-mode.util.ts`), the
+ * single place production code obtains this value.
  */
 export function resolveAccessTier(
   input: {
@@ -58,7 +96,12 @@ export function resolveAccessTier(
     episodeNumber: number;
   },
   freeEpisodeLimit: number = FREE_EPISODE_LIMIT,
+  accessMode: ContentAccessMode = DEFAULT_CONTENT_ACCESS_MODE,
 ): AccessTier {
+  if (accessMode === 'free') {
+    return 'free';
+  }
+
   if (
     input.accessTierOverride === 'premium' ||
     input.accessTierOverride === 'free'

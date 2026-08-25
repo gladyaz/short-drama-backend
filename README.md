@@ -311,6 +311,52 @@ this value is a SEPARATE, admin-only field — it is never included on
 content management API" below, which also exposes the same resolved
 `accessTier` next to it for convenience).
 
+#### Content access mode (`CONTENT_ACCESS_MODE`) — work unit "V1 FREE ACCESS POLICY"
+
+`accessTier`'s resolution has ONE deployment-level input above the per-row
+data: `CONTENT_ACCESS_MODE`, a named-mode setting read once at boot
+(`ContentConfig` in `src/config/configuration.ts`, validated by
+`validateContentAccessMode` in `src/config/env.validation.ts`, and obtained
+by services through the single `readContentAccessMode` helper in
+`src/config/content-access-mode.util.ts`).
+
+| Mode | Meaning |
+| --- | --- |
+| `entitlement` | **The default** (unset/empty resolves here). Exactly the behavior described above: explicit `accessTierOverride` first, `episodeNumber > FREE_EPISODE_LIMIT` derivation otherwise, and a `premium` episode requires an active `Entitlement` — `403 ENTITLEMENT_REQUIRED` otherwise. |
+| `free` | Every published catalog episode resolves `accessTier: "free"`. The playback/stream gate allows it for any caller (guest or signed-in), HLS authorization is returned normally, `requiresAuthHeader` is `false` for local-storage rows, and `SeriesPublicDto.hasPremiumEpisodes` reports `false`. |
+
+**Why it exists.** Red Panda V1 for Google Play ships free and ad-monetized
+with **no purchase flow of any kind**. In that build an episode that resolves
+`premium` is not "behind a paywall" — it is permanently unreachable, because
+there is no action a user can take to unlock it. The catalog already carries
+explicit `accessTierOverride: "premium"` values (every `series-101` episode
+6–10, from the 11F-4 backfill below), so this is not hypothetical.
+
+**Precedence — free mode outranks every per-row tier**, including an explicit
+`accessTierOverride` of `"premium"`. The override is a statement about the
+CATALOG ("this is premium content"); the mode is a statement about the
+DEPLOYMENT ("this build cannot sell premium"). Letting the override win would
+have left exactly the dead-end this setting exists to remove, and would let it
+reappear silently for every future row an admin marks premium.
+
+**What it does not do.** It grants nobody premium, and it writes nothing. The
+`Entitlement` model/service, reward redemption, the payments module, the
+`accessTierOverride` column and every value in it, the entitlement gate
+implementation, and the premium DTO types are all untouched and stay live —
+`GET /users/me/entitlement` still reports `isPremium: false` for a
+non-entitled viewer in free mode, and a real grant still reads back as
+premium. Ads are independent of both: `GET /config/ads` reads only its own
+`ADS_*` variables and never consults content tier or entitlement, so the
+intended V1 state — content accessible, entitlement absent, ads eligible —
+holds as three separate facts.
+
+**Reversible.** Setting the variable back to `entitlement` (or removing it)
+restores the previous enforcement exactly — no migration, no backfill, no
+catalog change — precisely because the stored per-row tiers were never
+modified. `test/content-access-mode.e2e-spec.ts` proves the full matrix by
+booting three separate `AppModule` instances: unset, `free`, and back to
+`entitlement`.
+
 ### `GET /videos/:id/stream`
 
 Streams the underlying MP4 with Range support. Responds `206 Partial Content`

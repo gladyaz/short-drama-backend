@@ -4,7 +4,12 @@ import { ConfigService } from '@nestjs/config';
 import { AppErrorCode } from '../common/errors/app-error-code';
 import { AppException } from '../common/errors/app.exception';
 import { redactSensitiveText } from '../common/logging/redact';
-import { RootConfig } from '../config/configuration';
+import {
+  ContentAccessMode,
+  DEFAULT_CONTENT_ACCESS_MODE,
+  RootConfig,
+} from '../config/configuration';
+import { readContentAccessMode } from '../config/content-access-mode.util';
 import {
   deriveAccessTier,
   FREE_EPISODE_LIMIT,
@@ -135,6 +140,25 @@ export class AdminMediaService {
    * (`undefined`), `completeUpload` below treats transcode processing as
    * disabled — the exact same effective behavior as `TRANSCODE_ENABLED=false`.
    */
+  /**
+   * Work unit "V1 FREE ACCESS POLICY": the deployment's content access
+   * policy, resolved once via the shared `readContentAccessMode` helper —
+   * which tolerates the `@Optional()` `configService` being absent (see the
+   * constructor doc comment above) by falling back to the DEFAULT
+   * `entitlement` mode.
+   *
+   * Used ONLY for the READ-side `AdminMediaDto.accessTier` field, so an
+   * admin is shown the tier this deployment actually enforces rather than
+   * one the gate contradicts. It deliberately does NOT touch any WRITE path:
+   * `createUpload` below still stamps `deriveAccessTier(dto.episodeNumber)`
+   * into `Video.accessTierOverride`, and `updateAccessTier` still persists
+   * exactly what an admin asked for. The stored catalog tier is what makes
+   * the mode reversible, so free mode must never overwrite it — which is
+   * also why `AdminMediaDto.accessTierOverride` keeps reporting the raw
+   * column value unchanged, next to the mode-aware `accessTier`.
+   */
+  private readonly contentAccessMode: ContentAccessMode;
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly storageService: StorageService,
@@ -142,7 +166,9 @@ export class AdminMediaService {
     @Optional() private readonly configService?: ConfigService<RootConfig>,
     @Optional()
     private readonly transcodeIntentService?: TranscodeIntentService,
-  ) {}
+  ) {
+    this.contentAccessMode = readContentAccessMode(this.configService);
+  }
 
   async createUpload(
     dto: CreateMediaUploadDto,
@@ -208,7 +234,7 @@ export class AdminMediaService {
     });
 
     return {
-      media: toAdminMediaDto(created),
+      media: toAdminMediaDto(created, this.contentAccessMode),
       upload: toPresignedUploadDto(presigned),
     };
   }
@@ -407,7 +433,7 @@ export class AdminMediaService {
       );
     }
 
-    return toAdminMediaDto(updated);
+    return toAdminMediaDto(updated, this.contentAccessMode);
   }
 
   async publish(id: string): Promise<AdminMediaDto> {
@@ -437,7 +463,10 @@ export class AdminMediaService {
   }
 
   async findById(id: string): Promise<AdminMediaDto> {
-    return toAdminMediaDto(await this.findMediaOrThrow(id));
+    return toAdminMediaDto(
+      await this.findMediaOrThrow(id),
+      this.contentAccessMode,
+    );
   }
 
   /**
@@ -489,7 +518,7 @@ export class AdminMediaService {
       data,
     });
 
-    return toAdminMediaDto(updated);
+    return toAdminMediaDto(updated, this.contentAccessMode);
   }
 
   /**
@@ -513,7 +542,7 @@ export class AdminMediaService {
       data: { accessTierOverride: dto.tier },
     });
 
-    return toAdminMediaDto(updated);
+    return toAdminMediaDto(updated, this.contentAccessMode);
   }
 
   /**
@@ -570,7 +599,7 @@ export class AdminMediaService {
     ]);
 
     return {
-      items: rows.map(toAdminMediaDto),
+      items: rows.map((row) => toAdminMediaDto(row, this.contentAccessMode)),
       total,
       page,
       pageSize,
@@ -596,7 +625,7 @@ export class AdminMediaService {
       data: { lifecycleState: nextState },
     });
 
-    return toAdminMediaDto(updated);
+    return toAdminMediaDto(updated, this.contentAccessMode);
   }
 
   /**
@@ -647,7 +676,7 @@ export class AdminMediaService {
     });
 
     return {
-      media: toAdminMediaDto(updated),
+      media: toAdminMediaDto(updated, this.contentAccessMode),
       upload: toPresignedUploadDto(presigned),
     };
   }
@@ -728,7 +757,10 @@ function buildMetadataUpdateData(
   return data;
 }
 
-function toAdminMediaDto(record: VideoRow): AdminMediaDto {
+function toAdminMediaDto(
+  record: VideoRow,
+  accessMode: ContentAccessMode = DEFAULT_CONTENT_ACCESS_MODE,
+): AdminMediaDto {
   return {
     id: record.id,
     seriesId: record.seriesId,
@@ -754,6 +786,7 @@ function toAdminMediaDto(record: VideoRow): AdminMediaDto {
         episodeNumber: record.episodeNumber,
       },
       FREE_EPISODE_LIMIT,
+      accessMode,
     ),
   };
 }

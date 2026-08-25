@@ -196,6 +196,75 @@ describe('video-response.util', () => {
         );
         expect(dto).not.toHaveProperty('accessTierOverride');
       });
+
+      /**
+       * Work unit "V1 FREE ACCESS POLICY": the public DTO field mobile
+       * actually reads. Under `CONTENT_ACCESS_MODE=free` it must report
+       * `'free'` for every published episode — including one whose row
+       * still carries an explicit `'premium'` override, which is the exact
+       * shape of every `series-101` episode 6-10.
+       */
+      describe('under CONTENT_ACCESS_MODE=free', () => {
+        it('reports accessTier "free" for an episode whose row is explicitly overridden premium', () => {
+          const dto = toVideoResponseDto(
+            buildRecord({ episodeNumber: 6, accessTierOverride: 'premium' }),
+            'http://localhost:3000',
+            'free',
+          );
+          expect(dto.accessTier).toBe('free');
+        });
+
+        it('reports accessTier "free" for a late episode with no override (the derivation path)', () => {
+          const dto = toVideoResponseDto(
+            buildRecord({ episodeNumber: 10, accessTierOverride: null }),
+            'http://localhost:3000',
+            'free',
+          );
+          expect(dto.accessTier).toBe('free');
+        });
+
+        it('changes NOTHING else about the DTO — only accessTier differs from entitlement mode', () => {
+          const record = buildRecord({
+            episodeNumber: 6,
+            accessTierOverride: 'premium',
+          });
+
+          const entitlementDto = toVideoResponseDto(
+            record,
+            'http://localhost:3000',
+            'entitlement',
+          );
+          const freeDto = toVideoResponseDto(
+            record,
+            'http://localhost:3000',
+            'free',
+          );
+
+          expect(entitlementDto.accessTier).toBe('premium');
+          expect(freeDto.accessTier).toBe('free');
+          expect({ ...freeDto, accessTier: 'premium' }).toEqual(entitlementDto);
+        });
+
+        it('still never exposes the raw accessTierOverride — the stored premium tier stays private', () => {
+          const dto = toVideoResponseDto(
+            buildRecord({ episodeNumber: 6, accessTierOverride: 'premium' }),
+            'http://localhost:3000',
+            'free',
+          );
+          expect(dto).not.toHaveProperty('accessTierOverride');
+        });
+      });
+
+      it('explicitly passing "entitlement" is identical to omitting the mode', () => {
+        const record = buildRecord({
+          episodeNumber: 6,
+          accessTierOverride: 'premium',
+        });
+
+        expect(
+          toVideoResponseDto(record, 'http://localhost:3000', 'entitlement'),
+        ).toEqual(toVideoResponseDto(record, 'http://localhost:3000'));
+      });
     });
   });
 });

@@ -3,6 +3,10 @@ import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AppErrorCode } from '../common/errors/app-error-code';
 import { AppException } from '../common/errors/app.exception';
+import {
+  ContentAccessMode,
+  DEFAULT_CONTENT_ACCESS_MODE,
+} from '../config/configuration';
 import { resolveAccessTier } from './entitlement.constants';
 import { EntitlementStatusDto } from './entitlement.types';
 
@@ -67,6 +71,17 @@ export class EntitlementsService {
    * from the same `resolveAccessTier` call) can never disagree. Behavior is
    * byte-identical to before this refactor (see
    * `entitlements.service.spec.ts`, unchanged and still passing).
+   *
+   * Work unit "V1 FREE ACCESS POLICY": `accessMode` is a pure pass-through
+   * to `resolveAccessTier` — this method deliberately does not interpret it,
+   * for the same reason it does not re-implement the override-vs-default
+   * check. It DEFAULTS to `entitlement` (today's behavior), so this
+   * signature stays source-compatible and any caller that omits it keeps
+   * enforcing the paywall. Nothing about ENTITLEMENTS themselves changes
+   * here: `isEntitled`, `getStatus`, `grantTimedPremium`/`grantPaidPremium`
+   * (payments and reward redemption) and the `Entitlement` table are
+   * untouched by the mode, which is why a user's premium status stays a
+   * fully independent fact from whether content happens to be free.
    */
   resolveEpisodePremium(
     input: {
@@ -74,8 +89,9 @@ export class EntitlementsService {
       episodeNumber: number;
     },
     freeEpisodeLimit: number,
+    accessMode: ContentAccessMode = DEFAULT_CONTENT_ACCESS_MODE,
   ): boolean {
-    return resolveAccessTier(input, freeEpisodeLimit) === 'premium';
+    return resolveAccessTier(input, freeEpisodeLimit, accessMode) === 'premium';
   }
 
   /**

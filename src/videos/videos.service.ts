@@ -3,12 +3,17 @@ import { ConfigService } from '@nestjs/config';
 import { existsSync, statSync } from 'fs';
 import {
   AppConfig,
+  ContentAccessMode,
   HlsGatewayConfig,
   RootConfig,
 } from '../config/configuration';
+import { readContentAccessMode } from '../config/content-access-mode.util';
 import { AppErrorCode } from '../common/errors/app-error-code';
 import { AppException } from '../common/errors/app.exception';
-import { resolveAccessTier } from '../entitlements/entitlement.constants';
+import {
+  FREE_EPISODE_LIMIT,
+  resolveAccessTier,
+} from '../entitlements/entitlement.constants';
 import { MediaLifecycleState } from '../media/media-lifecycle.types';
 import { PrismaService } from '../prisma/prisma.service';
 import { PLAYBACK_URL_EXPIRY_SECONDS } from '../storage/storage.constants';
@@ -43,6 +48,15 @@ export interface StreamableVideo {
 export class VideosService {
   private readonly appConfig: AppConfig;
   private readonly hlsGatewayConfig: HlsGatewayConfig;
+  /**
+   * Work unit "V1 FREE ACCESS POLICY": read once at construction through the
+   * shared `readContentAccessMode` helper, exactly like the two configs
+   * above. Feeds BOTH tier-dependent answers this service produces — the
+   * public `VideoResponseDto.accessTier` (via `toResponseDto`) and
+   * `VideoPlaybackResponseDto.requiresAuthHeader` — from the same value, so
+   * neither can contradict the gate's decision in `VideosController`.
+   */
+  private readonly contentAccessMode: ContentAccessMode;
 
   constructor(
     private readonly configService: ConfigService<RootConfig>,
@@ -53,6 +67,7 @@ export class VideosService {
     this.hlsGatewayConfig = this.configService.get('hlsGateway', {
       infer: true,
     })!;
+    this.contentAccessMode = readContentAccessMode(this.configService);
   }
 
   async findAll(): Promise<VideoResponseDto[]> {
@@ -203,10 +218,14 @@ export class VideosService {
         //   premium -> true: `/stream` still refuses this row without an
         //              active entitlement, exactly as before.
         requiresAuthHeader:
-          resolveAccessTier({
-            accessTierOverride: record.accessTierOverride,
-            episodeNumber: record.episodeNumber,
-          }) === 'premium',
+          resolveAccessTier(
+            {
+              accessTierOverride: record.accessTierOverride,
+              episodeNumber: record.episodeNumber,
+            },
+            FREE_EPISODE_LIMIT,
+            this.contentAccessMode,
+          ) === 'premium',
       };
     }
 
@@ -364,7 +383,11 @@ export class VideosService {
   }
 
   private toResponseDto(record: VideoRecord): VideoResponseDto {
-    return toVideoResponseDto(record, this.appConfig.publicBaseUrl);
+    return toVideoResponseDto(
+      record,
+      this.appConfig.publicBaseUrl,
+      this.contentAccessMode,
+    );
   }
 }
 

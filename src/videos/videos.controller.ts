@@ -8,6 +8,7 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { createReadStream } from 'fs';
+import { ConfigService } from '@nestjs/config';
 import { Throttle } from '@nestjs/throttler';
 import type { Request, Response } from 'express';
 import { OptionalCurrentUser } from '../auth/decorators/optional-current-user.decorator';
@@ -21,6 +22,8 @@ import {
   VIDEO_STREAM_RATE_LIMIT,
   VIDEO_STREAM_RATE_TTL_MS,
 } from '../common/rate-limit.constants';
+import type { ContentAccessMode, RootConfig } from '../config/configuration';
+import { readContentAccessMode } from '../config/content-access-mode.util';
 import { FREE_EPISODE_LIMIT } from '../entitlements/entitlement.constants';
 import { EntitlementsService } from '../entitlements/entitlements.service';
 import { VideosService } from './videos.service';
@@ -33,10 +36,24 @@ import { parseRangeHeader } from './video-range.util';
 
 @Controller('videos')
 export class VideosController {
+  /**
+   * Work unit "V1 FREE ACCESS POLICY": the deployment's active content
+   * access policy, read ONCE here (this controller is a singleton, so that
+   * is once per process lifetime) through the shared
+   * `readContentAccessMode` helper — never re-read per request, and never
+   * read from `process.env` anywhere below. Held as a field so
+   * `enforceEntitlementGate` stays a pure decision over `(row, user, mode)`
+   * with no config lookup of its own.
+   */
+  private readonly contentAccessMode: ContentAccessMode;
+
   constructor(
     private readonly videosService: VideosService,
     private readonly entitlementsService: EntitlementsService,
-  ) {}
+    configService: ConfigService<RootConfig>,
+  ) {
+    this.contentAccessMode = readContentAccessMode(configService);
+  }
 
   @Get('feed')
   getFeed(): Promise<VideoResponseDto[]> {
@@ -211,6 +228,17 @@ export class VideosController {
    * learns 404-vs-403 for an id where they previously got a blanket 401.
    * That is not new information — `GET /videos/:id` and `GET /videos/feed`
    * are already fully public and expose exactly the same published-row set.
+   *
+   * Work unit "V1 FREE ACCESS POLICY": this gate gains NO new branch. The
+   * deployment's `contentAccessMode` is handed to the SAME
+   * `resolveEpisodePremium` call that already decided the tier, so under
+   * `CONTENT_ACCESS_MODE=free` a published episode simply resolves free and
+   * takes the existing free `return` below — the one that already serves
+   * guests and signed-in non-entitled users alike. There is no "free mode"
+   * bypass, no skipped check, and no second authorization path: the
+   * `VIDEO_NOT_FOUND` lookup still runs first for every caller, and the
+   * premium branch below (entitlement lookup, then 403) is still fully
+   * live and is exactly what returns the instant the mode is flipped back.
    */
   private async enforceEntitlementGate(
     id: string,
@@ -228,6 +256,7 @@ export class VideosController {
       !this.entitlementsService.resolveEpisodePremium(
         guardInfo,
         FREE_EPISODE_LIMIT,
+        this.contentAccessMode,
       )
     ) {
       // FREE. Allowed for EVERY caller — guest or signed-in, entitled or

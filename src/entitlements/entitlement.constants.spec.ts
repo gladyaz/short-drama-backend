@@ -1,3 +1,4 @@
+import { DEFAULT_CONTENT_ACCESS_MODE } from '../config/configuration';
 import {
   deriveAccessTier,
   FREE_EPISODE_LIMIT,
@@ -110,5 +111,137 @@ describe('resolveAccessTier', () => {
         ),
       ).toBe(deriveAccessTier(episodeNumber, FREE_EPISODE_LIMIT));
     }
+  });
+});
+
+/**
+ * Work unit "V1 FREE ACCESS POLICY": the precedence matrix for the
+ * `accessMode` parameter. `resolveAccessTier` is the ONE function the
+ * playback gate, the public `accessTier` DTO field, `requiresAuthHeader`
+ * and `hasPremiumEpisodes` all resolve through, so proving the matrix here
+ * proves it for all four at once.
+ */
+describe('resolveAccessTier — CONTENT_ACCESS_MODE precedence', () => {
+  const EVERY_OVERRIDE: readonly (string | null | undefined)[] = [
+    null,
+    undefined,
+    'free',
+    'premium',
+  ];
+
+  describe('entitlement mode (the default) — unchanged behavior', () => {
+    it('omitting accessMode entirely is identical to passing "entitlement" explicitly, for every override x episode combination', () => {
+      for (const accessTierOverride of EVERY_OVERRIDE) {
+        for (let episodeNumber = 1; episodeNumber <= 10; episodeNumber += 1) {
+          const omitted = resolveAccessTier(
+            { accessTierOverride, episodeNumber },
+            FREE_EPISODE_LIMIT,
+          );
+          const explicit = resolveAccessTier(
+            { accessTierOverride, episodeNumber },
+            FREE_EPISODE_LIMIT,
+            'entitlement',
+          );
+
+          expect(omitted).toBe(explicit);
+        }
+      }
+    });
+
+    it('the shipped DEFAULT mode is "entitlement" — the paywall is what a deployment inherits without opting in', () => {
+      expect(DEFAULT_CONTENT_ACCESS_MODE).toBe('entitlement');
+    });
+
+    it('an explicit "premium" override still wins in entitlement mode', () => {
+      expect(
+        resolveAccessTier(
+          { accessTierOverride: 'premium', episodeNumber: 1 },
+          FREE_EPISODE_LIMIT,
+          'entitlement',
+        ),
+      ).toBe('premium');
+    });
+
+    it('a late episode with no override still derives premium in entitlement mode', () => {
+      expect(
+        resolveAccessTier(
+          { accessTierOverride: null, episodeNumber: 6 },
+          FREE_EPISODE_LIMIT,
+          'entitlement',
+        ),
+      ).toBe('premium');
+    });
+  });
+
+  describe('free mode — PRECEDENCE POLICY A: the mode outranks every per-row override', () => {
+    it('resolves "free" for EVERY override x episode combination, including an explicit "premium" override', () => {
+      for (const accessTierOverride of EVERY_OVERRIDE) {
+        for (let episodeNumber = 1; episodeNumber <= 10; episodeNumber += 1) {
+          expect(
+            resolveAccessTier(
+              { accessTierOverride, episodeNumber },
+              FREE_EPISODE_LIMIT,
+              'free',
+            ),
+          ).toBe('free');
+        }
+      }
+    });
+
+    /**
+     * The exact production shape of the V1 dead-end: `series-101` episodes
+     * 6-10 each carry an explicit `accessTierOverride: 'premium'` from the
+     * 11F-4 backfill, so a policy in which the per-row override outranked
+     * the mode would have left every one of them unreachable in a build
+     * that ships no purchase flow.
+     */
+    it('an explicit "premium" override on a late episode — the exact series-101 ep6-10 shape — resolves free', () => {
+      expect(
+        resolveAccessTier(
+          { accessTierOverride: 'premium', episodeNumber: 6 },
+          FREE_EPISODE_LIMIT,
+          'free',
+        ),
+      ).toBe('free');
+    });
+
+    it('an episode number far beyond any plausible free limit still resolves free', () => {
+      expect(
+        resolveAccessTier(
+          { accessTierOverride: 'premium', episodeNumber: 9999 },
+          FREE_EPISODE_LIMIT,
+          'free',
+        ),
+      ).toBe('free');
+    });
+
+    it('the free limit argument is irrelevant in free mode — even a limit of 0 yields free', () => {
+      expect(
+        resolveAccessTier(
+          { accessTierOverride: null, episodeNumber: 10 },
+          0,
+          'free',
+        ),
+      ).toBe('free');
+    });
+  });
+
+  describe('reversibility', () => {
+    it('switching the mode back to "entitlement" restores the exact tier the same input produced before, with no data change', () => {
+      const input = { accessTierOverride: 'premium', episodeNumber: 6 };
+
+      const before = resolveAccessTier(input, FREE_EPISODE_LIMIT);
+      const during = resolveAccessTier(input, FREE_EPISODE_LIMIT, 'free');
+      const after = resolveAccessTier(input, FREE_EPISODE_LIMIT, 'entitlement');
+
+      expect(before).toBe('premium');
+      expect(during).toBe('free');
+      expect(after).toBe(before);
+      // The input object itself was never mutated by any of the three calls.
+      expect(input).toEqual({
+        accessTierOverride: 'premium',
+        episodeNumber: 6,
+      });
+    });
   });
 });

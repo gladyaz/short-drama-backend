@@ -1,5 +1,8 @@
 import { existsSync, statSync } from 'fs';
 import {
+  CONTENT_ACCESS_MODES,
+  ContentAccessMode,
+  DEFAULT_CONTENT_ACCESS_MODE,
   DEFAULT_STORAGE_DRIVER,
   STORAGE_DRIVERS,
   StorageDriver,
@@ -93,6 +96,8 @@ export function validateEnv(
   validateIdentityProvidersConfig(config);
 
   validateRewardsConfig(config);
+
+  validateContentAccessMode(config);
 
   return config;
 }
@@ -684,6 +689,40 @@ function validateWhatsAppConfig(config: Record<string, unknown>): void {
         'exist to build or test one against. Implement a WhatsAppOtpProvider ' +
         'for the chosen vendor and register it in AuthModule before enabling ' +
         'WHATSAPP_AUTH_ENABLED in this environment.',
+    );
+  }
+}
+
+/**
+ * Work unit "V1 FREE ACCESS POLICY": `CONTENT_ACCESS_MODE` policy-name
+ * validation, shaped after `validateStorageDriver` above. Unset/empty
+ * resolves to `entitlement` (byte-for-byte existing behavior). Any value
+ * other than the two known modes fails fast with a clear, secret-free
+ * message naming both.
+ *
+ * WHY A NAMED-MODE ALLOWLIST RATHER THAN THE `=== 'true'` FLAG SHAPE used by
+ * TRANSCODE_ENABLED/PAYMENTS_ENABLED/REWARDS_ENABLED. Those flags fail
+ * CLOSED on a typo: a misspelled value leaves the feature off, which is the
+ * safe direction for a feature that mints money, premium, or queue work.
+ * This setting has no such safe direction — one mode gates content behind
+ * entitlements, the other publishes it — so "whichever mode a typo happens
+ * to land on" is never acceptable, and the boot must refuse instead.
+ *
+ * VALIDATED UNCONDITIONALLY, like `validateRewardsConfig`'s timezone check:
+ * a deployment that misspells the mode should find out when it sets it.
+ */
+function validateContentAccessMode(config: Record<string, unknown>): void {
+  const rawMode = config.CONTENT_ACCESS_MODE;
+  const mode =
+    typeof rawMode === 'string' && rawMode.trim().length > 0
+      ? rawMode
+      : DEFAULT_CONTENT_ACCESS_MODE;
+
+  if (!CONTENT_ACCESS_MODES.includes(mode as ContentAccessMode)) {
+    throw new Error(
+      `Invalid CONTENT_ACCESS_MODE: "${mode}". Must be one of: ` +
+        `${CONTENT_ACCESS_MODES.join(', ')}. Unset or empty means ` +
+        `"${DEFAULT_CONTENT_ACCESS_MODE}" (entitlement enforcement stays on).`,
     );
   }
 }

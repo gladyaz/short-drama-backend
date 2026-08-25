@@ -704,3 +704,64 @@ describe('validateEnv — TRUST_PROXY_HOPS (production HTTPS readiness)', () => 
     );
   });
 });
+
+/**
+ * Work unit "V1 FREE ACCESS POLICY": `CONTENT_ACCESS_MODE` is a named-mode
+ * ALLOWLIST, not an exact-string boolean flag. A typo must fail the boot
+ * rather than resolving to whichever mode `!== 'free'` happens to mean —
+ * see `validateContentAccessMode`'s doc comment for why this setting has no
+ * "safe direction" to fall back in.
+ */
+describe('validateEnv — CONTENT_ACCESS_MODE (V1 FREE ACCESS POLICY)', () => {
+  it('passes when CONTENT_ACCESS_MODE is absent (unset means entitlement)', () => {
+    expect(() => validateEnv({ ...VALID_CONFIG })).not.toThrow();
+  });
+
+  it('passes when CONTENT_ACCESS_MODE is empty', () => {
+    expect(() =>
+      validateEnv({ ...VALID_CONFIG, CONTENT_ACCESS_MODE: '' }),
+    ).not.toThrow();
+  });
+
+  it('passes for the two known modes', () => {
+    expect(() =>
+      validateEnv({ ...VALID_CONFIG, CONTENT_ACCESS_MODE: 'entitlement' }),
+    ).not.toThrow();
+    expect(() =>
+      validateEnv({ ...VALID_CONFIG, CONTENT_ACCESS_MODE: 'free' }),
+    ).not.toThrow();
+  });
+
+  it('throws, naming both valid modes, for an unknown value', () => {
+    expect(() =>
+      validateEnv({ ...VALID_CONFIG, CONTENT_ACCESS_MODE: 'freemium' }),
+    ).toThrow(/Invalid CONTENT_ACCESS_MODE: "freemium"/);
+    expect(() =>
+      validateEnv({ ...VALID_CONFIG, CONTENT_ACCESS_MODE: 'freemium' }),
+    ).toThrow(/entitlement, free/);
+  });
+
+  it('throws for a differently-cased near-miss rather than silently choosing a mode', () => {
+    for (const nearMiss of ['Free', 'FREE', 'Entitlement', 'true']) {
+      expect(() =>
+        validateEnv({ ...VALID_CONFIG, CONTENT_ACCESS_MODE: nearMiss }),
+      ).toThrow(/Invalid CONTENT_ACCESS_MODE/);
+    }
+  });
+
+  it('never echoes any other environment value in the error message', () => {
+    let message = '';
+    try {
+      validateEnv({
+        ...VALID_CONFIG,
+        CONTENT_ACCESS_MODE: 'bogus',
+        JWT_ACCESS_SECRET: 'super-secret-value-that-must-not-leak',
+      });
+    } catch (error) {
+      message = (error as Error).message;
+    }
+
+    expect(message).toMatch(/Invalid CONTENT_ACCESS_MODE/);
+    expect(message).not.toContain('super-secret-value-that-must-not-leak');
+  });
+});

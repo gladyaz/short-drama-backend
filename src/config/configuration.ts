@@ -347,6 +347,52 @@ export interface RewardsConfig {
   timezone: string;
 }
 
+/**
+ * Work unit "V1 FREE ACCESS POLICY": which content-access policy this
+ * deployment enforces. Shaped exactly like the `STORAGE_DRIVER` precedent
+ * above (`StorageDriver`/`STORAGE_DRIVERS`/`DEFAULT_STORAGE_DRIVER` +
+ * `resolveStorageDriver` here, `validateStorageDriver` in
+ * `env.validation.ts`) rather than as an exact-string boolean flag, because
+ * this is a CHOICE BETWEEN NAMED POLICIES, not an on/off switch — a future
+ * third mode has somewhere to go, and a typo fails the boot loudly instead
+ * of silently resolving to whichever mode `!== 'free'` happens to mean.
+ *
+ * `entitlement` (the DEFAULT — unset/empty also resolves here) is
+ * byte-for-byte today's behavior: an episode's effective tier is its
+ * explicit `Video.accessTierOverride` when set, otherwise the
+ * `episodeNumber > FREE_EPISODE_LIMIT` derivation, and a `premium` episode
+ * requires an active `Entitlement` to stream.
+ *
+ * `free` is the Red Panda V1 Google Play policy: the app ships free and
+ * ad-monetized with NO purchase flow of any kind, so a published episode
+ * that resolves `premium` is not "locked behind a paywall", it is
+ * PERMANENTLY UNREACHABLE. In this mode every published catalog episode
+ * resolves `free` — see `resolveAccessTier`
+ * (`../entitlements/entitlement.constants.ts`) for the single line that
+ * implements it, and for why the mode deliberately outranks even an
+ * explicit per-row `premium` override.
+ *
+ * WHAT THIS IS NOT. It is not a switch that grants anybody premium, and it
+ * writes nothing: the `Entitlement` model/service, reward redemption,
+ * payments, the `accessTierOverride` column and every value stored in it,
+ * the gate itself, and the premium DTO types are all untouched and stay
+ * live. Flipping this back to `entitlement` restores the previous
+ * enforcement exactly, because the catalog still holds the same tiers it
+ * always did.
+ */
+export type ContentAccessMode = 'entitlement' | 'free';
+
+export const CONTENT_ACCESS_MODES: readonly ContentAccessMode[] = [
+  'entitlement',
+  'free',
+];
+
+export const DEFAULT_CONTENT_ACCESS_MODE: ContentAccessMode = 'entitlement';
+
+export interface ContentConfig {
+  accessMode: ContentAccessMode;
+}
+
 export interface RootConfig {
   app: AppConfig;
   auth: AuthConfig;
@@ -356,6 +402,7 @@ export interface RootConfig {
   payments: PaymentsConfig;
   identityProviders: IdentityProvidersConfig;
   rewards: RewardsConfig;
+  content: ContentConfig;
 }
 
 export default (): RootConfig => ({
@@ -419,6 +466,9 @@ export default (): RootConfig => ({
   rewards: {
     enabled: process.env.REWARDS_ENABLED === 'true',
     timezone: process.env.REWARDS_TIMEZONE ?? DEFAULT_REWARDS_TIMEZONE,
+  },
+  content: {
+    accessMode: resolveContentAccessMode(),
   },
   identityProviders: {
     googleEnabled: process.env.GOOGLE_AUTH_ENABLED === 'true',
@@ -494,4 +544,21 @@ function parseNonNegativeIntEnv(
 
 function resolveStorageDriver(): StorageDriver {
   return process.env.STORAGE_DRIVER === 'r2' ? 'r2' : DEFAULT_STORAGE_DRIVER;
+}
+
+/**
+ * Work unit "V1 FREE ACCESS POLICY": resolves `CONTENT_ACCESS_MODE`
+ * unset/empty/`entitlement` to `entitlement` (the default). Same
+ * "validate elsewhere, resolve permissively here" split as
+ * `resolveStorageDriver` directly above — `env.validation.ts`'s
+ * `validateContentAccessMode` runs before this factory (see
+ * `ConfigModule.forRoot`'s `validate` option in `app.module.ts`) and has
+ * already failed the boot for any value other than the two known modes, so
+ * by the time this runs the only other possible value is the literal
+ * `free`.
+ */
+function resolveContentAccessMode(): ContentAccessMode {
+  return process.env.CONTENT_ACCESS_MODE === 'free'
+    ? 'free'
+    : DEFAULT_CONTENT_ACCESS_MODE;
 }

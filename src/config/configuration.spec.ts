@@ -1,4 +1,5 @@
 import configuration, {
+  DEFAULT_CONTENT_ACCESS_MODE,
   DEFAULT_STORAGE_DRIVER,
   DEFAULT_TRUST_PROXY_HOPS,
 } from './configuration';
@@ -207,5 +208,63 @@ describe('configuration — app.trustProxyHops (production HTTPS readiness)', ()
     process.env.TRUST_PROXY_HOPS = '-1';
 
     expect(configuration().app.trustProxyHops).toBe(0);
+  });
+});
+
+/**
+ * Work unit "V1 FREE ACCESS POLICY": `CONTENT_ACCESS_MODE` resolution in the
+ * config factory. Entirely in-memory, mirroring `STORAGE_DRIVER`'s spec at
+ * the top of this file — sets/restores `process.env.CONTENT_ACCESS_MODE`
+ * around each test, touches no database and no network.
+ */
+describe('configuration — content.accessMode (V1 FREE ACCESS POLICY)', () => {
+  const originalMode = process.env.CONTENT_ACCESS_MODE;
+
+  afterEach(() => {
+    if (originalMode === undefined) {
+      delete process.env.CONTENT_ACCESS_MODE;
+    } else {
+      process.env.CONTENT_ACCESS_MODE = originalMode;
+    }
+  });
+
+  it('resolves to "entitlement" (the default) when CONTENT_ACCESS_MODE is unset', () => {
+    delete process.env.CONTENT_ACCESS_MODE;
+
+    expect(configuration().content.accessMode).toBe(
+      DEFAULT_CONTENT_ACCESS_MODE,
+    );
+    expect(configuration().content.accessMode).toBe('entitlement');
+  });
+
+  it('resolves to "entitlement" when CONTENT_ACCESS_MODE is empty', () => {
+    process.env.CONTENT_ACCESS_MODE = '';
+
+    expect(configuration().content.accessMode).toBe('entitlement');
+  });
+
+  it('resolves to "free" when CONTENT_ACCESS_MODE=free', () => {
+    process.env.CONTENT_ACCESS_MODE = 'free';
+
+    expect(configuration().content.accessMode).toBe('free');
+  });
+
+  it('resolves to "entitlement" when CONTENT_ACCESS_MODE=entitlement is set explicitly', () => {
+    process.env.CONTENT_ACCESS_MODE = 'entitlement';
+
+    expect(configuration().content.accessMode).toBe('entitlement');
+  });
+
+  /**
+   * The factory is deliberately permissive (`env.validation.ts` is what
+   * fails the boot for a bad value — see `resolveContentAccessMode`'s doc
+   * comment). What matters here is the DIRECTION it falls back in: a
+   * near-miss like "Free" must never be read as free.
+   */
+  it('falls back to "entitlement" for a differently-cased or misspelled value — never silently to free', () => {
+    for (const nearMiss of ['Free', 'FREE', ' free', 'fre', 'true', '1']) {
+      process.env.CONTENT_ACCESS_MODE = nearMiss;
+      expect(configuration().content.accessMode).toBe('entitlement');
+    }
   });
 });

@@ -1,4 +1,6 @@
 import { Logger } from '@nestjs/common';
+import type { ContentAccessMode } from '../config/configuration';
+import { DEFAULT_CONTENT_ACCESS_MODE } from '../config/configuration';
 import {
   FREE_EPISODE_LIMIT,
   resolveAccessTier,
@@ -106,10 +108,20 @@ export function toVideoRecord(record: {
  * (`VideosService#toResponseDto` before this extraction). `publicBaseUrl`
  * is passed explicitly rather than read from `ConfigService` here, so this
  * stays a pure function usable outside `VideosService`'s DI context.
+ *
+ * Work unit "V1 FREE ACCESS POLICY": `accessMode` is passed explicitly for
+ * the SAME reason `publicBaseUrl` is — this module must stay pure and
+ * DI-free, so it never reaches for `ConfigService` or `process.env` itself.
+ * Its two production callers (`VideosService#toResponseDto` and
+ * `PublicSeriesService`) each resolve the mode once, in their own
+ * constructor, via `readContentAccessMode`. Defaults to `entitlement`
+ * (today's behavior) so an omission keeps enforcing the paywall rather than
+ * publishing premium content — see `resolveAccessTier`'s doc comment.
  */
 export function toVideoResponseDto(
   record: VideoRecord,
   publicBaseUrl: string,
+  accessMode: ContentAccessMode = DEFAULT_CONTENT_ACCESS_MODE,
 ): VideoResponseDto {
   return {
     id: record.id,
@@ -141,6 +153,7 @@ export function toVideoResponseDto(
         episodeNumber: record.episodeNumber,
       },
       FREE_EPISODE_LIMIT,
+      accessMode,
     ),
   };
 }

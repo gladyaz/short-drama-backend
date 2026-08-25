@@ -1,6 +1,12 @@
 import { HttpStatus, Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { AppConfig, RootConfig } from '../config/configuration';
+import {
+  AppConfig,
+  ContentAccessMode,
+  DEFAULT_CONTENT_ACCESS_MODE,
+  RootConfig,
+} from '../config/configuration';
+import { readContentAccessMode } from '../config/content-access-mode.util';
 import { AppErrorCode } from '../common/errors/app-error-code';
 import { AppException } from '../common/errors/app.exception';
 import { FREE_EPISODE_LIMIT } from '../entitlements/entitlement.constants';
@@ -80,6 +86,15 @@ type VideoRow = {
 @Injectable()
 export class PublicSeriesService {
   private readonly appConfig: AppConfig;
+  /**
+   * Work unit "V1 FREE ACCESS POLICY": read once at construction through the
+   * shared `readContentAccessMode` helper, and fed to BOTH tier-dependent
+   * answers this service produces — the embedded episodes'
+   * `VideoResponseDto.accessTier` and the `hasPremiumEpisodes` aggregate —
+   * so a series can never advertise premium episodes that the gate is in
+   * fact serving to everyone.
+   */
+  private readonly contentAccessMode: ContentAccessMode;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -88,6 +103,7 @@ export class PublicSeriesService {
     private readonly configService: ConfigService<RootConfig>,
   ) {
     this.appConfig = this.configService.get('app', { infer: true })!;
+    this.contentAccessMode = readContentAccessMode(this.configService);
   }
 
   /**
@@ -173,6 +189,7 @@ export class PublicSeriesService {
         toVideoResponseDto(
           toVideoRecord(episode),
           this.appConfig.publicBaseUrl,
+          this.contentAccessMode,
         ),
       ),
     };
@@ -217,7 +234,11 @@ export class PublicSeriesService {
         this.storageService,
         series.coverImageKey,
       ),
-      ...computeSeriesAggregate(episodes, this.entitlementsService),
+      ...computeSeriesAggregate(
+        episodes,
+        this.entitlementsService,
+        this.contentAccessMode,
+      ),
     };
   }
 }
@@ -242,10 +263,18 @@ function seriesNotFound(): AppException {
  * override-aware rule `VideosController#enforceEntitlementGate` already
  * enforces at stream/playback time — rather than re-deriving a parallel
  * free/premium rule that could drift from it.
+ *
+ * Work unit "V1 FREE ACCESS POLICY": `accessMode` is threaded into that
+ * same call for the same reason — under `CONTENT_ACCESS_MODE=free` the gate
+ * serves every published episode, so `hasPremiumEpisodes` must report
+ * `false` or the series list would advertise a lock the backend does not
+ * apply (and that V1 offers no way to unlock). Defaults to `entitlement`,
+ * i.e. today's behavior, for a caller that omits it.
  */
 function computeSeriesAggregate(
   episodes: VideoRow[],
   entitlementsService: EntitlementsService,
+  accessMode: ContentAccessMode = DEFAULT_CONTENT_ACCESS_MODE,
 ): Omit<SeriesPublicDto, 'id' | 'title' | 'coverUrl'> {
   const categories = new Set(episodes.map((episode) => episode.category));
   const sourceLanguages = new Set(
@@ -256,7 +285,11 @@ function computeSeriesAggregate(
     0,
   );
   const hasPremiumEpisodes = episodes.some((episode) =>
-    entitlementsService.resolveEpisodePremium(episode, FREE_EPISODE_LIMIT),
+    entitlementsService.resolveEpisodePremium(
+      episode,
+      FREE_EPISODE_LIMIT,
+      accessMode,
+    ),
   );
 
   return {

@@ -1,6 +1,7 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { Queue } from 'bullmq';
 import IORedis from 'ioredis';
+import { redactSensitiveText } from '../common/logging/redact';
 import {
   TRANSCODE_BACKOFF_BASE_DELAY_MS,
   TRANSCODE_QUEUE_NAME,
@@ -46,10 +47,32 @@ import { TranscodeJobPayload, TranscodeQueue } from './transcode.types';
  * mismatch between the two is harmless (a redundant extra delivery after our
  * own cap is hit is a cheap, idempotent no-op; see
  * `TranscodeJobProcessor.process`'s `NOT_QUEUED` superseded path).
+ *
+ * ## Shutdown (`OnModuleDestroy`)
+ *
+ * `lazyConnect` defers the FIRST connection, it does not prevent one: BullMQ's
+ * `Queue` opens its own Redis connection as soon as it needs one, and that
+ * socket is an open libuv handle that keeps the Node event loop alive forever
+ * unless something closes it. Nothing did, so with `TRANSCODE_ENABLED=true`
+ * every process that merely CONSTRUCTED this client — the API server, and
+ * `scripts/hls-local-proof.ts` — finished all of its work, set `process
+ * .exitCode`, and then hung indefinitely instead of exiting. That also defeated
+ * the graceful-shutdown path added in `225c2ae`, which awaits `app.close()`.
+ *
+ * `onModuleDestroy` closes the `Queue` (which disconnects the connection BullMQ
+ * itself created) and then quits the `IORedis` client this class constructed,
+ * so `app.close()` releases every handle this client owns. Both steps are
+ * best-effort and independently guarded: a shutdown-time Redis error must
+ * never turn a clean exit into a crash, and a failure closing the queue must
+ * not skip quitting the connection.
  */
 @Injectable()
-export class BullmqTranscodeQueueClient implements TranscodeQueue {
+export class BullmqTranscodeQueueClient
+  implements TranscodeQueue, OnModuleDestroy
+{
+  private readonly logger = new Logger(BullmqTranscodeQueueClient.name);
   private readonly queue: Queue<TranscodeJobPayload>;
+  private readonly connection: IORedis;
   private readonly maxAttempts: number;
 
   constructor(redisUrl: string, maxAttempts: number) {
@@ -58,10 +81,33 @@ export class BullmqTranscodeQueueClient implements TranscodeQueue {
       maxRetriesPerRequest: null,
     });
 
+    this.connection = connection;
     this.queue = new Queue<TranscodeJobPayload>(TRANSCODE_QUEUE_NAME, {
       connection,
     });
     this.maxAttempts = maxAttempts;
+  }
+
+  async onModuleDestroy(): Promise<void> {
+    try {
+      await this.queue.close();
+    } catch (error) {
+      this.logger.warn(
+        redactSensitiveText(
+          `Failed to close the transcode queue during shutdown: ${String(error)}`,
+        ),
+      );
+    }
+
+    try {
+      await this.connection.quit();
+    } catch (error) {
+      this.logger.warn(
+        redactSensitiveText(
+          `Failed to quit the transcode queue's Redis connection during shutdown: ${String(error)}`,
+        ),
+      );
+    }
   }
 
   async add(jobId: string, payload: TranscodeJobPayload): Promise<void> {

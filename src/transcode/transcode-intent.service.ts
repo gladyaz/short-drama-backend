@@ -57,7 +57,7 @@ export class TranscodeIntentService {
    * of what happens next.
    *
    * The enqueue that follows is best-effort: `TranscodeQueue.add` uses the
-   * deterministic `jobId = "<videoId>:<processingVersion>"` (BullMQ dedupe —
+   * deterministic `jobId = "<videoId>__v<processingVersion>"` (BullMQ dedupe —
    * see `buildTranscodeJobId`), and any failure (Redis unreachable, Redis
    * never having been installed, etc.) is caught here, logged at `warn`
    * through the shared `redactSensitiveText` wrapper (so nothing about the

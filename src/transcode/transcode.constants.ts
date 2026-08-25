@@ -9,19 +9,49 @@ export const TRANSCODE_QUEUE_NAME = 'media-transcode';
 export const DEFAULT_RECONCILE_LIMIT = 25;
 
 /**
- * Deterministic BullMQ job identity: `<videoId>:<processingVersion>`. The
+ * The separator between the video id and the processing version in a
+ * transcode jobId. Deliberately NOT `:`.
+ *
+ * BullMQ REJECTS a custom `jobId` containing `:` outright — `Job.addJob`
+ * throws `Error: Custom Id cannot contain :` for any custom id that contains
+ * a colon and does not split into exactly 3 colon-separated parts (that
+ * 3-part carve-out exists only for backwards compatibility with old
+ * repeatable-job ids; see `bullmq/dist/cjs/classes/job.js`). The original
+ * `<videoId>:<processingVersion>` shape splits into 2 parts, so EVERY real
+ * enqueue threw.
+ *
+ * That failure was invisible for two compounding reasons, which is why it
+ * survived to a live run: `TranscodeIntentService.enqueueBestEffort`
+ * deliberately catches and logs (never rethrows) every enqueue failure, so
+ * the row was simply left `"queued"` forever; and every unit test
+ * `jest.mock`s `bullmq` wholesale, so no test ever executed the real
+ * validation that rejects the id. `TranscodeReconcilerService.reconcile`
+ * could not recover it either — it rebuilds the SAME id and would fail
+ * identically on every sweep, forever.
+ */
+export const TRANSCODE_JOB_ID_SEPARATOR = '__v';
+
+/**
+ * Deterministic BullMQ job identity: `<videoId>__v<processingVersion>`. The
  * SAME `(videoId, processingVersion)` pair always produces the SAME jobId,
  * which is what makes BullMQ's own duplicate-job suppression work as the
  * dedupe mechanism (proposal §8) — a second `add` call with an identical
  * jobId is a no-op on BullMQ's side, and `TranscodeReconcilerService` relies
  * on exactly this property to safely re-enqueue an already-queued row
  * without producing a second, distinct job.
+ *
+ * Only the SEPARATOR changed from the shape the proposal's prose names
+ * (`<videoId>:<processingVersion>`) — see `TRANSCODE_JOB_ID_SEPARATOR` for
+ * why a colon is impossible here. Every property the dedupe mechanism
+ * actually depends on (determinism, and distinctness across both video id
+ * and version) is unchanged, and nothing anywhere parses a jobId back apart
+ * into its components — it is only ever produced and compared whole.
  */
 export function buildTranscodeJobId(
   videoId: string,
   processingVersion: number,
 ): string {
-  return `${videoId}:${processingVersion}`;
+  return `${videoId}${TRANSCODE_JOB_ID_SEPARATOR}${processingVersion}`;
 }
 
 /**

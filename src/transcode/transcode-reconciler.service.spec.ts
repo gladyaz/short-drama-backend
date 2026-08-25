@@ -3,6 +3,10 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { RootConfig, TranscodeConfig } from '../config/configuration';
 import { PrismaService } from '../prisma/prisma.service';
 import { TranscodeReconcilerService } from './transcode-reconciler.service';
+import {
+  buildTranscodeJobId,
+  TRANSCODE_JOB_ID_SEPARATOR,
+} from './transcode.constants';
 import { TRANSCODE_QUEUE, TranscodeQueue } from './transcode.types';
 
 /**
@@ -105,7 +109,7 @@ describe('TranscodeReconcilerService', () => {
   function callsForIds(ids: string[]): Array<[string, unknown]> {
     const calls = queue.add.mock.calls as Array<[string, unknown]>;
     return calls.filter(([jobId]) =>
-      ids.some((id) => jobId.startsWith(`${id}:`)),
+      ids.some((id) => jobId.startsWith(`${id}${TRANSCODE_JOB_ID_SEPARATOR}`)),
     );
   }
 
@@ -148,11 +152,11 @@ describe('TranscodeReconcilerService', () => {
     );
 
     expect(byVideoId.get(idA)).toEqual({
-      jobId: `${idA}:1`,
+      jobId: buildTranscodeJobId(idA, 1),
       payload: { videoId: idA, processingVersion: 1 },
     });
     expect(byVideoId.get(idB)).toEqual({
-      jobId: `${idB}:3`,
+      jobId: buildTranscodeJobId(idB, 3),
       payload: { videoId: idB, processingVersion: 3 },
     });
     // Ready/null rows never produce a call at all — check no jobId embeds
@@ -195,9 +199,14 @@ describe('TranscodeReconcilerService', () => {
 
     const jobIdsForThisRow = (queue.add.mock.calls as Array<[string]>)
       .map(([jobId]) => jobId)
-      .filter((jobId) => jobId.startsWith(`${id}:`));
+      .filter((jobId) =>
+        jobId.startsWith(`${id}${TRANSCODE_JOB_ID_SEPARATOR}`),
+      );
 
-    expect(jobIdsForThisRow).toEqual([`${id}:1`, `${id}:1`]);
+    expect(jobIdsForThisRow).toEqual([
+      buildTranscodeJobId(id, 1),
+      buildTranscodeJobId(id, 1),
+    ]);
   });
 
   it('is bounded by limit — never returns/enqueues more than requested (identity-agnostic: safe under concurrent global fixtures)', async () => {
@@ -230,9 +239,11 @@ describe('TranscodeReconcilerService', () => {
     const calls = callsForIds([failing, succeeding]);
     expect(calls).toHaveLength(2);
     const succeededCall = calls.find(([jobId]) =>
-      jobId.startsWith(`${succeeding}:`),
+      jobId.startsWith(`${succeeding}${TRANSCODE_JOB_ID_SEPARATOR}`),
     );
-    const failedCall = calls.find(([jobId]) => jobId.startsWith(`${failing}:`));
+    const failedCall = calls.find(([jobId]) =>
+      jobId.startsWith(`${failing}${TRANSCODE_JOB_ID_SEPARATOR}`),
+    );
     expect(succeededCall).toBeDefined();
     expect(failedCall).toBeDefined();
   });

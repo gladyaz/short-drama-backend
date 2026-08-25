@@ -7,6 +7,7 @@ import { AppExceptionFilter } from './../src/common/filters/app-exception.filter
 import { PrismaService } from './../src/prisma/prisma.service';
 import { StorageService } from './../src/storage/storage.service';
 import { TRANSCODE_QUEUE } from './../src/transcode/transcode.types';
+import { buildTranscodeJobId } from './../src/transcode/transcode.constants';
 import type { AuthResponseDto } from './../src/auth/auth.types';
 import { e2eSuiteBootBudgetMs } from './../src/common/testing/e2e-boot-budget.helpers';
 
@@ -329,7 +330,7 @@ describe('Slice 11N — transcode enqueue on complete-upload (e2e)', () => {
         string,
         Record<string, unknown>,
       ];
-      expect(jobId).toBe(`${mediaId}:1`);
+      expect(jobId).toBe(buildTranscodeJobId(mediaId, 1));
       expect(Object.keys(payload).sort()).toEqual([
         'processingVersion',
         'videoId',

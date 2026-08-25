@@ -3,6 +3,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { PrismaService } from '../prisma/prisma.service';
 import { StorageService } from '../storage/storage.service';
 import { TranscodeIntentService } from '../transcode/transcode-intent.service';
+import { buildTranscodeJobId } from '../transcode/transcode.constants';
 import { TRANSCODE_QUEUE, TranscodeQueue } from '../transcode/transcode.types';
 import { AdminMediaService } from './admin-media.service';
 import { MediaLifecycleService } from './media-lifecycle.service';
@@ -102,7 +103,7 @@ describe('AdminMediaService — Slice 11N transcode enqueue wiring', () => {
       string,
       { videoId: string; processingVersion: number },
     ];
-    expect(jobId).toBe(`${id}:1`);
+    expect(jobId).toBe(buildTranscodeJobId(id, 1));
     expect(payload).toEqual({ videoId: id, processingVersion: 1 });
 
     const row = await prisma.video.findUniqueOrThrow({ where: { id } });

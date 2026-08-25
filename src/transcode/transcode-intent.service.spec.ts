@@ -1,6 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { PrismaService } from '../prisma/prisma.service';
 import { TranscodeIntentService } from './transcode-intent.service';
+import { buildTranscodeJobId } from './transcode.constants';
 import { TRANSCODE_QUEUE, TranscodeQueue } from './transcode.types';
 
 /**
@@ -79,7 +80,7 @@ describe('TranscodeIntentService', () => {
       expect(row.processingVersion).toBe(1);
     });
 
-    it('enqueues with the deterministic jobId "<videoId>:<processingVersion>" and a payload of ONLY videoId + processingVersion (proof 7)', async () => {
+    it('enqueues with the deterministic jobId "<videoId>__v<processingVersion>" and a payload of ONLY videoId + processingVersion (proof 7)', async () => {
       const id = `${testIdPrefix}-payload`;
       await createFixtureVideo(id);
 
@@ -90,7 +91,7 @@ describe('TranscodeIntentService', () => {
         string,
         Record<string, unknown>,
       ];
-      expect(jobId).toBe(`${id}:1`);
+      expect(jobId).toBe(buildTranscodeJobId(id, 1));
       expect(Object.keys(payload).sort()).toEqual([
         'processingVersion',
         'videoId',
@@ -116,8 +117,8 @@ describe('TranscodeIntentService', () => {
       expect(queue.add).toHaveBeenCalledTimes(2);
       const firstJobId = (queue.add.mock.calls[0] as [string])[0];
       const secondJobId = (queue.add.mock.calls[1] as [string])[0];
-      expect(firstJobId).toBe(`${id}:1`);
-      expect(secondJobId).toBe(`${id}:2`);
+      expect(firstJobId).toBe(buildTranscodeJobId(id, 1));
+      expect(secondJobId).toBe(buildTranscodeJobId(id, 2));
       expect(firstJobId).not.toBe(secondJobId);
 
       const row = await prisma.video.findUniqueOrThrow({ where: { id } });
@@ -493,7 +494,7 @@ describe('TranscodeIntentService', () => {
 
       await expect(service.enqueueBestEffort(id, 3)).resolves.toBeUndefined();
 
-      expect(queue.add).toHaveBeenCalledWith(`${id}:3`, {
+      expect(queue.add).toHaveBeenCalledWith(buildTranscodeJobId(id, 3), {
         videoId: id,
         processingVersion: 3,
       });

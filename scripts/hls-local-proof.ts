@@ -5,7 +5,11 @@ import { HlsSmokeRunner } from '../src/transcode/hls/hls-smoke-runner.service';
 
 /**
  * Slice 11O — the orchestrator's one-shot "full 4-rung local proof" runner.
- * Boots the real `WorkerModule` (real ffmpeg/ffprobe CLI clients — nothing
+ * Boots the real `WorkerModule.register()` DYNAMIC module (Slice 11P turned
+ * `WorkerModule` into a `@Module({})` shell whose only real definition comes
+ * from `register()`; passing the bare class here silently produced an EMPTY
+ * context and an `Nest could not find HlsSmokeRunner` failure) — real
+ * ffmpeg/ffprobe CLI clients, nothing
  * mocked), runs `HlsSmokeRunner.run()` with `upload: false` (the default —
  * this script NEVER touches the network or R2, regardless of `.env`
  * contents), and prints a JSON summary: wall-clock, produced file count,
@@ -21,7 +25,7 @@ import { HlsSmokeRunner } from '../src/transcode/hls/hls-smoke-runner.service';
  * without needing to parse the JSON output.
  */
 async function main(): Promise<void> {
-  const app = await NestFactory.createApplicationContext(WorkerModule, {
+  const app = await NestFactory.createApplicationContext(WorkerModule.register(), {
     logger: false,
   });
 

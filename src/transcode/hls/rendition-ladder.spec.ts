@@ -217,6 +217,47 @@ describe('computeRenditionLadder', () => {
     expect(rung1080.height % 2).toBe(0);
   });
 
+  // LANDSCAPE COVERAGE. Every pre-existing aspect-ratio test above is
+  // portrait or square, so `buildStandardRung`'s `isPortraitOrSquare ===
+  // false` branch — the one that drives HEIGHT to the tier's short side and
+  // derives WIDTH — had no test at all. It is not a hypothetical branch:
+  // half the current real catalog (series-010 and series-105, 20 episodes)
+  // is 1280x720 landscape source media. These lock in that a landscape
+  // source ladders on its SHORT side (the height) with the aspect ratio
+  // preserved — never cropped to portrait, never stretched.
+  it('a 1280x720 landscape source ladders on its short side: 640x360, 960x540, 1280x720, no 1080p', () => {
+    const result = computeRenditionLadder(probe({ width: 1280, height: 720 }));
+
+    expect(names(result.rungs)).toEqual(['360p', '540p', '720p']);
+    expect(result.rungs[0]).toMatchObject({ width: 640, height: 360 });
+    expect(result.rungs[1]).toMatchObject({ width: 960, height: 540 });
+    expect(result.rungs[2]).toMatchObject({ width: 1280, height: 720 });
+  });
+
+  it('a 1920x1080 landscape source produces all 4 rungs, topping out at the source size', () => {
+    const result = computeRenditionLadder(probe({ width: 1920, height: 1080 }));
+
+    expect(names(result.rungs)).toEqual(['360p', '540p', '720p', '1080p']);
+    expect(result.rungs[3]).toMatchObject({ width: 1920, height: 1080 });
+  });
+
+  it('never crops or stretches a landscape source: every rung keeps the source aspect ratio', () => {
+    const result = computeRenditionLadder(probe({ width: 1280, height: 720 }));
+    const sourceAspect = 1280 / 720;
+
+    for (const rung of result.rungs) {
+      // Landscape stays landscape (never rotated/cropped into portrait).
+      expect(rung.width).toBeGreaterThan(rung.height);
+      // Aspect preserved within one even-floor rounding step.
+      expect(Math.abs(rung.width / rung.height - sourceAspect)).toBeLessThan(0.02);
+      expect(rung.width % 2).toBe(0);
+      expect(rung.height % 2).toBe(0);
+      // Never upscaled beyond the source.
+      expect(rung.width).toBeLessThanOrEqual(1280);
+      expect(rung.height).toBeLessThanOrEqual(720);
+    }
+  });
+
   it('always produces at least one rung for any input', () => {
     const inputs: Partial<HlsSourceProbe>[] = [
       { width: 1, height: 1 },

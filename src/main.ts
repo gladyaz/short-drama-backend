@@ -72,6 +72,32 @@ async function bootstrap(): Promise<void> {
   app.useBodyParser('json', { limit: JSON_BODY_LIMIT });
   app.useBodyParser('urlencoded', { extended: true, limit: JSON_BODY_LIMIT });
 
+  // PRODUCTION HTTPS READINESS: teach Express how many reverse proxies sit
+  // in front of this process, so `request.ip` is the real client address
+  // rather than the proxy's.
+  //
+  // WHAT DEPENDS ON THIS. Every per-IP control in the app reads
+  // `request.ip`: the global `ThrottlerGuard` (@nestjs/throttler's default
+  // tracker IS `req.ip`), every `@Throttle()` override — `LOGIN_RATE_LIMIT`
+  // is 5/min, `WHATSAPP_OTP_REQUEST_RATE_LIMIT` 3/10min — and
+  // `requestContext()`, whose `ip` becomes `Session.ipHash` /
+  // `AuthAuditEvent.ipHash`. A public HTTPS deployment always terminates TLS
+  // at a proxy; left unconfigured there, every request reports the SAME
+  // (proxy) address, so the 5-logins-per-minute ceiling becomes 5 logins per
+  // minute for the whole user base — a self-inflicted outage — and every
+  // audit row hashes one address.
+  //
+  // NUMBER, NEVER `true`: `trust proxy: true` trusts the entire
+  // `X-Forwarded-For` chain, letting any client prepend a forged address and
+  // mint unlimited rate-limit identities. A hop COUNT makes Express skip
+  // exactly that many trusted entries from the right, which a client cannot
+  // forge past. `0` (the default) leaves `trust proxy` untouched — the exact
+  // behavior this app has always had — so a direct-to-Node deployment and
+  // every existing test are unaffected.
+  if (appConfig.trustProxyHops > 0) {
+    app.set('trust proxy', appConfig.trustProxyHops);
+  }
+
   app.enableCors({ origin: appConfig.corsOrigins });
   app.useGlobalFilters(new AppExceptionFilter());
   app.useGlobalPipes(
@@ -82,6 +108,22 @@ async function bootstrap(): Promise<void> {
     }),
   );
 
+  // PRODUCTION HTTPS READINESS: without this, Nest never runs its shutdown
+  // lifecycle on a signal. Every managed platform stops a container by
+  // sending SIGTERM and waiting a grace period before SIGKILL, so on every
+  // single deploy, scale event and restart the process would die with
+  // `onModuleDestroy` never called: `PrismaService.$disconnect()` skipped
+  // (server-side Postgres connections left to time out rather than being
+  // released — they accumulate across rapid redeploys and can exhaust a
+  // small connection limit) and `RetentionSchedulerService`'s cron left
+  // running into the teardown. It also lets Nest stop accepting new
+  // connections and drain in-flight requests instead of severing them
+  // mid-response — including a partially-streamed episode.
+  //
+  // Registered BEFORE `listen()` so a signal arriving during a slow startup
+  // is still handled.
+  app.enableShutdownHooks();
+
   await app.listen(appConfig.port, '0.0.0.0');
 
   const logger = new Logger('Bootstrap');
@@ -90,5 +132,12 @@ async function bootstrap(): Promise<void> {
   );
   logger.log(`Public base URL: ${appConfig.publicBaseUrl}`);
   logger.log(`CORS origins: ${appConfig.corsOrigins.join(', ') || '(none)'}`);
+  // Logged because a wrong value here is invisible at runtime — it produces
+  // no error, just silently wrong client IPs — so the boot line is the one
+  // place an operator can confirm it against their actual topology.
+  logger.log(
+    `Trusted reverse-proxy hops: ${appConfig.trustProxyHops}` +
+      (appConfig.trustProxyHops === 0 ? ' (trust proxy disabled)' : ''),
+  );
 }
 void bootstrap();

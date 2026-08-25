@@ -1,4 +1,7 @@
-import configuration, { DEFAULT_STORAGE_DRIVER } from './configuration';
+import configuration, {
+  DEFAULT_STORAGE_DRIVER,
+  DEFAULT_TRUST_PROXY_HOPS,
+} from './configuration';
 
 /**
  * Phase 11, work unit 11G-3: unit coverage for the `STORAGE_DRIVER`
@@ -146,4 +149,63 @@ describe('configuration — transcode.maxAttempts / stalledAfterMinutes / cleanu
       expect(configuration().transcode.maxAttempts).toBe(3);
     },
   );
+});
+
+/**
+ * PRODUCTION HTTPS READINESS: `app.trustProxyHops` resolution. Mirrors the
+ * `STORAGE_DRIVER` spec above — sets/restores one env var, entirely
+ * in-memory, no network call and no real credential.
+ *
+ * The load-bearing case is the LAST one: a malformed value must resolve to
+ * the safe default rather than something Express would interpret loosely.
+ * `env.validation.ts` refuses to boot on such a value first, so this is the
+ * belt-and-braces half of the pair.
+ */
+describe('configuration — app.trustProxyHops (production HTTPS readiness)', () => {
+  const originalTrustProxyHops = process.env.TRUST_PROXY_HOPS;
+
+  afterEach(() => {
+    if (originalTrustProxyHops === undefined) {
+      delete process.env.TRUST_PROXY_HOPS;
+    } else {
+      process.env.TRUST_PROXY_HOPS = originalTrustProxyHops;
+    }
+  });
+
+  it('defaults to 0 (trust proxy off) when TRUST_PROXY_HOPS is unset', () => {
+    delete process.env.TRUST_PROXY_HOPS;
+
+    expect(configuration().app.trustProxyHops).toBe(DEFAULT_TRUST_PROXY_HOPS);
+    expect(configuration().app.trustProxyHops).toBe(0);
+  });
+
+  it('defaults to 0 when TRUST_PROXY_HOPS is empty', () => {
+    process.env.TRUST_PROXY_HOPS = '';
+
+    expect(configuration().app.trustProxyHops).toBe(0);
+  });
+
+  it('preserves an explicit "0" instead of discarding it as non-positive', () => {
+    process.env.TRUST_PROXY_HOPS = '0';
+
+    expect(configuration().app.trustProxyHops).toBe(0);
+  });
+
+  it('resolves a positive hop count', () => {
+    process.env.TRUST_PROXY_HOPS = '2';
+
+    expect(configuration().app.trustProxyHops).toBe(2);
+  });
+
+  it('falls back to the safe default for a malformed value', () => {
+    process.env.TRUST_PROXY_HOPS = 'one';
+
+    expect(configuration().app.trustProxyHops).toBe(0);
+  });
+
+  it('falls back to the safe default for a negative value', () => {
+    process.env.TRUST_PROXY_HOPS = '-1';
+
+    expect(configuration().app.trustProxyHops).toBe(0);
+  });
 });

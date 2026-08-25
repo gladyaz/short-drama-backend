@@ -5,6 +5,30 @@ export interface AppConfig {
   corsOrigins: string[];
   /** Phase 10, work unit 10-B5: gates dev-only entitlement grant/revoke routes. */
   devToolsEnabled: boolean;
+  /**
+   * PRODUCTION HTTPS READINESS: how many reverse proxies sit in front of
+   * this process. `0` (the default) means "no proxy" and leaves Express's
+   * `trust proxy` OFF — byte-for-byte the behavior this app has always had.
+   *
+   * WHY THIS EXISTS. Every per-IP control in this codebase reads
+   * `request.ip`: the global `ThrottlerGuard` (@nestjs/throttler 6.5.0's
+   * default tracker is literally `req.ip`), every `@Throttle()` override
+   * (`LOGIN_RATE_LIMIT = 5/min`, `WHATSAPP_OTP_REQUEST_RATE_LIMIT = 3/10min`,
+   * ...), and `requestContext()`'s `ip` — which becomes `Session.ipHash` and
+   * `AuthAuditEvent.ipHash`. Behind a TLS-terminating proxy with `trust
+   * proxy` off, `request.ip` is the PROXY's address for every caller, so all
+   * of those collapse onto ONE bucket: the 5-logins-per-minute ceiling
+   * becomes 5 logins per minute for the entire user base, and every audit
+   * row hashes the same address.
+   *
+   * WHY A HOP COUNT AND NOT `true`. `trust proxy: true` trusts the whole
+   * `X-Forwarded-For` chain, so any client can prepend a forged address and
+   * mint itself an unlimited number of rate-limit identities. A NUMBER tells
+   * Express to skip exactly that many trusted hops from the right and take
+   * the next value, which a client cannot forge past. Set it to the real
+   * number of proxies (1 for a single managed platform router/ingress).
+   */
+  trustProxyHops: number;
 }
 
 export interface AuthConfig {
@@ -136,6 +160,18 @@ export interface TranscodeConfig {
    */
   cleanupGraceMinutes: number;
 }
+
+/**
+ * PRODUCTION HTTPS READINESS default for `AppConfig.trustProxyHops`: ZERO,
+ * i.e. Express's `trust proxy` stays OFF unless a deployment explicitly says
+ * how many proxies are in front of it. Deliberately fail-closed in the
+ * direction that CANNOT be abused: with no proxy configured a real proxy
+ * deployment over-throttles (an availability problem the operator sees
+ * immediately and fixes with one variable), whereas a wrong non-zero value
+ * would let a client forge its own rate-limit identity via
+ * `X-Forwarded-For` — a silent security hole. Never guessed from NODE_ENV.
+ */
+export const DEFAULT_TRUST_PROXY_HOPS = 0;
 
 /** Slice 11P default for `TranscodeConfig.maxAttempts` (proposal §8: "3 attempts"). */
 export const DEFAULT_TRANSCODE_MAX_ATTEMPTS = 3;
@@ -332,6 +368,10 @@ export default (): RootConfig => ({
       .map((origin) => origin.trim())
       .filter((origin) => origin.length > 0),
     devToolsEnabled: process.env.DEV_TOOLS_ENABLED === 'true',
+    trustProxyHops: parseNonNegativeIntEnv(
+      process.env.TRUST_PROXY_HOPS,
+      DEFAULT_TRUST_PROXY_HOPS,
+    ),
   },
   auth: {
     jwtAccessSecret: process.env.JWT_ACCESS_SECRET ?? '',
@@ -431,6 +471,27 @@ function parsePositiveIntEnv(
  * already fails the app's boot for any value other than `local`/`r2`, so by
  * the time this runs the only other possible value is the literal `r2`.
  */
+/**
+ * PRODUCTION HTTPS READINESS: the `parsePositiveIntEnv` sibling for a value
+ * whose ZERO is meaningful rather than a mistake. `TRUST_PROXY_HOPS=0` is
+ * the explicit "there is no proxy in front of me" answer, so it must survive
+ * parsing instead of being rejected as non-positive and silently replaced by
+ * a fallback. Same "validate elsewhere, resolve permissively here" split
+ * every other parser in this file follows — `env.validation.ts` has already
+ * failed the boot for a malformed value by the time this runs.
+ */
+function parseNonNegativeIntEnv(
+  value: string | undefined,
+  fallback: number,
+): number {
+  if (value === undefined || value.trim().length === 0) {
+    return fallback;
+  }
+
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
 function resolveStorageDriver(): StorageDriver {
   return process.env.STORAGE_DRIVER === 'r2' ? 'r2' : DEFAULT_STORAGE_DRIVER;
 }

@@ -651,3 +651,56 @@ describe('validateEnv — PAYMENTS_ENABLED / MIDTRANS_* (MIDTRANS PAYMENT BACKEN
     }
   });
 });
+
+/**
+ * PRODUCTION HTTPS READINESS: `TRUST_PROXY_HOPS`. Optional (default 0), but
+ * must be a well-formed non-negative integer when set — validated
+ * UNCONDITIONALLY, since unlike the transcode/payment knobs this value is
+ * read on every request path in every deployment. Entirely in-memory: no
+ * network call, no real credential, no filesystem access beyond the
+ * `STORAGE_ROOT: process.cwd()` the shared `VALID_CONFIG` already uses.
+ */
+describe('validateEnv — TRUST_PROXY_HOPS (production HTTPS readiness)', () => {
+  it('passes when TRUST_PROXY_HOPS is absent (the documented default applies)', () => {
+    expect(() => validateEnv({ ...VALID_CONFIG })).not.toThrow();
+  });
+
+  it('passes when TRUST_PROXY_HOPS is blank (treated as not set)', () => {
+    expect(() =>
+      validateEnv({ ...VALID_CONFIG, TRUST_PROXY_HOPS: '   ' }),
+    ).not.toThrow();
+  });
+
+  it('accepts "0" — the explicit "no reverse proxy" answer, not a mistake', () => {
+    expect(() =>
+      validateEnv({ ...VALID_CONFIG, TRUST_PROXY_HOPS: '0' }),
+    ).not.toThrow();
+  });
+
+  it('accepts a positive hop count', () => {
+    expect(() =>
+      validateEnv({ ...VALID_CONFIG, TRUST_PROXY_HOPS: '1' }),
+    ).not.toThrow();
+  });
+
+  it.each(['one', '1.5', '-1', '1x'])(
+    'throws for the malformed value %p rather than silently falling back to 0',
+    (value) => {
+      expect(() =>
+        validateEnv({ ...VALID_CONFIG, TRUST_PROXY_HOPS: value }),
+      ).toThrow(/Invalid TRUST_PROXY_HOPS/);
+    },
+  );
+
+  it('names the offending value, which is a hop count and never a secret', () => {
+    expect(() =>
+      validateEnv({ ...VALID_CONFIG, TRUST_PROXY_HOPS: 'one' }),
+    ).toThrow(/TRUST_PROXY_HOPS="one"/);
+  });
+
+  it('throws for a non-string value', () => {
+    expect(() => validateEnv({ ...VALID_CONFIG, TRUST_PROXY_HOPS: 1 })).toThrow(
+      /Invalid TRUST_PROXY_HOPS/,
+    );
+  });
+});

@@ -80,6 +80,8 @@ export function validateEnv(
 
   validateStorageDriver(config);
 
+  validateTrustProxyHops(config);
+
   validateDevToolsNodeEnv(config);
 
   validateTranscodeConfig(config);
@@ -138,6 +140,57 @@ function validateRewardsConfig(config: Record<string, unknown>): void {
     throw new Error(
       `REWARDS_TIMEZONE is not a valid IANA timezone: "${timezone}". ` +
         'Use a zone name such as "Asia/Jakarta", or unset it to use the default.',
+    );
+  }
+}
+
+/**
+ * PRODUCTION HTTPS READINESS: `TRUST_PROXY_HOPS` is OPTIONAL (it has a
+ * documented default, `DEFAULT_TRUST_PROXY_HOPS = 0`), following the exact
+ * "optional, but must be well-formed if present" pattern
+ * `assertPositiveIntEnvIfPresent` established for the transcode knobs.
+ *
+ * It gets its own validator rather than reusing that helper for one reason:
+ * ZERO IS A LEGITIMATE VALUE HERE. `TRUST_PROXY_HOPS=0` is the explicit "no
+ * proxy is in front of this process" answer, and `assertPositiveIntEnvIfPresent`
+ * rejects `0` outright (and names `TRANSCODE_ENABLED` in its error message,
+ * which has nothing to do with this variable).
+ *
+ * VALIDATED UNCONDITIONALLY, not behind a feature flag: unlike the transcode
+ * and payment knobs, this value is read on EVERY request path in every
+ * deployment, and a typo (`"one"`, `"1 "`, `"-1"`, `"1.5"`) would otherwise
+ * fall back silently to 0 and re-open the collapsed-rate-limit failure the
+ * variable exists to close. Failing the boot makes that impossible to deploy
+ * unnoticed. The value is a small integer, never a secret, so — unlike the
+ * secret-bearing validators in this file — it IS safe to echo back, and
+ * naming the bad value is what makes the error actionable.
+ */
+function validateTrustProxyHops(config: Record<string, unknown>): void {
+  const raw = config.TRUST_PROXY_HOPS;
+
+  if (raw === undefined || raw === null) {
+    return; // genuinely unset — the default (0) applies.
+  }
+
+  if (typeof raw !== 'string') {
+    throw new Error(
+      'Invalid TRUST_PROXY_HOPS: must be a non-negative integer when set ' +
+        '(0 = no reverse proxy, 1 = one proxy in front of this process).',
+    );
+  }
+
+  if (raw.trim().length === 0) {
+    return; // blank string — treated as "not set".
+  }
+
+  const parsed = Number(raw);
+
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error(
+      `Invalid TRUST_PROXY_HOPS=${JSON.stringify(raw)}: must be a ` +
+        'non-negative integer (0 = no reverse proxy, 1 = one proxy in front ' +
+        'of this process). A malformed value would silently disable proxy ' +
+        'awareness and collapse every per-IP rate limit onto a single bucket.',
     );
   }
 }

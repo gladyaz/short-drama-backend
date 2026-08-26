@@ -1324,3 +1324,254 @@ describe('validateEnv — CONTENT_ACCESS_MODE (V1 FREE ACCESS POLICY)', () => {
     expect(message).not.toContain('super-secret-value-that-must-not-leak');
   });
 });
+
+/**
+ * WHATSAPP LOGIN V1 — the boot contract for WhatsApp OTP.
+ *
+ * This block did not exist before this work unit: `validateWhatsAppConfig`
+ * shipped with ZERO direct coverage, so the single most important property
+ * of the whole feature — "a production deployment cannot start with a
+ * provider that delivers nothing" — was asserted nowhere. It is the first
+ * thing tested here.
+ *
+ * Shaped after the `PAYMENTS_ENABLED / MIDTRANS_*` block above, whose
+ * flag-gated, fail-closed, never-echo-a-value contract this mirrors exactly.
+ */
+describe('validateEnv — WHATSAPP_AUTH_ENABLED / WHATSAPP_OTP_PROVIDER_DRIVER (WHATSAPP LOGIN V1)', () => {
+  const TOKEN_VALUE = 'spec-fixture-whatsapp-access-token';
+
+  const CLOUD_API_CONFIG: Record<string, unknown> = {
+    ...VALID_CONFIG,
+    WHATSAPP_AUTH_ENABLED: 'true',
+    WHATSAPP_OTP_PROVIDER_DRIVER: 'cloud-api',
+    WHATSAPP_CLOUD_API_PHONE_NUMBER_ID: '111122223333444',
+    WHATSAPP_CLOUD_API_ACCESS_TOKEN: TOKEN_VALUE,
+    WHATSAPP_CLOUD_API_TEMPLATE_NAME: 'red_panda_login_otp',
+    WHATSAPP_CLOUD_API_TEMPLATE_LANGUAGE: 'id',
+  };
+
+  it('boots with every WhatsApp variable unset (the shipped default posture)', () => {
+    expect(() => validateEnv({ ...VALID_CONFIG })).not.toThrow();
+  });
+
+  it('boots with WHATSAPP_AUTH_ENABLED=false and no driver', () => {
+    expect(() =>
+      validateEnv({ ...VALID_CONFIG, WHATSAPP_AUTH_ENABLED: 'false' }),
+    ).not.toThrow();
+  });
+
+  describe('the fake driver is fenced to development/test', () => {
+    it.each(['production', 'Production', 'PRODUCTION', 'staging', ''])(
+      'CRITICAL: driver=fake refuses to boot with NODE_ENV=%s',
+      (nodeEnv) => {
+        expect(() =>
+          validateEnv({
+            ...VALID_CONFIG,
+            NODE_ENV: nodeEnv,
+            WHATSAPP_OTP_PROVIDER_DRIVER: 'fake',
+          }),
+        ).toThrow(/Refusing to boot with WHATSAPP_OTP_PROVIDER_DRIVER=fake/);
+      },
+    );
+
+    it('CRITICAL: driver=fake refuses to boot with NODE_ENV unset', () => {
+      expect(() =>
+        validateEnv({
+          ...VALID_CONFIG,
+          WHATSAPP_OTP_PROVIDER_DRIVER: 'fake',
+        }),
+      ).toThrow(/Refusing to boot with WHATSAPP_OTP_PROVIDER_DRIVER=fake/);
+    });
+
+    it.each(['development', 'test'])(
+      'driver=fake boots under NODE_ENV=%s',
+      (nodeEnv) => {
+        expect(() =>
+          validateEnv({
+            ...VALID_CONFIG,
+            NODE_ENV: nodeEnv,
+            WHATSAPP_AUTH_ENABLED: 'true',
+            WHATSAPP_OTP_PROVIDER_DRIVER: 'fake',
+          }),
+        ).not.toThrow();
+      },
+    );
+
+    it('the NODE_ENV allowlist applies even while WhatsApp auth is disabled', () => {
+      expect(() =>
+        validateEnv({
+          ...VALID_CONFIG,
+          NODE_ENV: 'production',
+          WHATSAPP_AUTH_ENABLED: 'false',
+          WHATSAPP_OTP_PROVIDER_DRIVER: 'fake',
+        }),
+      ).toThrow(/Refusing to boot with WHATSAPP_OTP_PROVIDER_DRIVER=fake/);
+    });
+  });
+
+  describe('an enabled provider must name an implemented driver', () => {
+    it('WHATSAPP_AUTH_ENABLED=true with no driver fails, naming the variable', () => {
+      expect(() =>
+        validateEnv({ ...VALID_CONFIG, WHATSAPP_AUTH_ENABLED: 'true' }),
+      ).toThrow(
+        /Missing required environment variable: WHATSAPP_OTP_PROVIDER_DRIVER/,
+      );
+    });
+
+    it('an empty driver is treated as absent, never as a default', () => {
+      expect(() =>
+        validateEnv({
+          ...VALID_CONFIG,
+          WHATSAPP_AUTH_ENABLED: 'true',
+          WHATSAPP_OTP_PROVIDER_DRIVER: '   ',
+        }),
+      ).toThrow(
+        /Missing required environment variable: WHATSAPP_OTP_PROVIDER_DRIVER/,
+      );
+    });
+
+    it.each(['twilio', 'vonage', 'cloudapi', 'CLOUD-API'])(
+      'an unimplemented driver "%s" fails the boot',
+      (driver) => {
+        expect(() =>
+          validateEnv({
+            ...VALID_CONFIG,
+            WHATSAPP_AUTH_ENABLED: 'true',
+            WHATSAPP_OTP_PROVIDER_DRIVER: driver,
+          }),
+        ).toThrow(/Unsupported WHATSAPP_OTP_PROVIDER_DRIVER/);
+      },
+    );
+
+    it('only the exact string "true" enables the requirement (fail-closed flag parsing)', () => {
+      for (const nonTrue of ['TRUE', '1', 'yes', '']) {
+        expect(() =>
+          validateEnv({ ...VALID_CONFIG, WHATSAPP_AUTH_ENABLED: nonTrue }),
+        ).not.toThrow();
+      }
+    });
+  });
+
+  describe('the cloud-api driver requires a complete sender', () => {
+    it('boots when every required variable is present', () => {
+      expect(() => validateEnv({ ...CLOUD_API_CONFIG })).not.toThrow();
+    });
+
+    it.each([
+      'WHATSAPP_CLOUD_API_PHONE_NUMBER_ID',
+      'WHATSAPP_CLOUD_API_ACCESS_TOKEN',
+      'WHATSAPP_CLOUD_API_TEMPLATE_NAME',
+      'WHATSAPP_CLOUD_API_TEMPLATE_LANGUAGE',
+    ])('fails without %s, naming the variable', (key) => {
+      expect(() => validateEnv(omitKey(CLOUD_API_CONFIG, key))).toThrow(
+        new RegExp(`Missing required environment variable: ${key}`),
+      );
+    });
+
+    it.each([
+      'WHATSAPP_CLOUD_API_PHONE_NUMBER_ID',
+      'WHATSAPP_CLOUD_API_ACCESS_TOKEN',
+      'WHATSAPP_CLOUD_API_TEMPLATE_NAME',
+      'WHATSAPP_CLOUD_API_TEMPLATE_LANGUAGE',
+    ])('treats a whitespace-only %s as missing', (key) => {
+      expect(() => validateEnv({ ...CLOUD_API_CONFIG, [key]: '   ' })).toThrow(
+        new RegExp(`Missing required environment variable: ${key}`),
+      );
+    });
+
+    it('requires nothing while the feature flag is off', () => {
+      expect(() =>
+        validateEnv({
+          ...VALID_CONFIG,
+          WHATSAPP_AUTH_ENABLED: 'false',
+          WHATSAPP_OTP_PROVIDER_DRIVER: 'cloud-api',
+        }),
+      ).not.toThrow();
+    });
+
+    it('CRITICAL: the boot succeeds in production with a complete cloud-api sender', () => {
+      expect(() =>
+        validateEnv({
+          ...CLOUD_API_CONFIG,
+          NODE_ENV: 'production',
+          // Production independently requires an https public origin and
+          // rejects a dev CORS origin; this test's subject is WhatsApp.
+          PUBLIC_BASE_URL: 'https://api.redpanda-fixture.com',
+          CORS_ORIGINS: '',
+        }),
+      ).not.toThrow();
+    });
+  });
+
+  describe('WHATSAPP_CLOUD_API_GRAPH_VERSION shape', () => {
+    it('is optional', () => {
+      expect(() => validateEnv({ ...CLOUD_API_CONFIG })).not.toThrow();
+    });
+
+    it.each(['v21.0', 'v23.0', 'v7.1'])('accepts %s', (version) => {
+      expect(() =>
+        validateEnv({
+          ...CLOUD_API_CONFIG,
+          WHATSAPP_CLOUD_API_GRAPH_VERSION: version,
+        }),
+      ).not.toThrow();
+    });
+
+    it.each(['21.0', 'v21', 'latest', '../../evil', 'v21.0/../x'])(
+      'rejects "%s" — it is interpolated into the request URL',
+      (version) => {
+        expect(() =>
+          validateEnv({
+            ...CLOUD_API_CONFIG,
+            WHATSAPP_CLOUD_API_GRAPH_VERSION: version,
+          }),
+        ).toThrow(/Invalid WHATSAPP_CLOUD_API_GRAPH_VERSION/);
+      },
+    );
+
+    it('validates the shape even while WhatsApp auth is disabled', () => {
+      expect(() =>
+        validateEnv({
+          ...VALID_CONFIG,
+          WHATSAPP_CLOUD_API_GRAPH_VERSION: 'latest',
+        }),
+      ).toThrow(/Invalid WHATSAPP_CLOUD_API_GRAPH_VERSION/);
+    });
+  });
+
+  describe('no credential value ever appears in an error message', () => {
+    it.each([
+      'WHATSAPP_CLOUD_API_PHONE_NUMBER_ID',
+      'WHATSAPP_CLOUD_API_TEMPLATE_NAME',
+      'WHATSAPP_CLOUD_API_TEMPLATE_LANGUAGE',
+    ])(
+      'CRITICAL: the access token is absent from the error raised by a missing %s',
+      (key) => {
+        let message = '';
+        try {
+          validateEnv(omitKey(CLOUD_API_CONFIG, key));
+        } catch (error) {
+          message = (error as Error).message;
+        }
+
+        expect(message).not.toBe('');
+        expect(message).not.toContain(TOKEN_VALUE);
+      },
+    );
+
+    it('CRITICAL: a missing token names the variable without echoing any value', () => {
+      let message = '';
+      try {
+        validateEnv(
+          omitKey(CLOUD_API_CONFIG, 'WHATSAPP_CLOUD_API_ACCESS_TOKEN'),
+        );
+      } catch (error) {
+        message = (error as Error).message;
+      }
+
+      expect(message).toContain('WHATSAPP_CLOUD_API_ACCESS_TOKEN');
+      expect(message).not.toContain(TOKEN_VALUE);
+      expect(message).toContain('Values are never logged');
+    });
+  });
+});

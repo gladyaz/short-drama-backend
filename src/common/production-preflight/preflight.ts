@@ -418,15 +418,7 @@ function checkFeaturePosture(env: EnvRecord, add: AddFinding): void {
     );
   }
 
-  if (env.WHATSAPP_AUTH_ENABLED === 'true') {
-    add(
-      'WARNING',
-      'WhatsApp sign-in',
-      'WHATSAPP_AUTH_ENABLED=true, but the only implemented OTP driver is ' +
-        '"fake", which the boot contract refuses outside development/test. ' +
-        'This configuration cannot start in production.',
-    );
-  }
+  addWhatsAppFindings(env, add);
 
   if (env.PAYMENTS_ENABLED === 'true') {
     add(
@@ -492,4 +484,110 @@ function checkFeaturePosture(env: EnvRecord, add: AddFinding): void {
         'grant routes. It must be false in production.',
     );
   }
+}
+
+/**
+ * WHATSAPP LOGIN V1 — the named `WhatsApp sign-in` verdict.
+ *
+ * V1 SHIPS WHATSAPP LOGIN AS A REQUIRED SIGN-IN METHOD, so "not enabled" is
+ * a WARNING here rather than the silent pass an optional provider would get:
+ * a build that reaches the Play Store with `WHATSAPP_AUTH_ENABLED` unset
+ * answers `503` to every OTP route, and an operator must see that stated
+ * before release rather than discover it from a review.
+ *
+ * A BLOCKER means "this will not boot, or it will boot and be wrong" — the
+ * same bar the rest of this file uses. Every blocker below is a posture
+ * `validateEnv` also refuses, which is deliberate: the boot contract is the
+ * enforcement, and this is the legible, per-feature reading of it an
+ * operator gets BEFORE spending a deploy to find out.
+ *
+ * IT CHECKS PRESENCE, NEVER VALIDITY, and never echoes a value. Whether a
+ * token is accepted by Meta, whether the template is approved, and whether
+ * the number can send are all facts only Meta holds; this function refuses
+ * to guess at them and says so, rather than reporting a green light it
+ * cannot actually see.
+ */
+function addWhatsAppFindings(
+  env: EnvRecord,
+  add: (severity: PreflightSeverity, check: string, detail: string) => void,
+): void {
+  const CHECK = 'WhatsApp sign-in';
+
+  if (env.WHATSAPP_AUTH_ENABLED !== 'true') {
+    add(
+      'WARNING',
+      CHECK,
+      'WHATSAPP_AUTH_ENABLED is not "true" — every /auth/whatsapp/* route ' +
+        'answers 503 WHATSAPP_AUTH_DISABLED. V1 ships WhatsApp login as a ' +
+        'required sign-in method, so confirm this is deliberate.',
+    );
+    return;
+  }
+
+  const driver = env.WHATSAPP_OTP_PROVIDER_DRIVER?.trim() ?? '';
+
+  if (driver.length === 0) {
+    add(
+      'BLOCKER',
+      CHECK,
+      'WHATSAPP_AUTH_ENABLED=true with no WHATSAPP_OTP_PROVIDER_DRIVER. The ' +
+        'boot contract refuses this: there is no default driver, because a ' +
+        'backend that accepts OTP requests without a delivery provider would ' +
+        'answer 202 while sending nothing.',
+    );
+    return;
+  }
+
+  if (driver === 'fake') {
+    add(
+      'BLOCKER',
+      CHECK,
+      'WHATSAPP_OTP_PROVIDER_DRIVER=fake delivers NO message and retains ' +
+        'plaintext codes in memory. The boot contract refuses it outside ' +
+        'NODE_ENV=development/test, so this configuration cannot start in ' +
+        'production. Use WHATSAPP_OTP_PROVIDER_DRIVER=cloud-api.',
+    );
+    return;
+  }
+
+  if (driver !== 'cloud-api') {
+    add(
+      'BLOCKER',
+      CHECK,
+      `WHATSAPP_OTP_PROVIDER_DRIVER=${driver} is not an implemented driver. ` +
+        'The boot contract refuses it. The production driver is "cloud-api".',
+    );
+    return;
+  }
+
+  const missing = [
+    'WHATSAPP_CLOUD_API_PHONE_NUMBER_ID',
+    'WHATSAPP_CLOUD_API_ACCESS_TOKEN',
+    'WHATSAPP_CLOUD_API_TEMPLATE_NAME',
+    'WHATSAPP_CLOUD_API_TEMPLATE_LANGUAGE',
+  ].filter((key) => (env[key]?.trim() ?? '').length === 0);
+
+  if (missing.length > 0) {
+    // Variable NAMES only — one of these is an access token, and a preflight
+    // report is exactly the kind of output that gets pasted into a chat.
+    add(
+      'BLOCKER',
+      CHECK,
+      'WHATSAPP_OTP_PROVIDER_DRIVER=cloud-api is missing required ' +
+        `configuration: ${missing.join(', ')}. The boot contract refuses an ` +
+        'incomplete Cloud API sender. See docs/WHATSAPP_LOGIN_SETUP.md.',
+    );
+    return;
+  }
+
+  add(
+    'PASS',
+    CHECK,
+    'READY — WHATSAPP_AUTH_ENABLED=true, driver=cloud-api, and all four ' +
+      'Cloud API sender variables are set. STRUCTURAL ONLY: this cannot ' +
+      'verify that the access token is valid, that the template is approved ' +
+      'and un-paused, or that the sender number can reach WhatsApp. Confirm ' +
+      'those in the Meta dashboard, and prove them with one real end-to-end ' +
+      'OTP to a test number before release.',
+  );
 }

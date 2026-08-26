@@ -319,12 +319,106 @@ describe('runProductionPreflight', () => {
       expect(runProductionPreflight(VALID_PRODUCTION_ENV).ok).toBe(true);
     });
 
-    it('WARNS that a WhatsApp production configuration cannot start at all', () => {
-      const env = { ...VALID_PRODUCTION_ENV, WHATSAPP_AUTH_ENABLED: 'true' };
+    /**
+     * WHATSAPP LOGIN V1 — the named READY/BLOCKER verdict Phase 9 asks for.
+     *
+     * Every BLOCKER here is also refused by `validateEnv`, and the
+     * `boot contract` assertions below prove that rather than assuming it:
+     * the boot contract is the enforcement, and this check is the legible
+     * per-feature reading of it an operator gets before spending a deploy.
+     */
+    describe('WhatsApp sign-in', () => {
+      const CLOUD_API_ENV = {
+        ...VALID_PRODUCTION_ENV,
+        WHATSAPP_AUTH_ENABLED: 'true',
+        WHATSAPP_OTP_PROVIDER_DRIVER: 'cloud-api',
+        WHATSAPP_CLOUD_API_PHONE_NUMBER_ID: '111122223333444',
+        WHATSAPP_CLOUD_API_ACCESS_TOKEN: 'spec-fixture-token',
+        WHATSAPP_CLOUD_API_TEMPLATE_NAME: 'red_panda_login_otp',
+        WHATSAPP_CLOUD_API_TEMPLATE_LANGUAGE: 'id',
+      };
 
-      expect(severityOf(env, 'WhatsApp sign-in')).toEqual(['WARNING']);
-      // ...and the boot contract independently proves it, which is the point.
-      expect(severityOf(env, 'boot contract')).toContain('BLOCKER');
+      it('WARNS when WhatsApp login is not enabled — V1 requires it', () => {
+        expect(severityOf(VALID_PRODUCTION_ENV, 'WhatsApp sign-in')).toEqual([
+          'WARNING',
+        ]);
+        expect(runProductionPreflight(VALID_PRODUCTION_ENV).ok).toBe(true);
+      });
+
+      it('BLOCKS the fake driver, which cannot start in production', () => {
+        const env = {
+          ...VALID_PRODUCTION_ENV,
+          WHATSAPP_AUTH_ENABLED: 'true',
+          WHATSAPP_OTP_PROVIDER_DRIVER: 'fake',
+        };
+
+        expect(severityOf(env, 'WhatsApp sign-in')).toEqual(['BLOCKER']);
+        expect(runProductionPreflight(env).ok).toBe(false);
+        // ...and the boot contract independently proves it.
+        expect(severityOf(env, 'boot contract')).toContain('BLOCKER');
+      });
+
+      it('BLOCKS an enabled provider with no driver named', () => {
+        const env = { ...VALID_PRODUCTION_ENV, WHATSAPP_AUTH_ENABLED: 'true' };
+
+        expect(severityOf(env, 'WhatsApp sign-in')).toEqual(['BLOCKER']);
+        expect(severityOf(env, 'boot contract')).toContain('BLOCKER');
+      });
+
+      it('BLOCKS a driver that is not implemented', () => {
+        const env = {
+          ...VALID_PRODUCTION_ENV,
+          WHATSAPP_AUTH_ENABLED: 'true',
+          WHATSAPP_OTP_PROVIDER_DRIVER: 'twilio',
+        };
+
+        expect(severityOf(env, 'WhatsApp sign-in')).toEqual(['BLOCKER']);
+        expect(severityOf(env, 'boot contract')).toContain('BLOCKER');
+      });
+
+      it.each([
+        'WHATSAPP_CLOUD_API_PHONE_NUMBER_ID',
+        'WHATSAPP_CLOUD_API_ACCESS_TOKEN',
+        'WHATSAPP_CLOUD_API_TEMPLATE_NAME',
+        'WHATSAPP_CLOUD_API_TEMPLATE_LANGUAGE',
+      ])('BLOCKS cloud-api with %s missing, naming the variable', (key) => {
+        const env = { ...CLOUD_API_ENV, [key]: undefined };
+
+        expect(severityOf(env, 'WhatsApp sign-in')).toEqual(['BLOCKER']);
+        expect(
+          runProductionPreflight(env).findings.find(
+            (f) => f.check === 'WhatsApp sign-in',
+          )?.detail,
+        ).toContain(key);
+      });
+
+      it('reports READY when the cloud-api sender is fully configured', () => {
+        expect(severityOf(CLOUD_API_ENV, 'WhatsApp sign-in')).toEqual(['PASS']);
+        expect(runProductionPreflight(CLOUD_API_ENV).ok).toBe(true);
+        expect(severityOf(CLOUD_API_ENV, 'boot contract')).not.toContain(
+          'BLOCKER',
+        );
+      });
+
+      it('says plainly that READY is structural, not proof of delivery', () => {
+        const detail =
+          runProductionPreflight(CLOUD_API_ENV).findings.find(
+            (f) => f.check === 'WhatsApp sign-in',
+          )?.detail ?? '';
+
+        expect(detail).toContain('STRUCTURAL ONLY');
+        expect(detail).toMatch(/template is approved/);
+      });
+
+      it('CRITICAL: never prints the access token, in any posture', () => {
+        for (const env of [
+          CLOUD_API_ENV,
+          { ...CLOUD_API_ENV, WHATSAPP_CLOUD_API_TEMPLATE_NAME: undefined },
+        ]) {
+          const report = JSON.stringify(runProductionPreflight(env));
+          expect(report).not.toContain('spec-fixture-token');
+        }
+      });
     });
 
     it('WARNS that payments are out of V1 scope when enabled', () => {

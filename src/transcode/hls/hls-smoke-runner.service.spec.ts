@@ -81,6 +81,10 @@ async function writeFakeRung(
     [
       '#EXTM3U',
       '#EXT-X-VERSION:7',
+      // Faithful to what the real encoder emits (`-hls_playlist_type vod`):
+      // a VOD media playlist always carries TARGETDURATION and ENDLIST, and
+      // `HlsPackageValidator` now rejects a variant missing either.
+      '#EXT-X-TARGETDURATION:4',
       '#EXT-X-MAP:URI="init.mp4"',
       '#EXTINF:4.000000,',
       'seg_00000.m4s',

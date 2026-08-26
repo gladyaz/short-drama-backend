@@ -44,6 +44,26 @@ import type {
  * 8. Segment count is sane: `duration / 4s`, ±1.
  * 9. No zero-byte artifact (playlist, init segment, or media segment).
  * 10. The master references EXACTLY the produced rungs — no more, no fewer.
+ * 11. Each variant playlist is STRUCTURALLY a complete VOD media playlist:
+ *     it opens with `#EXTM3U`, declares `#EXT-X-TARGETDURATION`, and is
+ *     terminated by `#EXT-X-ENDLIST`. Checks 1-10 above all passed on a
+ *     TRUNCATED variant playlist (one whose write was cut short by a killed
+ *     encoder, a full disk, or a partial upload): the head of such a file
+ *     still carries a valid `#EXT-X-MAP` and a prefix of real, on-disk,
+ *     non-zero segments, and `ffprobe` still reads it happily. The damage is
+ *     invisible until playback — without `#EXT-X-ENDLIST` a player treats a
+ *     finished VOD as a LIVE stream (no seek bar, no duration, endless
+ *     reload polling of a playlist that will never grow), and without
+ *     `#EXT-X-TARGETDURATION` the playlist violates RFC 8216 §4.3.3.1
+ *     outright. Cheap to check, and the only thing standing between a
+ *     half-written playlist and `promoteIfCurrent`.
+ * 12. Every reference INSIDE a variant playlist is a bare filename resolving
+ *     within that variant's OWN rung directory. Check 4 above only proves a
+ *     reference stays inside `packageRoot` — it deliberately permits
+ *     `360p/../720p/seg_00000.m4s`, which is inside the root yet points at a
+ *     DIFFERENT rendition's bytes. A player following it would silently
+ *     decode 720p media while believing it is on the 360p rung, breaking the
+ *     ABR contract in exactly the way no other check here would notice.
  */
 @Injectable()
 export class HlsPackageValidator {
@@ -119,12 +139,15 @@ export class HlsPackageValidator {
 
     const { mapUri, segmentUris } = parseVariantReferences(variantText);
 
+    assertVariantStructure(artifact.rung.name, variantText, issues);
+
     if (mapUri === undefined) {
       issues.push({
         code: 'VARIANT_MISSING_MAP',
         message: `Variant "${artifact.rung.name}" has no #EXT-X-MAP init segment reference`,
       });
     } else {
+      assertReferenceStaysInRung(artifact.rung.name, mapUri, issues);
       await this.assertNonZeroArtifact(
         packageRoot,
         `${artifact.rung.name}/${mapUri}`,
@@ -133,6 +156,7 @@ export class HlsPackageValidator {
     }
 
     for (const segmentUri of segmentUris) {
+      assertReferenceStaysInRung(artifact.rung.name, segmentUri, issues);
       await this.assertNonZeroArtifact(
         packageRoot,
         `${artifact.rung.name}/${segmentUri}`,
@@ -309,6 +333,70 @@ function parseMasterVariantUris(masterPlaylistText: string): string[] {
   }
 
   return uris;
+}
+
+/**
+ * Checklist item 11 (see the class doc comment for why a truncated playlist
+ * survives every OTHER check in this file). All three tags are emitted
+ * unconditionally by the encoder's own `-hls_playlist_type vod` output, so a
+ * missing one always means the file is damaged, never merely unusual.
+ */
+function assertVariantStructure(
+  rungName: string,
+  variantText: string,
+  issues: HlsPackageValidationIssue[],
+): void {
+  if (!variantText.trim().startsWith('#EXTM3U')) {
+    issues.push({
+      code: 'VARIANT_PLAYLIST_UNPARSEABLE',
+      message: `Variant "${rungName}" does not start with #EXTM3U`,
+    });
+  }
+
+  if (!variantText.includes('#EXT-X-TARGETDURATION')) {
+    issues.push({
+      code: 'VARIANT_MISSING_TARGET_DURATION',
+      message: `Variant "${rungName}" has no #EXT-X-TARGETDURATION (required by RFC 8216 §4.3.3.1)`,
+    });
+  }
+
+  if (!variantText.includes('#EXT-X-ENDLIST')) {
+    issues.push({
+      code: 'VARIANT_MISSING_ENDLIST',
+      message: `Variant "${rungName}" has no #EXT-X-ENDLIST — a VOD playlist without it is served to players as a LIVE stream`,
+    });
+  }
+}
+
+/**
+ * Checklist item 12. Records an issue for any reference carrying a path
+ * separator or a `.`/`..` traversal component, i.e. anything that could
+ * resolve outside `<packageRoot>/<rungName>/`.
+ *
+ * Deliberately ADDITIVE rather than short-circuiting: the caller still runs
+ * the pre-existing `resolveSafeStoragePath` + on-disk checks afterwards, so a
+ * reference escaping the package root entirely (`../../../../etc/passwd`)
+ * still also reports `PATH_OUTSIDE_PACKAGE_ROOT` exactly as before. This
+ * check's unique contribution is the case that guard cannot see — a
+ * reference that stays comfortably INSIDE the package root while pointing at
+ * another rendition's directory.
+ */
+function assertReferenceStaysInRung(
+  rungName: string,
+  uri: string,
+  issues: HlsPackageValidationIssue[],
+): void {
+  const isBareFilename =
+    !uri.includes('/') && !uri.includes('\\') && uri !== '.' && uri !== '..';
+
+  if (isBareFilename) {
+    return;
+  }
+
+  issues.push({
+    code: 'VARIANT_REFERENCE_ESCAPES_RUNG',
+    message: `Variant "${rungName}" references "${uri}", which is not a bare filename inside its own rendition directory`,
+  });
 }
 
 function parseVariantReferences(variantPlaylistText: string): {

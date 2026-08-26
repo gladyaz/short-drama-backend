@@ -65,6 +65,7 @@ async function buildValidPackage(
     [
       '#EXTM3U',
       '#EXT-X-VERSION:7',
+      '#EXT-X-TARGETDURATION:4',
       '#EXT-X-MAP:URI="init.mp4"',
       '#EXTINF:4.000000,',
       'seg_00000.m4s',
@@ -293,6 +294,7 @@ describe('HlsPackageValidator', () => {
       join(rungDir, 'index.m3u8'),
       [
         '#EXTM3U',
+        '#EXT-X-TARGETDURATION:4',
         '#EXT-X-MAP:URI="init.mp4"',
         '#EXTINF:4.0,',
         '../../../../etc/passwd',
@@ -327,6 +329,158 @@ describe('HlsPackageValidator', () => {
     expect(
       result.issues.some((i) => i.code === 'PATH_OUTSIDE_PACKAGE_ROOT'),
     ).toBe(true);
+  });
+
+  /**
+   * Checklist items 11-12. Every test below builds a package that passes
+   * EVERY OTHER check in the validator — real master, real init segment, real
+   * non-zero segments on disk, a probe that matches the claimed rung — and
+   * damages exactly one structural property. Before these checks existed each
+   * of these packages validated clean and would have reached
+   * `TranscodeIntentService.promoteIfCurrent`.
+   */
+  describe('variant playlist structural completeness', () => {
+    /** Rewrites the produced variant playlist, keeping every on-disk artifact intact. */
+    async function rewriteVariant(lines: string[]): Promise<void> {
+      await writeFile(
+        join(tempDir, '360p', 'index.m3u8'),
+        [...lines, ''].join('\n'),
+      );
+    }
+
+    const COMPLETE_VARIANT = [
+      '#EXTM3U',
+      '#EXT-X-VERSION:7',
+      '#EXT-X-TARGETDURATION:4',
+      '#EXT-X-MEDIA-SEQUENCE:0',
+      '#EXT-X-PLAYLIST-TYPE:VOD',
+      '#EXT-X-MAP:URI="init.mp4"',
+      '#EXTINF:4.000000,',
+      'seg_00000.m4s',
+      '#EXTINF:2.000000,',
+      'seg_00001.m4s',
+      '#EXT-X-ENDLIST',
+    ];
+
+    it('a complete VOD variant playlist still passes (control)', async () => {
+      const { artifact, masterText } = await buildValidPackage(tempDir);
+      await rewriteVariant(COMPLETE_VARIANT);
+
+      const result = await validator.validate(
+        tempDir,
+        ladder(),
+        [artifact],
+        6,
+        masterText,
+      );
+
+      expect(result.issues).toEqual([]);
+      expect(result.valid).toBe(true);
+    });
+
+    it('fails a VOD variant playlist truncated before #EXT-X-ENDLIST — players would treat a finished VOD as a live stream', async () => {
+      const { artifact, masterText } = await buildValidPackage(tempDir);
+      await rewriteVariant(
+        COMPLETE_VARIANT.filter((line) => line !== '#EXT-X-ENDLIST'),
+      );
+
+      const result = await validator.validate(
+        tempDir,
+        ladder(),
+        [artifact],
+        6,
+        masterText,
+      );
+
+      expect(result.valid).toBe(false);
+      expect(result.issues.map((i) => i.code)).toContain(
+        'VARIANT_MISSING_ENDLIST',
+      );
+    });
+
+    it('fails a variant playlist with no #EXT-X-TARGETDURATION (RFC 8216 §4.3.3.1)', async () => {
+      const { artifact, masterText } = await buildValidPackage(tempDir);
+      await rewriteVariant(
+        COMPLETE_VARIANT.filter(
+          (line) => !line.startsWith('#EXT-X-TARGETDURATION'),
+        ),
+      );
+
+      const result = await validator.validate(
+        tempDir,
+        ladder(),
+        [artifact],
+        6,
+        masterText,
+      );
+
+      expect(result.valid).toBe(false);
+      expect(result.issues.map((i) => i.code)).toContain(
+        'VARIANT_MISSING_TARGET_DURATION',
+      );
+    });
+
+    it('fails a variant playlist that does not open with #EXTM3U', async () => {
+      const { artifact, masterText } = await buildValidPackage(tempDir);
+      await rewriteVariant(COMPLETE_VARIANT.slice(1));
+
+      const result = await validator.validate(
+        tempDir,
+        ladder(),
+        [artifact],
+        6,
+        masterText,
+      );
+
+      expect(result.valid).toBe(false);
+      expect(result.issues.map((i) => i.code)).toContain(
+        'VARIANT_PLAYLIST_UNPARSEABLE',
+      );
+    });
+
+    it('fails a CROSS-RENDITION segment reference even though it resolves inside the package root and the file really exists', async () => {
+      const { artifact, masterText } = await buildValidPackage(tempDir);
+
+      // A genuine, non-zero 720p artifact — so every existence/size check the
+      // validator performs on this reference SUCCEEDS. Only the containment
+      // rule can tell that the 360p rung is pointing at 720p bytes.
+      const otherRungDir = join(tempDir, '720p');
+      await mkdir(otherRungDir, { recursive: true });
+      await writeFile(join(otherRungDir, 'seg_00000.m4s'), Buffer.alloc(500));
+
+      await rewriteVariant([
+        '#EXTM3U',
+        '#EXT-X-VERSION:7',
+        '#EXT-X-TARGETDURATION:4',
+        '#EXT-X-MAP:URI="init.mp4"',
+        '#EXTINF:4.000000,',
+        '../720p/seg_00000.m4s',
+        '#EXTINF:2.000000,',
+        'seg_00001.m4s',
+        '#EXT-X-ENDLIST',
+      ]);
+
+      const result = await validator.validate(
+        tempDir,
+        ladder(),
+        [artifact],
+        6,
+        masterText,
+      );
+
+      expect(result.valid).toBe(false);
+      expect(result.issues.map((i) => i.code)).toContain(
+        'VARIANT_REFERENCE_ESCAPES_RUNG',
+      );
+      // The pre-existing traversal guard cannot see this: the path resolves
+      // cleanly inside the package root, so it reports nothing.
+      expect(result.issues.map((i) => i.code)).not.toContain(
+        'PATH_OUTSIDE_PACKAGE_ROOT',
+      );
+      expect(result.issues.map((i) => i.code)).not.toContain(
+        'ARTIFACT_MISSING',
+      );
+    });
   });
 
   it('fails when the probed dimensions do not match the claimed rung dimensions', async () => {
@@ -375,6 +529,7 @@ describe('HlsPackageValidator', () => {
       join(rungDir, 'index.m3u8'),
       [
         '#EXTM3U',
+        '#EXT-X-TARGETDURATION:4',
         '#EXT-X-MAP:URI="init.mp4"',
         '#EXTINF:4.0,',
         'seg_00000.m4s',

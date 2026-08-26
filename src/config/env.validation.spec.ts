@@ -85,6 +85,11 @@ describe('validateEnv — DEV_TOOLS_ENABLED / NODE_ENV interaction (Phase 12, 12
       // so it uses a base URL that is valid under EVERY NODE_ENV, keeping the
       // one variable under test the only thing that decides the outcome.
       PUBLIC_BASE_URL: 'https://api.example.com',
+      // Same reasoning for CORS: VALID_CONFIG's http://localhost:8081 is a
+      // legitimate DEV origin that production rejects. Empty is valid under
+      // every NODE_ENV (and is the correct mobile-only answer), so it keeps
+      // NODE_ENV x DEV_TOOLS_ENABLED the only variables under test here.
+      CORS_ORIGINS: '',
     };
     if (nodeEnv !== undefined) {
       config.NODE_ENV = nodeEnv;
@@ -626,8 +631,10 @@ describe('validateEnv — PAYMENTS_ENABLED / MIDTRANS_* (MIDTRANS PAYMENT BACKEN
           MIDTRANS_SERVER_KEY: SECRET_VALUE,
           MIDTRANS_IS_PRODUCTION: 'true',
           // As in buildConfig above: production requires an https
-          // PUBLIC_BASE_URL. This test's subject is MIDTRANS_IS_PRODUCTION.
+          // PUBLIC_BASE_URL and rejects a dev CORS origin. This test's
+          // subject is MIDTRANS_IS_PRODUCTION.
           PUBLIC_BASE_URL: 'https://api.example.com',
+          CORS_ORIGINS: '',
         }),
       ).not.toThrow();
     });
@@ -716,41 +723,178 @@ describe('validateEnv — TRUST_PROXY_HOPS (production HTTPS readiness)', () => 
 });
 
 /**
- * PRODUCTION HTTPS READINESS: `PUBLIC_BASE_URL` must be https in production,
- * because it is stamped into every local-storage row's `playbackUrl` and an
- * http value fails on the device rather than at boot.
+ * The three unconditionally-required auth secrets must differ from one
+ * another. `.env.production.example` has always DOCUMENTED this ("Must be
+ * different from JWT_ACCESS_SECRET") and `HLS_TOKEN_SECRET` has always
+ * ENFORCED it against all three — but nothing enforced it among the three
+ * themselves, so one value pasted into all three lines booted cleanly.
  *
- * The negative-space tests matter as much as the positive ones: this check
- * must NOT fire for the LAN/localhost URLs local development and CI both use.
+ * Every value below is an obvious placeholder; no real secret appears here,
+ * and the assertions only ever match on variable NAMES.
  */
-describe('validateEnv — PUBLIC_BASE_URL https in production', () => {
+describe('validateEnv — the auth secrets must be distinct from each other', () => {
+  const SHARED = 'the-same-secret-in-two-places';
+
+  it('boots when all three secrets differ (the VALID_CONFIG baseline)', () => {
+    expect(() => validateEnv({ ...VALID_CONFIG })).not.toThrow();
+  });
+
+  it.each([
+    ['JWT_REFRESH_SECRET', 'JWT_ACCESS_SECRET'],
+    ['AUTH_AUDIT_IP_HASH_SECRET', 'JWT_ACCESS_SECRET'],
+    ['AUTH_AUDIT_IP_HASH_SECRET', 'JWT_REFRESH_SECRET'],
+  ])('REFUSES %s reused as %s', (offender, collidesWith) => {
+    expect(() =>
+      validateEnv({
+        ...VALID_CONFIG,
+        [collidesWith]: SHARED,
+        [offender]: SHARED,
+      }),
+    ).toThrow(
+      new RegExp(`Invalid ${offender}: must be DISTINCT from ${collidesWith}`),
+    );
+  });
+
+  it('REFUSES one value pasted into all three', () => {
+    expect(() =>
+      validateEnv({
+        ...VALID_CONFIG,
+        JWT_ACCESS_SECRET: SHARED,
+        JWT_REFRESH_SECRET: SHARED,
+        AUTH_AUDIT_IP_HASH_SECRET: SHARED,
+      }),
+    ).toThrow(/must be DISTINCT from/);
+  });
+
+  it('never echoes a secret value, only the two variable names', () => {
+    let message = '';
+    try {
+      validateEnv({
+        ...VALID_CONFIG,
+        JWT_ACCESS_SECRET: SHARED,
+        JWT_REFRESH_SECRET: SHARED,
+      });
+    } catch (error) {
+      message = (error as Error).message;
+    }
+
+    expect(message).toContain('JWT_REFRESH_SECRET');
+    expect(message).toContain('JWT_ACCESS_SECRET');
+    expect(message).not.toContain(SHARED);
+  });
+
+  it('applies in every environment, not only production — a dev machine with one shared secret is still wrong', () => {
+    for (const nodeEnv of ['development', 'test', undefined]) {
+      expect(() =>
+        validateEnv({
+          ...VALID_CONFIG,
+          NODE_ENV: nodeEnv,
+          JWT_ACCESS_SECRET: SHARED,
+          JWT_REFRESH_SECRET: SHARED,
+        }),
+      ).toThrow(/must be DISTINCT from/);
+    }
+  });
+});
+
+/**
+ * PRODUCTION HTTPS READINESS — the production network contract.
+ *
+ * Every variable exercised below becomes a URL the ANDROID CLIENT fetches.
+ * They all fail the same silent way when they are wrong: the API answers
+ * 200, `/health` is green, the mobile release preflight (which validates
+ * `EXPO_PUBLIC_API_BASE_URL`, not the URLs the API returns) passes, and
+ * playback simply never starts on a real device.
+ *
+ * The negative-space tests matter as much as the positive ones: none of
+ * these rules may fire for the LAN/localhost URLs that local development
+ * and CI both legitimately use.
+ *
+ * NO REAL VALUE APPEARS HERE. Every host is `example.com`/`.invalid` and
+ * every secret is an obvious placeholder.
+ */
+
+/** A minimal production-valid baseline: https public origin, deny-all CORS. */
+const PRODUCTION_CONFIG: Record<string, unknown> = {
+  ...VALID_CONFIG,
+  NODE_ENV: 'production',
+  PUBLIC_BASE_URL: 'https://api.example.com',
+  CORS_ORIGINS: '',
+};
+
+/**
+ * The shapes a developer machine produces, which must never survive a
+ * production boot for any client-facing URL. Reused across every variable
+ * below so a rule can never be enforced for one and forgotten for another.
+ */
+const UNSAFE_PRODUCTION_URLS: Array<{
+  label: string;
+  url: string;
+  expected: RegExp;
+}> = [
+  {
+    label: 'cleartext http',
+    url: 'http://api.example.com',
+    expected: /it must use https/,
+  },
+  {
+    label: 'https loopback name',
+    url: 'https://localhost:3000',
+    expected: /is a loopback address/,
+  },
+  {
+    label: 'https loopback address',
+    url: 'https://127.0.0.1:3000',
+    expected: /is a loopback address/,
+  },
+  {
+    label: 'http loopback',
+    url: 'http://localhost:3000',
+    expected: /it must use https/,
+  },
+  {
+    label: 'https LAN address',
+    url: 'https://192.168.110.144:3000',
+    expected: /private\/LAN address/,
+  },
+  {
+    label: 'https 10/8 address',
+    url: 'https://10.1.2.3:3000',
+    expected: /private\/LAN address/,
+  },
+  {
+    label: 'https mDNS .local',
+    url: 'https://glady-mac.local:3000',
+    expected: /private\/LAN address/,
+  },
+];
+
+/**
+ * Malformed values are rejected too, but the message depends on the
+ * variable: `OBJECT_STORAGE_ENDPOINT` and `HLS_GATEWAY_BASE_URL` each
+ * already had their own absolute-URL shape check from an earlier slice, and
+ * those run BEFORE the production block. Kept as a separate table so the
+ * tests assert what actually happens rather than assuming one message.
+ */
+const MALFORMED_URLS = ['api.example.com', ':::'];
+
+describe('validateEnv — PUBLIC_BASE_URL must be a public https origin in production', () => {
   it('accepts an https origin under NODE_ENV=production', () => {
-    expect(() =>
-      validateEnv({
-        ...VALID_CONFIG,
-        NODE_ENV: 'production',
-        PUBLIC_BASE_URL: 'https://api.example.com',
-      }),
-    ).not.toThrow();
+    expect(() => validateEnv({ ...PRODUCTION_CONFIG })).not.toThrow();
   });
 
-  it('REFUSES an http origin under NODE_ENV=production', () => {
-    expect(() =>
-      validateEnv({
-        ...VALID_CONFIG,
-        NODE_ENV: 'production',
-        PUBLIC_BASE_URL: 'http://api.example.com',
-      }),
-    ).toThrow(/it must use https/);
-  });
+  it.each(UNSAFE_PRODUCTION_URLS)(
+    'REFUSES $label ($url)',
+    ({ url, expected }) => {
+      expect(() =>
+        validateEnv({ ...PRODUCTION_CONFIG, PUBLIC_BASE_URL: url }),
+      ).toThrow(expected);
+    },
+  );
 
-  it('refuses a non-absolute value under NODE_ENV=production', () => {
+  it.each(MALFORMED_URLS)('REFUSES the malformed value %p', (url) => {
     expect(() =>
-      validateEnv({
-        ...VALID_CONFIG,
-        NODE_ENV: 'production',
-        PUBLIC_BASE_URL: 'api.example.com',
-      }),
+      validateEnv({ ...PRODUCTION_CONFIG, PUBLIC_BASE_URL: url }),
     ).toThrow(/must be an absolute URL/);
   });
 
@@ -774,10 +918,348 @@ describe('validateEnv — PUBLIC_BASE_URL https in production', () => {
   it('names the offending origin, which is public information, not a secret', () => {
     expect(() =>
       validateEnv({
-        ...VALID_CONFIG,
-        NODE_ENV: 'production',
+        ...PRODUCTION_CONFIG,
         PUBLIC_BASE_URL: 'http://api.example.com',
       }),
     ).toThrow(/"http:\/\/api\.example\.com"/);
+  });
+});
+
+/**
+ * `OBJECT_STORAGE_ENDPOINT` is the one that reads like internal
+ * infrastructure and is not: every presigned GET URL is SIGNED AGAINST IT,
+ * so its scheme and host become the `playbackUrl` of every R2-backed row
+ * and the `coverUrl` of every series. A MinIO-on-the-LAN endpoint in
+ * production produces `http://192.168.x.x:9000/...` playback URLs.
+ */
+describe('validateEnv — OBJECT_STORAGE_ENDPOINT must be a public https origin in production', () => {
+  const R2_PRODUCTION_CONFIG: Record<string, unknown> = {
+    ...PRODUCTION_CONFIG,
+    STORAGE_DRIVER: 'r2',
+    OBJECT_STORAGE_ENDPOINT: 'https://account.r2.cloudflarestorage.invalid',
+    OBJECT_STORAGE_REGION: 'auto',
+    OBJECT_STORAGE_BUCKET: 'test-bucket',
+    OBJECT_STORAGE_ACCESS_KEY_ID: 'test-access-key-id',
+    OBJECT_STORAGE_SECRET_ACCESS_KEY: 'test-secret-access-key',
+  };
+
+  it('accepts a public https endpoint under NODE_ENV=production', () => {
+    expect(() => validateEnv({ ...R2_PRODUCTION_CONFIG })).not.toThrow();
+  });
+
+  it.each(UNSAFE_PRODUCTION_URLS)(
+    'REFUSES $label ($url)',
+    ({ url, expected }) => {
+      expect(() =>
+        validateEnv({ ...R2_PRODUCTION_CONFIG, OBJECT_STORAGE_ENDPOINT: url }),
+      ).toThrow(expected);
+    },
+  );
+
+  it.each(MALFORMED_URLS)(
+    'REFUSES the malformed value %p via the pre-existing r2 shape check',
+    (url) => {
+      expect(() =>
+        validateEnv({ ...R2_PRODUCTION_CONFIG, OBJECT_STORAGE_ENDPOINT: url }),
+      ).toThrow(
+        /OBJECT_STORAGE_ENDPOINT must be a valid absolute http\(s\) URL/,
+      );
+    },
+  );
+
+  it('does not fire in local storage mode, where nothing is ever signed against it', () => {
+    expect(() =>
+      validateEnv({
+        ...PRODUCTION_CONFIG,
+        OBJECT_STORAGE_ENDPOINT: 'http://localhost:9000',
+      }),
+    ).not.toThrow();
+  });
+
+  it('does not fire outside production — a local MinIO endpoint stays usable in development', () => {
+    expect(() =>
+      validateEnv({
+        ...R2_PRODUCTION_CONFIG,
+        NODE_ENV: 'development',
+        PUBLIC_BASE_URL: 'http://localhost:3000',
+        CORS_ORIGINS: 'http://localhost:8081',
+        OBJECT_STORAGE_ENDPOINT: 'http://localhost:9000',
+      }),
+    ).not.toThrow();
+  });
+});
+
+/**
+ * `HLS_GATEWAY_BASE_URL` is stamped into `masterUrl` and every rendition
+ * URL of an HLS-ready row. Gated on `TRANSCODE_ENABLED=true`, mirroring
+ * `validateHlsGatewayConfig`'s own gate — while the flag is off (this
+ * repo's shipped default) the gateway is never consulted.
+ */
+describe('validateEnv — HLS_GATEWAY_BASE_URL must be a public https origin in production', () => {
+  const HLS_PRODUCTION_CONFIG: Record<string, unknown> = {
+    ...PRODUCTION_CONFIG,
+    TRANSCODE_ENABLED: 'true',
+    REDIS_URL: 'redis://redis.internal:6379',
+    HLS_TOKEN_SECRET: 'test-hls-token-secret-distinct-from-jwt',
+    HLS_GATEWAY_BASE_URL: 'https://hls.example.com',
+  };
+
+  it('accepts a public https gateway under NODE_ENV=production', () => {
+    expect(() => validateEnv({ ...HLS_PRODUCTION_CONFIG })).not.toThrow();
+  });
+
+  it.each(UNSAFE_PRODUCTION_URLS)(
+    'REFUSES $label ($url)',
+    ({ url, expected }) => {
+      expect(() =>
+        validateEnv({ ...HLS_PRODUCTION_CONFIG, HLS_GATEWAY_BASE_URL: url }),
+      ).toThrow(expected);
+    },
+  );
+
+  it.each(MALFORMED_URLS)(
+    'REFUSES the malformed value %p via the pre-existing TRANSCODE_ENABLED shape check',
+    (url) => {
+      expect(() =>
+        validateEnv({ ...HLS_PRODUCTION_CONFIG, HLS_GATEWAY_BASE_URL: url }),
+      ).toThrow(/HLS_GATEWAY_BASE_URL must be a valid absolute http\(s\) URL/);
+    },
+  );
+
+  it("does not fire while TRANSCODE_ENABLED is off, matching validateHlsGatewayConfig's own gate", () => {
+    expect(() =>
+      validateEnv({
+        ...PRODUCTION_CONFIG,
+        HLS_GATEWAY_BASE_URL: 'http://localhost:8787',
+      }),
+    ).not.toThrow();
+  });
+
+  it('does not fire outside production — a local wrangler dev gateway stays usable', () => {
+    expect(() =>
+      validateEnv({
+        ...HLS_PRODUCTION_CONFIG,
+        NODE_ENV: 'development',
+        PUBLIC_BASE_URL: 'http://localhost:3000',
+        CORS_ORIGINS: 'http://localhost:8081',
+        HLS_GATEWAY_BASE_URL: 'http://localhost:8787',
+      }),
+    ).not.toThrow();
+  });
+
+  /**
+   * INFRASTRUCTURE URLs MUST NOT BE CAUGHT BY THIS RULE. `REDIS_URL` and
+   * `DATABASE_URL` are consumed by this process and never handed to a
+   * client, and a platform's private hostname is exactly the shape the
+   * public-URL rules reject. A regression here would break every correct
+   * production deployment.
+   */
+  it('never applies the public-https rules to REDIS_URL or DATABASE_URL', () => {
+    expect(() =>
+      validateEnv({
+        ...HLS_PRODUCTION_CONFIG,
+        REDIS_URL: 'redis://10.0.0.5:6379',
+        DATABASE_URL: 'postgresql://user:pass@10.0.0.4:5432/db',
+      }),
+    ).not.toThrow();
+  });
+});
+
+/**
+ * `OBJECT_STORAGE_PUBLIC_BASE_URL` is optional in every mode (it has no
+ * production caller today — `StorageService.buildPublicUrl` is unused
+ * outside its own spec), so it is validated only WHEN SET.
+ */
+describe('validateEnv — OBJECT_STORAGE_PUBLIC_BASE_URL when set in production', () => {
+  it('accepts a public https media base', () => {
+    expect(() =>
+      validateEnv({
+        ...PRODUCTION_CONFIG,
+        OBJECT_STORAGE_PUBLIC_BASE_URL: 'https://media.example.com',
+      }),
+    ).not.toThrow();
+  });
+
+  it('REFUSES a cleartext media base', () => {
+    expect(() =>
+      validateEnv({
+        ...PRODUCTION_CONFIG,
+        OBJECT_STORAGE_PUBLIC_BASE_URL: 'http://media.example.com',
+      }),
+    ).toThrow(/it must use https/);
+  });
+
+  it('stays optional — an absent or blank value boots', () => {
+    expect(() => validateEnv({ ...PRODUCTION_CONFIG })).not.toThrow();
+    expect(() =>
+      validateEnv({ ...PRODUCTION_CONFIG, OBJECT_STORAGE_PUBLIC_BASE_URL: '' }),
+    ).not.toThrow();
+  });
+});
+
+/**
+ * CORS. Three separate defects are covered here — see `validateCorsOrigins`
+ * for the full rationale.
+ */
+describe('validateEnv — CORS_ORIGINS', () => {
+  describe('presence without requiring a value', () => {
+    /**
+     * REGRESSION GUARD for a real production blocker: `CORS_ORIGINS` used to
+     * live in `REQUIRED_KEYS`, whose loop rejects any FALSY value — so the
+     * EMPTY value that `.env.production.example` ships, and that
+     * `docs/PRODUCTION_DEPLOYMENT_REQUIREMENTS.md` documents as correct for
+     * a mobile-only V1, refused the boot with "Missing required environment
+     * variable". Following the shipped contract exactly produced a process
+     * that would not start.
+     */
+    it('accepts an EMPTY value — the documented deny-all answer for a mobile-only V1', () => {
+      expect(() =>
+        validateEnv({ ...VALID_CONFIG, CORS_ORIGINS: '' }),
+      ).not.toThrow();
+    });
+
+    it('accepts an empty value in production too', () => {
+      expect(() => validateEnv({ ...PRODUCTION_CONFIG })).not.toThrow();
+    });
+
+    it('still requires the variable to be DECLARED, so deny-all is a choice and not an omission', () => {
+      expect(() => validateEnv(omitKey(VALID_CONFIG, 'CORS_ORIGINS'))).toThrow(
+        /Missing required environment variable: CORS_ORIGINS/,
+      );
+    });
+
+    it('explains that empty is valid, so the fix is obvious from the message alone', () => {
+      expect(() => validateEnv(omitKey(VALID_CONFIG, 'CORS_ORIGINS'))).toThrow(
+        /EMPTY value is valid/,
+      );
+    });
+  });
+
+  describe('the "*" trap — rejected in EVERY environment', () => {
+    /**
+     * `configuration.ts` always parses this variable into an ARRAY, and the
+     * `cors` package compares array entries to the request Origin with
+     * `===`. Its wildcard branch only fires for the literal STRING `'*'`,
+     * which an array can never be — so `CORS_ORIGINS=*` allows an origin
+     * literally named `*`, i.e. nothing at all. It fails safe, but silently
+     * and in the opposite direction from what was intended.
+     */
+    it.each(['production', 'development', 'test', undefined])(
+      'refuses a bare "*" under NODE_ENV=%p',
+      (nodeEnv) => {
+        expect(() =>
+          validateEnv({
+            ...VALID_CONFIG,
+            NODE_ENV: nodeEnv,
+            CORS_ORIGINS: '*',
+          }),
+        ).toThrow(/does not allow every origin/);
+      },
+    );
+
+    it('refuses a "*" hidden among real origins', () => {
+      expect(() =>
+        validateEnv({
+          ...PRODUCTION_CONFIG,
+          CORS_ORIGINS: 'https://admin.example.com,*',
+        }),
+      ).toThrow(/does not allow every origin/);
+    });
+  });
+
+  describe('production origin shape', () => {
+    it('accepts exact https origins, with and without a port', () => {
+      expect(() =>
+        validateEnv({
+          ...PRODUCTION_CONFIG,
+          CORS_ORIGINS:
+            'https://admin.example.com,https://ops.example.com:8443',
+        }),
+      ).not.toThrow();
+    });
+
+    it('REFUSES a cleartext origin', () => {
+      expect(() =>
+        validateEnv({
+          ...PRODUCTION_CONFIG,
+          CORS_ORIGINS: 'http://admin.example.com',
+        }),
+      ).toThrow(/must use https/);
+    });
+
+    it.each([
+      'https://localhost:5173',
+      'https://127.0.0.1:5173',
+      'https://192.168.1.39:8082',
+      'https://glady-mac.local:5173',
+    ])('REFUSES the leftover development origin %s', (origin) => {
+      expect(() =>
+        validateEnv({ ...PRODUCTION_CONFIG, CORS_ORIGINS: origin }),
+      ).toThrow(/loopback\/LAN host/);
+    });
+
+    /**
+     * A browser's `Origin` header is always exactly `scheme://host[:port]`.
+     * A trailing slash — the shape a person copies out of an address bar —
+     * silently matches nothing, so the API looks broken rather than
+     * misconfigured.
+     */
+    it.each([
+      'https://admin.example.com/',
+      'https://admin.example.com/admin',
+      'https://admin.example.com?x=1',
+      'https://admin.example.com#frag',
+    ])('REFUSES %s, which would silently match no browser Origin', (origin) => {
+      expect(() =>
+        validateEnv({ ...PRODUCTION_CONFIG, CORS_ORIGINS: origin }),
+      ).toThrow(/bare origin with no path, query, fragment or trailing slash/);
+    });
+
+    it('suggests the corrected origin in the error', () => {
+      expect(() =>
+        validateEnv({
+          ...PRODUCTION_CONFIG,
+          CORS_ORIGINS: 'https://admin.example.com/',
+        }),
+      ).toThrow(/"https:\/\/admin\.example\.com"/);
+    });
+
+    it('does not fire outside production — dev keeps its localhost origins', () => {
+      expect(() =>
+        validateEnv({
+          ...VALID_CONFIG,
+          CORS_ORIGINS: 'http://localhost:8082,http://192.168.1.39:8082',
+        }),
+      ).not.toThrow();
+    });
+  });
+});
+
+/**
+ * ORDERING. `validateEnv` runs the production URL/CORS block LAST, so a
+ * config that is wrong in several ways reports the SECURITY problem first.
+ * The existing comment at the call site records why: an earlier version
+ * reported a bad base URL and hid a privilege-escalation misconfiguration
+ * sitting in the same file.
+ */
+describe('validateEnv — production check ordering', () => {
+  it('reports DEV_TOOLS_ENABLED before a cleartext PUBLIC_BASE_URL', () => {
+    expect(() =>
+      validateEnv({
+        ...PRODUCTION_CONFIG,
+        DEV_TOOLS_ENABLED: 'true',
+        PUBLIC_BASE_URL: 'http://api.example.com',
+      }),
+    ).toThrow(/Refusing to boot with DEV_TOOLS_ENABLED=true/);
+  });
+
+  it('reports a cleartext PUBLIC_BASE_URL before a leftover development CORS origin', () => {
+    expect(() =>
+      validateEnv({
+        ...PRODUCTION_CONFIG,
+        PUBLIC_BASE_URL: 'http://api.example.com',
+        CORS_ORIGINS: 'http://localhost:5173',
+      }),
+    ).toThrow(/PUBLIC_BASE_URL/);
   });
 });

@@ -10,6 +10,8 @@
  * (which validates the API BASE url, not the media URLs the API returns).
  */
 
+import { isLoopbackHostname, isPrivateHostname } from '../net/public-host';
+
 /** Why a playback URL is not usable from a phone on the public internet. */
 export type PlaybackUrlRejection =
   | 'missing'
@@ -23,36 +25,6 @@ export interface PlaybackUrlVerdict {
   ok: boolean;
   rejection: PlaybackUrlRejection | null;
   detail: string;
-}
-
-const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
-
-/**
- * RFC1918 private ranges plus RFC3927 link-local (169.254/16) and the
- * carrier-grade NAT range (100.64/10). `.local` mDNS names are caught too:
- * a Mac advertises itself that way, and `http://something.local:3000` is
- * exactly the shape a developer machine produces.
- */
-function isPrivateHost(hostname: string): boolean {
-  const host = hostname.toLowerCase();
-
-  if (host.endsWith('.local')) {
-    return true;
-  }
-
-  const octets = host.split('.');
-  if (octets.length !== 4 || !octets.every((o) => /^\d{1,3}$/.test(o))) {
-    return false;
-  }
-
-  const [a, b] = octets.map(Number);
-  if (a === 10) return true;
-  if (a === 192 && b === 168) return true;
-  if (a === 172 && b >= 16 && b <= 31) return true;
-  if (a === 169 && b === 254) return true;
-  if (a === 100 && b >= 64 && b <= 127) return true;
-
-  return false;
 }
 
 /**
@@ -101,7 +73,7 @@ export function judgePlaybackUrl(
     };
   }
 
-  if (LOOPBACK_HOSTS.has(parsed.hostname.toLowerCase())) {
+  if (isLoopbackHostname(parsed.hostname)) {
     return {
       ok: false,
       rejection: 'loopback_host',
@@ -109,7 +81,7 @@ export function judgePlaybackUrl(
     };
   }
 
-  if (isPrivateHost(parsed.hostname)) {
+  if (isPrivateHostname(parsed.hostname)) {
     return {
       ok: false,
       rejection: 'private_lan_host',

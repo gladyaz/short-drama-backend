@@ -249,12 +249,90 @@ describe('computeRenditionLadder', () => {
       // Landscape stays landscape (never rotated/cropped into portrait).
       expect(rung.width).toBeGreaterThan(rung.height);
       // Aspect preserved within one even-floor rounding step.
-      expect(Math.abs(rung.width / rung.height - sourceAspect)).toBeLessThan(0.02);
+      expect(Math.abs(rung.width / rung.height - sourceAspect)).toBeLessThan(
+        0.02,
+      );
       expect(rung.width % 2).toBe(0);
       expect(rung.height % 2).toBe(0);
       // Never upscaled beyond the source.
       expect(rung.width).toBeLessThanOrEqual(1280);
       expect(rung.height).toBeLessThanOrEqual(720);
+    }
+  });
+
+  // ABOVE-1080p CAPPING. Every dimension test above uses a source at or below
+  // 1080 on its short side, so the ladder's behavior for a source LARGER than
+  // the top tier was asserted only indirectly (by the generic
+  // "at least one rung" case, which checks nothing about capping). A 4K
+  // master is not hypothetical for a future upload path, and the failure mode
+  // if capping ever broke — emitting a 2160p rung the frozen ladder table has
+  // no bitrate/profile/level for — would be silent.
+  describe('a source larger than the top tier is capped at 1080p', () => {
+    it('a 2160x3840 portrait (4K) source produces exactly the 4 standard rungs, topping out at 1080x1920', () => {
+      const result = computeRenditionLadder(
+        probe({ width: 2160, height: 3840 }),
+      );
+
+      expect(names(result.rungs)).toEqual(['360p', '540p', '720p', '1080p']);
+      expect(result.rungs).toHaveLength(4);
+      expect(result.rungs[3]).toMatchObject({ width: 1080, height: 1920 });
+      // Nothing above the frozen table's top tier is ever synthesized.
+      expect(result.rungs.some((r) => Math.min(r.width, r.height) > 1080)).toBe(
+        false,
+      );
+    });
+
+    it('a 3840x2160 landscape (4K) source caps identically, at 1920x1080', () => {
+      const result = computeRenditionLadder(
+        probe({ width: 3840, height: 2160 }),
+      );
+
+      expect(names(result.rungs)).toEqual(['360p', '540p', '720p', '1080p']);
+      expect(result.rungs[3]).toMatchObject({ width: 1920, height: 1080 });
+      expect(result.rungs.some((r) => Math.min(r.width, r.height) > 1080)).toBe(
+        false,
+      );
+    });
+
+    it('a rotated 4K source is capped on its EFFECTIVE (post-rotation) short side', () => {
+      const result = computeRenditionLadder(
+        probe({ width: 3840, height: 2160, rotation: 90 }),
+      );
+
+      expect(result.effectiveWidth).toBe(2160);
+      expect(result.effectiveHeight).toBe(3840);
+      expect(names(result.rungs)).toEqual(['360p', '540p', '720p', '1080p']);
+      expect(result.rungs[3]).toMatchObject({ width: 1080, height: 1920 });
+    });
+  });
+
+  // ENCODER-SAFE EVEN DIMENSIONS on the STANDARD tiers. The two existing
+  // odd-dimension tests both exercise the DEGENERATE sub-360p branch
+  // (`buildDegenerateRung`); `buildStandardRung`'s own even-flooring — the
+  // branch every real catalog episode goes through — had no direct assertion.
+  // libx264 with yuv420p cannot encode an odd width or height at all, so a
+  // regression here is a hard ffmpeg failure on real media, not a subtle one.
+  it('every standard-tier rung has EVEN width and height for awkward odd source dimensions', () => {
+    const oddSources = [
+      { width: 1081, height: 1921 },
+      { width: 1079, height: 1919 },
+      { width: 1237, height: 2199 },
+      { width: 2161, height: 3841 },
+      { width: 1921, height: 1081 },
+      { width: 1279, height: 719 },
+    ];
+
+    for (const source of oddSources) {
+      const result = computeRenditionLadder(probe(source));
+
+      expect(result.rungs.length).toBeGreaterThanOrEqual(1);
+      for (const rung of result.rungs) {
+        expect(rung.width % 2).toBe(0);
+        expect(rung.height % 2).toBe(0);
+        // Even-flooring must never round UP past the source (no upscale).
+        expect(rung.width).toBeLessThanOrEqual(source.width);
+        expect(rung.height).toBeLessThanOrEqual(source.height);
+      }
     }
   });
 

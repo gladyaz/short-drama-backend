@@ -831,6 +831,69 @@ describe('VideosService', () => {
       }
     });
 
+    /**
+     * The FOUR-rung contract. Every other test in this block uses a
+     * three-rung (360p/540p/720p) fixture, so the shape a 1080p-capable
+     * source actually produces — the one the mobile client's "1080p HD"
+     * manual-quality entry binds to — had no assertion anywhere in the
+     * backend. `computeRenditionLadder` emitting a 1080p rung
+     * (`rendition-ladder.spec.ts`) and the real pipeline producing a 1080p
+     * variant playlist are both proven independently; this pins the third
+     * link, that a persisted four-rung `hlsRenditions` survives
+     * `parseHlsRenditions` intact and reaches the client as a fourth
+     * addressable rendition covered by the SAME single token.
+     */
+    it('a four-rung generated asset yields all four renditions (360p/540p/720p/1080p), each addressable by the one master token', async () => {
+      const FOUR_RUNG_RENDITIONS = [
+        ...HLS_RENDITIONS,
+        { name: '1080p', width: 1080, height: 1920, bandwidth: 6_400_800 },
+      ];
+
+      await prisma.video.update({
+        where: { id: testVideos[0].id },
+        data: {
+          processingState: 'ready',
+          hlsMasterKey: HLS_MASTER_KEY,
+          hlsRenditions: FOUR_RUNG_RENDITIONS,
+        },
+      });
+
+      const result = (await service.getPlaybackUrl(
+        testVideos[0].id,
+      )) as import('./video.types').HlsPlaybackResponseDto;
+
+      expect(result.type).toBe('hls');
+      expect(result.renditions).toHaveLength(4);
+      expect(result.renditions.map((r) => r.quality)).toEqual([
+        '360p',
+        '540p',
+        '720p',
+        '1080p',
+      ]);
+
+      // The 1080p rung carries its real portrait dimensions through, not a
+      // truncated/defaulted pair.
+      expect(result.renditions[3]).toMatchObject({
+        quality: '1080p',
+        width: 1080,
+        height: 1920,
+      });
+
+      // ONE token covers the master and all four variant playlists — a
+      // client never needs a second authorization to switch rungs, and the
+      // 1080p rung is not accidentally issued a distinct (or absent) token.
+      const masterToken = result.masterUrl.split('/t/')[1].split('/')[0];
+      expect(masterToken.length).toBeGreaterThan(0);
+      for (const rendition of result.renditions) {
+        expect(rendition.url).toBe(
+          `${TEST_HLS_GATEWAY_CONFIG.baseUrl}/t/${masterToken}/${rendition.quality}/index.m3u8`,
+        );
+      }
+
+      // Expiry is a single value governing that one token, in the future.
+      expect(Date.parse(result.expiresAt)).toBeGreaterThan(Date.now());
+    });
+
     it('mints via mintHlsToken with the exact derived prefix, mediaId, and configured ttl/secret — proving the token is content/version-bound to THIS row', async () => {
       const mintSpy = jest.spyOn(hlsPlaybackTokenUtil, 'mintHlsToken');
 

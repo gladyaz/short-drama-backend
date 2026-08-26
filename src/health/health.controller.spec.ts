@@ -1,5 +1,7 @@
+import { HttpStatus } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Test, TestingModule } from '@nestjs/testing';
+import type { Response } from 'express';
 import { PrismaService } from '../prisma/prisma.service';
 import { HealthController } from './health.controller';
 import { StorageReadinessService } from './storage-readiness.service';
@@ -61,6 +63,93 @@ describe('HealthController', () => {
     expect(controller.getHealth()).toEqual({
       status: 'ok',
       service: 'short-drama-backend',
+    });
+  });
+
+  /**
+   * PRODUCTION HTTPS READINESS: `GET /health/ready` is the only
+   * production-reachable probe that proves a dependency, since
+   * `/health/details` is behind `DevToolsGuard` and `env.validation.ts`
+   * refuses to boot with dev tools enabled in production.
+   */
+  describe('GET /health/ready (readiness)', () => {
+    /** Minimal Express `Response` double — only `status` is used by the handler. */
+    function createResponse(): { res: Response; status: jest.Mock } {
+      const status = jest.fn();
+      return { res: { status } as unknown as Response, status };
+    }
+
+    it('answers 200 ready when the database probe succeeds', async () => {
+      const { res, status } = createResponse();
+
+      const body = await controller.getReadiness(res);
+
+      expect(body).toEqual({ status: 'ready', database: 'ok' });
+      expect(status).toHaveBeenCalledWith(HttpStatus.OK);
+    });
+
+    it('answers 503 not_ready when the database is unreachable', async () => {
+      queryRaw.mockRejectedValueOnce(new Error('connection refused'));
+      const { res, status } = createResponse();
+
+      const body = await controller.getReadiness(res);
+
+      expect(body).toEqual({ status: 'not_ready', database: 'unreachable' });
+      expect(status).toHaveBeenCalledWith(HttpStatus.SERVICE_UNAVAILABLE);
+    });
+
+    it('does not throw on a database failure — a probe must answer, not 500', async () => {
+      queryRaw.mockRejectedValueOnce(new Error('connection refused'));
+      const { res } = createResponse();
+
+      await expect(controller.getReadiness(res)).resolves.toBeDefined();
+    });
+
+    /**
+     * The body is reachable by anyone who can reach the API, so it must
+     * stay a closed two-field shape: no hostname, no connection string, no
+     * driver name, no error text, no stack. This asserts the WHOLE object,
+     * so any field added later has to be a deliberate decision here.
+     */
+    it('leaks nothing about the deployment when the database fails', async () => {
+      queryRaw.mockRejectedValueOnce(
+        new Error(
+          "Can't reach database server at db-prod-1.internal:5432 as user app_rw",
+        ),
+      );
+      const { res } = createResponse();
+
+      const body = await controller.getReadiness(res);
+
+      expect(Object.keys(body).sort()).toEqual(['database', 'status']);
+      const serialized = JSON.stringify(body);
+      expect(serialized).not.toMatch(/internal/);
+      expect(serialized).not.toMatch(/5432/);
+      expect(serialized).not.toMatch(/app_rw/);
+    });
+
+    /**
+     * LIVENESS MUST STAY DEPENDENCY-FREE. A liveness probe that fails on a
+     * database outage tells the platform to RESTART the container, which
+     * cannot fix the database and converts a recoverable outage into a
+     * crash loop.
+     */
+    it('leaves GET /health answering 200 while the database is down', () => {
+      queryRaw.mockRejectedValue(new Error('connection refused'));
+
+      expect(controller.getHealth()).toEqual({
+        status: 'ok',
+        service: 'short-drama-backend',
+      });
+      expect(queryRaw).not.toHaveBeenCalled();
+    });
+
+    it('runs exactly one cheap probe query per request', async () => {
+      const { res } = createResponse();
+
+      await controller.getReadiness(res);
+
+      expect(queryRaw).toHaveBeenCalledTimes(1);
     });
   });
 

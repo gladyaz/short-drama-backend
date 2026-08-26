@@ -1,5 +1,9 @@
 import { existsSync, statSync } from 'fs';
 import {
+  isLoopbackHostname,
+  isPrivateHostname,
+} from '../common/net/public-host';
+import {
   CONTENT_ACCESS_MODES,
   ContentAccessMode,
   DEFAULT_CONTENT_ACCESS_MODE,
@@ -12,7 +16,11 @@ const REQUIRED_KEYS = [
   'PORT',
   'PUBLIC_BASE_URL',
   'STORAGE_ROOT',
-  'CORS_ORIGINS',
+  // `CORS_ORIGINS` is deliberately NOT in this list — see
+  // `validateCorsOrigins`. This loop rejects any FALSY value, and an empty
+  // string is the correct, documented deny-all answer for a mobile-only
+  // deployment, so requiring it here made the shipped
+  // `.env.production.example` (which sets `CORS_ORIGINS=`) unbootable.
   'DATABASE_URL',
   'JWT_ACCESS_SECRET',
   'JWT_REFRESH_SECRET',
@@ -81,7 +89,11 @@ export function validateEnv(
     );
   }
 
+  validateAuthSecretDistinctness(config);
+
   validateStorageDriver(config);
+
+  validateCorsOrigins(config);
 
   validateTrustProxyHops(config);
 
@@ -99,7 +111,87 @@ export function validateEnv(
 
   validateContentAccessMode(config);
 
+  // DELIBERATELY LAST. This check fires only under NODE_ENV=production, which
+  // is exactly the condition several guards above also key on
+  // (`validateDevToolsNodeEnv`, `validatePaymentsConfig`). Running it earlier
+  // made it PREEMPT them: a config with both DEV_TOOLS_ENABLED=true and an
+  // http base URL reported the base URL and hid the privilege-escalation
+  // problem. A security guard must always be the error an operator sees first.
+  //
+  // INTEGRATION NOTE: `validateContentAccessMode` (the V1 free-catalog policy)
+  // is deliberately placed ABOVE this block rather than below it. It is an
+  // unconditional, environment-independent shape check like every other
+  // validator in the group above, so it belongs with them — and putting it
+  // after this block would have made a malformed CONTENT_ACCESS_MODE hide a
+  // cleartext production URL, re-opening exactly the preemption problem this
+  // comment records.
+  validateProductionPublicUrls(config);
+
   return config;
+}
+
+/**
+ * The three unconditionally-required auth secrets must all be DIFFERENT
+ * from each other.
+ *
+ * WHY THIS WAS MISSING AND WHY IT MATTERS. `.env.production.example` has
+ * always told the operator "Must be different from JWT_ACCESS_SECRET", and
+ * `validateHlsGatewayConfig` already enforces exactly this rule for
+ * `HLS_TOKEN_SECRET` against all three — but nothing enforced it *among*
+ * the three themselves, so the documented requirement was honor-system
+ * only. A single generated value pasted into all three lines boots cleanly
+ * today.
+ *
+ * The consequence is blast radius, not immediate token confusion: refresh
+ * tokens here are opaque random bytes (`randomBytes`), not JWTs, and
+ * `jwtRefreshSecret` is used as an HMAC key to hash them at rest — as it
+ * also is for password-reset tokens (`auth.constants.ts`) and the WhatsApp
+ * OTP hash (`whatsapp-otp.service.ts`). So an access token cannot be
+ * replayed as a refresh token. What collapses is separation: one leaked
+ * value would let an attacker forge access tokens AND compute the stored
+ * hash of any refresh/reset/OTP token AND correlate every `ipHash` — and
+ * rotating it to close one of those would sign out every session and break
+ * every audit correlation at the same time. That separation is the exact
+ * rationale `AuthConfig.authAuditIpHashSecret` records for existing as its
+ * own variable, so leaving it unenforced contradicted the design.
+ *
+ * NEVER LOGS A VALUE — only ever names the two variables that collided,
+ * matching `validateHlsGatewayConfig`'s established message shape.
+ */
+const DISTINCT_AUTH_SECRET_KEYS = [
+  'JWT_ACCESS_SECRET',
+  'JWT_REFRESH_SECRET',
+  'AUTH_AUDIT_IP_HASH_SECRET',
+] as const;
+
+function validateAuthSecretDistinctness(config: Record<string, unknown>): void {
+  for (let i = 0; i < DISTINCT_AUTH_SECRET_KEYS.length; i += 1) {
+    for (let j = i + 1; j < DISTINCT_AUTH_SECRET_KEYS.length; j += 1) {
+      const firstKey = DISTINCT_AUTH_SECRET_KEYS[i];
+      const secondKey = DISTINCT_AUTH_SECRET_KEYS[j];
+
+      // Read into separate locals BEFORE any truthiness narrowing, for the
+      // same `no-base-to-string` reason `validateTranscodeConfig` documents.
+      const first = config[firstKey];
+      const second = config[secondKey];
+
+      if (typeof first !== 'string' || typeof second !== 'string') {
+        continue; // absence is already reported by REQUIRED_KEYS above.
+      }
+
+      if (first === second) {
+        throw new Error(
+          `Invalid ${secondKey}: must be DISTINCT from ${firstKey}. ` +
+            'Generate each secret independently (openssl rand -base64 48). ' +
+            'Sharing one value means a single leak forges access tokens, ' +
+            'computes the stored hash of every refresh/reset/OTP token, and ' +
+            'de-anonymises every ipHash at once — and rotating it to fix any ' +
+            'one of those breaks the other two. Values are never logged — ' +
+            'only variable names are compared.',
+        );
+      }
+    }
+  }
 }
 
 /**
@@ -145,6 +237,316 @@ function validateRewardsConfig(config: Record<string, unknown>): void {
     throw new Error(
       `REWARDS_TIMEZONE is not a valid IANA timezone: "${timezone}". ` +
         'Use a zone name such as "Asia/Jakarta", or unset it to use the default.',
+    );
+  }
+}
+
+/**
+ * PRODUCTION HTTPS READINESS: every configured value that becomes a URL the
+ * ANDROID CLIENT must fetch has to be a public https origin in production.
+ *
+ * WHY ONE RULE ACROSS SEVERAL VARIABLES. These are not four cosmetic
+ * settings; each one is stamped verbatim into a response the phone then
+ * tries to load, and each fails the same silent way — the API answers 200,
+ * `npm run smoke:production` is the only thing that would notice, and
+ * playback simply never starts on a device:
+ *
+ *  - `PUBLIC_BASE_URL`      -> `playbackUrl` of every LOCAL-storage row
+ *                              (`VideosService.getPlaybackUrl`,
+ *                              `toVideoResponseDto`).
+ *  - `OBJECT_STORAGE_ENDPOINT` -> the ORIGIN of every presigned GET URL, i.e.
+ *                              `playbackUrl` for every R2-backed row AND the
+ *                              `coverUrl` of every series. This one is easy
+ *                              to miss because it reads like an internal
+ *                              infrastructure endpoint, and it is not: the
+ *                              AWS SDK signs a URL against it and that URL is
+ *                              handed straight to the client.
+ *  - `HLS_GATEWAY_BASE_URL` -> `masterUrl` and every rendition URL of an
+ *                              HLS-ready row (`tryBuildHlsPlaybackResponse`).
+ *  - `OBJECT_STORAGE_PUBLIC_BASE_URL` -> `StorageService.buildPublicUrl`.
+ *                              Has no production caller today, so it is
+ *                              checked only WHEN SET rather than required —
+ *                              but if a deployment does set it, a cleartext
+ *                              or LAN value is still wrong.
+ *
+ * `DATABASE_URL` and `REDIS_URL` are deliberately ABSENT from this list.
+ * They are genuine internal infrastructure — nothing hands them to a client
+ * — and a platform's private Postgres/Redis hostname is frequently exactly
+ * the kind of internal address the rules below reject. Forcing them through
+ * this check would break correct deployments for no security gain.
+ *
+ * GATED ON `NODE_ENV === 'production'`, and deliberately the OPPOSITE
+ * polarity to `validateDevToolsNodeEnv`'s allowlist. That guard asks "is
+ * this definitely a dev environment?" and treats an unrecognized `NODE_ENV`
+ * as unsafe. This one asks "is this definitely production?" and treats an
+ * unrecognized value as NOT production — the safe direction here, because
+ * the rule must not fire on the LAN URL every developer and CI run
+ * legitimately uses (`http://YOUR_MAC_IP:3000`, `http://localhost:3000`).
+ * A deployment that forgets `NODE_ENV=production` loses this check, but it
+ * also loses the dev-tools and Midtrans guards, which is why that variable
+ * is listed as mandatory in `.env.production.example`.
+ */
+function validateProductionPublicUrls(config: Record<string, unknown>): void {
+  if (config.NODE_ENV !== 'production') {
+    return;
+  }
+
+  assertProductionPublicUrl(config.PUBLIC_BASE_URL, {
+    key: 'PUBLIC_BASE_URL',
+    consequence:
+      'This value is stamped into the playbackUrl of every local-storage video row.',
+  });
+
+  // Only meaningful in r2 mode — in `local` mode no S3 client is ever used
+  // to sign anything, so an unset/placeholder endpoint is harmless.
+  if (resolveConfiguredStorageDriver(config) === 'r2') {
+    assertProductionPublicUrl(config.OBJECT_STORAGE_ENDPOINT, {
+      key: 'OBJECT_STORAGE_ENDPOINT',
+      consequence:
+        'Every presigned GET URL is signed against this origin, so it becomes the ' +
+        'playbackUrl of every R2-backed row and the coverUrl of every series.',
+    });
+  }
+
+  // Mirrors `validateHlsGatewayConfig`'s flag gate exactly: while
+  // `TRANSCODE_ENABLED` is not the literal string "true" (this repo's
+  // shipped default) the gateway is never consulted and the variable is not
+  // required to be set at all.
+  if (config.TRANSCODE_ENABLED === 'true') {
+    assertProductionPublicUrl(config.HLS_GATEWAY_BASE_URL, {
+      key: 'HLS_GATEWAY_BASE_URL',
+      consequence:
+        'It is stamped into the masterUrl and every rendition URL of an HLS-ready row.',
+    });
+  }
+
+  // OPTIONAL in every mode (see `REQUIRED_R2_KEYS`) — validated only when a
+  // deployment has actually set it.
+  if (isNonBlankString(config.OBJECT_STORAGE_PUBLIC_BASE_URL)) {
+    assertProductionPublicUrl(config.OBJECT_STORAGE_PUBLIC_BASE_URL, {
+      key: 'OBJECT_STORAGE_PUBLIC_BASE_URL',
+      consequence:
+        'StorageService.buildPublicUrl assembles client-facing object URLs from it.',
+    });
+  }
+
+  // LAST WITHIN THIS BLOCK. Every rule above concerns a URL the app HANDS
+  // OUT and without which nothing plays; a stale browser origin in the
+  // allowlist is a real problem but never the one to report first.
+  validateProductionCorsOrigins(config);
+}
+
+interface ProductionPublicUrlRule {
+  key: string;
+  /** What this particular variable breaks. Appended to the error so the message is actionable, not generic. */
+  consequence: string;
+}
+
+/**
+ * The four checks, ordered most-fundamental-first so the reported reason is
+ * the one an operator should act on: an unparseable string is not "not
+ * https", and an http URL is not "a LAN address".
+ *
+ * THE VALUE IS ECHOED, deliberately, unlike every secret-bearing validator
+ * in this file. A public base URL is not a secret — it is the origin about
+ * to be published in a store listing — and naming it is what makes the
+ * failure obvious at a glance.
+ */
+function assertProductionPublicUrl(
+  raw: unknown,
+  { key, consequence }: ProductionPublicUrlRule,
+): void {
+  if (typeof raw !== 'string') {
+    throw new Error(
+      `Invalid ${key}: must be an absolute https URL when NODE_ENV=production. ` +
+        consequence,
+    );
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error(
+      `Invalid ${key}=${JSON.stringify(raw)}: must be an absolute URL ` +
+        '(for example https://api.example.com) when NODE_ENV=production.',
+    );
+  }
+
+  if (parsed.protocol !== 'https:') {
+    throw new Error(
+      `Refusing to boot with NODE_ENV=production and ${key}=${JSON.stringify(raw)}: ` +
+        `it must use https. ${consequence} Android 9+ refuses cleartext, so an ` +
+        'http:// value produces an API that answers 200 while nothing can play.',
+    );
+  }
+
+  if (isLoopbackHostname(parsed.hostname)) {
+    throw new Error(
+      `Refusing to boot with NODE_ENV=production and ${key}=${JSON.stringify(raw)}: ` +
+        `"${parsed.hostname}" is a loopback address. On a phone it resolves to the ` +
+        `phone itself, never to this server. ${consequence}`,
+    );
+  }
+
+  if (isPrivateHostname(parsed.hostname)) {
+    throw new Error(
+      `Refusing to boot with NODE_ENV=production and ${key}=${JSON.stringify(raw)}: ` +
+        `"${parsed.hostname}" is a private/LAN address, unreachable from the public ` +
+        `internet — it works on the office wifi and nowhere else. ${consequence}`,
+    );
+  }
+}
+
+function isNonBlankString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+/**
+ * PRODUCTION HTTPS READINESS / CORS. Two independent problems, one
+ * validator.
+ *
+ * 1. PRESENCE, WITHOUT REQUIRING A VALUE. `CORS_ORIGINS` used to sit in
+ *    `REQUIRED_KEYS`, whose loop rejects any FALSY value — so an EMPTY
+ *    value failed the boot with "Missing required environment variable".
+ *    But empty is the CORRECT answer for this product: V1 is a mobile-only
+ *    Android client, which is not a browser, sends no `Origin` header, and
+ *    is completely unaffected by CORS. Deny-all is the intended posture and
+ *    an empty list is the only way to express it. The shipped
+ *    `.env.production.example` sets `CORS_ORIGINS=` and
+ *    `docs/PRODUCTION_DEPLOYMENT_REQUIREMENTS.md` documents empty as valid,
+ *    so the old rule made a release owner following the contract exactly end
+ *    up with a process that would not start. The variable must still be
+ *    DECLARED — an operator should choose deny-all, not forget the line.
+ *
+ * 2. THE `*` TRAP, checked in EVERY environment, not just production.
+ *    `configuration.ts` always parses this variable into an ARRAY, and Nest
+ *    hands that array to the `cors` package, which compares each entry to
+ *    the request's `Origin` with `===`. Its wildcard branch only triggers
+ *    for the literal STRING `'*'`, which an array can never be. So
+ *    `CORS_ORIGINS=*` does not mean "allow everything" — it means "allow an
+ *    origin whose name is exactly `*`", i.e. nothing at all. It fails safe,
+ *    but silently and in the opposite direction from what whoever typed it
+ *    intended, so it is never what anyone wants in any environment.
+ *
+ * 3. PRODUCTION ORIGIN SHAPE. Only under `NODE_ENV=production`, each entry
+ *    must be a bare https origin. The trailing-slash rule is not pedantry:
+ *    a browser's `Origin` header is always exactly `scheme://host[:port]`
+ *    with no path, so `https://admin.example.com/` — the shape a person
+ *    naturally copies out of a browser address bar — silently matches
+ *    nothing and looks like a broken API rather than a config typo.
+ */
+function validateCorsOrigins(config: Record<string, unknown>): void {
+  if (!('CORS_ORIGINS' in config)) {
+    throw new Error(
+      'Missing required environment variable: CORS_ORIGINS. It must be ' +
+        'DECLARED, but an EMPTY value is valid and is the right answer for a ' +
+        'mobile-only deployment (the Android app is not a browser and sends no ' +
+        'Origin header). Set `CORS_ORIGINS=` to allow no browser origin at all, ' +
+        'or a comma-separated list of exact origins for a web admin.',
+    );
+  }
+
+  const raw = config.CORS_ORIGINS;
+
+  if (typeof raw !== 'string') {
+    throw new Error(
+      'Invalid CORS_ORIGINS: must be a comma-separated list of exact origins ' +
+        '(empty means allow no browser origin).',
+    );
+  }
+
+  const origins = raw
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter((origin) => origin.length > 0);
+
+  for (const origin of origins) {
+    if (origin === '*') {
+      throw new Error(
+        'Invalid CORS_ORIGINS entry "*": this app parses CORS_ORIGINS into a ' +
+          'LIST of exact origins, which the cors package matches with string ' +
+          'equality — so "*" does not allow every origin, it allows an origin ' +
+          'literally named "*", i.e. nothing. Remove it: leave CORS_ORIGINS ' +
+          'empty to allow no browser origin, or list the exact origins you mean.',
+      );
+    }
+  }
+
+  // The PRODUCTION origin-shape rules deliberately do NOT live here. They
+  // run from `validateProductionPublicUrls`, which `validateEnv` calls LAST
+  // — see that call site's comment. Checked here, a dev origin left in a
+  // production allowlist would PREEMPT the dev-tools/Midtrans security
+  // guards and the PUBLIC_BASE_URL check, reporting the least important
+  // problem first.
+}
+
+/**
+ * The `NODE_ENV=production` half of the CORS contract, invoked from
+ * `validateProductionPublicUrls` so it shares that block's deliberate
+ * run-last ordering.
+ */
+function validateProductionCorsOrigins(config: Record<string, unknown>): void {
+  const raw = config.CORS_ORIGINS;
+
+  if (typeof raw !== 'string') {
+    return; // already reported by `validateCorsOrigins`.
+  }
+
+  for (const origin of raw
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0)) {
+    assertProductionCorsOrigin(origin);
+  }
+}
+
+function assertProductionCorsOrigin(origin: string): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(origin);
+  } catch {
+    throw new Error(
+      `Invalid CORS_ORIGINS entry ${JSON.stringify(origin)}: each entry must be an ` +
+        'absolute origin (for example https://admin.example.com) when ' +
+        'NODE_ENV=production.',
+    );
+  }
+
+  if (parsed.protocol !== 'https:') {
+    throw new Error(
+      `Refusing to boot with NODE_ENV=production and CORS_ORIGINS entry ` +
+        `${JSON.stringify(origin)}: a production browser origin must use https.`,
+    );
+  }
+
+  if (
+    isLoopbackHostname(parsed.hostname) ||
+    isPrivateHostname(parsed.hostname)
+  ) {
+    throw new Error(
+      `Refusing to boot with NODE_ENV=production and CORS_ORIGINS entry ` +
+        `${JSON.stringify(origin)}: ${JSON.stringify(parsed.hostname)} is a ` +
+        'loopback/LAN host. A development origin left in a production ' +
+        "allowlist grants a page on someone's own machine access to this API.",
+    );
+  }
+
+  // `new URL('https://admin.example.com').pathname` is '/', so this rejects
+  // only a REAL path, a trailing slash the operator typed, a query string or
+  // a fragment — every one of which makes the entry match nothing.
+  const hasExtraParts =
+    parsed.pathname !== '/' ||
+    parsed.search !== '' ||
+    parsed.hash !== '' ||
+    origin.endsWith('/');
+
+  if (hasExtraParts) {
+    throw new Error(
+      `Invalid CORS_ORIGINS entry ${JSON.stringify(origin)}: an entry must be a ` +
+        'bare origin with no path, query, fragment or trailing slash ' +
+        `(use ${JSON.stringify(parsed.origin)}). A browser's Origin header is ` +
+        'always exactly scheme://host[:port], so anything longer matches nothing.',
     );
   }
 }
@@ -261,12 +663,27 @@ function validateDevToolsNodeEnv(config: Record<string, unknown>): void {
  * (shape check only — this never makes a network request, never connects
  * to R2, and never validates credentials against a live endpoint).
  */
-function validateStorageDriver(config: Record<string, unknown>): void {
+/**
+ * The single place `STORAGE_DRIVER` is turned into a driver name, shared by
+ * `validateStorageDriver` (which decides whether the `OBJECT_STORAGE_*`
+ * names are required) and `validateProductionPublicUrls` (which decides
+ * whether `OBJECT_STORAGE_ENDPOINT` has to be a public https origin).
+ * Extracted rather than duplicated: if the two ever disagreed about what
+ * `STORAGE_DRIVER=` resolves to, an r2 deployment could pass one check and
+ * skip the other. Returns the RAW string when unrecognized so
+ * `validateStorageDriver` can still name it in its own error.
+ */
+function resolveConfiguredStorageDriver(
+  config: Record<string, unknown>,
+): string {
   const rawDriver = config.STORAGE_DRIVER;
-  const driver =
-    typeof rawDriver === 'string' && rawDriver.trim().length > 0
-      ? rawDriver
-      : DEFAULT_STORAGE_DRIVER;
+  return typeof rawDriver === 'string' && rawDriver.trim().length > 0
+    ? rawDriver
+    : DEFAULT_STORAGE_DRIVER;
+}
+
+function validateStorageDriver(config: Record<string, unknown>): void {
+  const driver = resolveConfiguredStorageDriver(config);
 
   if (!STORAGE_DRIVERS.includes(driver as StorageDriver)) {
     throw new Error(

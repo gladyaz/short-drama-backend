@@ -110,6 +110,58 @@ describe('Health storage-readiness (e2e)', () => {
       const body = response.body as ErrorResponseBody;
       expect(body.code).toBe('DEV_TOOLS_DISABLED');
     });
+
+    /**
+     * PRODUCTION HTTPS READINESS. This is the assertion a unit test cannot
+     * make: that `/health/ready` is REACHABLE in exactly the posture
+     * production runs in — dev tools off — unlike `/health/details`
+     * immediately above. It is the only production-reachable probe that
+     * proves a dependency, so a guard accidentally applied to it would
+     * silently leave a deployment with no readiness signal at all.
+     */
+    it('GET /health/ready is reachable with dev tools OFF and reports database readiness', async () => {
+      const response = await request(app.getHttpServer())
+        .get('/health/ready')
+        .expect(HttpStatus.OK);
+
+      expect(response.body).toEqual({ status: 'ready', database: 'ok' });
+    });
+
+    it('GET /health/ready leaks nothing about the deployment', async () => {
+      const response = await request(app.getHttpServer())
+        .get('/health/ready')
+        .expect(HttpStatus.OK);
+
+      // Exact key set — nothing can ride along on this payload without
+      // this failing. It is served unauthenticated to anyone who can reach
+      // the API.
+      expect(Object.keys(response.body as object).sort()).toEqual([
+        'database',
+        'status',
+      ]);
+
+      const serialized = JSON.stringify(response.body).toLowerCase();
+      expect(serialized).not.toMatch(
+        /postgres|postgresql|:5432|password|host|endpoint|storageroot/,
+      );
+    });
+
+    /**
+     * Liveness must stay dependency-free: it answers 200 on the same boot
+     * where readiness is doing real work. Asserted side by side so a future
+     * change that gives `/health` a database check has to fail here.
+     */
+    it('keeps GET /health free of the dependency check that GET /health/ready performs', async () => {
+      const liveness = await request(app.getHttpServer())
+        .get('/health')
+        .expect(HttpStatus.OK);
+
+      expect(liveness.body).toEqual({
+        status: 'ok',
+        service: 'short-drama-backend',
+      });
+      expect(liveness.body).not.toHaveProperty('database');
+    });
   });
 
   describe('with DEV_TOOLS_ENABLED=true (developer opt-in)', () => {

@@ -26,7 +26,7 @@ import {
   HLS_MASTER_PLAYLIST_FILENAME,
   HLS_VARIANT_PLAYLIST_FILENAME,
 } from '../transcode/hls/hls.constants';
-import { HlsRenditionSummary } from '../transcode/transcode.types';
+import { parseHlsRenditions } from '../transcode/hls-rendition-summary.util';
 import {
   HlsPlaybackResponseDto,
   HlsRenditionPlaybackDto,
@@ -389,40 +389,4 @@ export class VideosService {
       this.contentAccessMode,
     );
   }
-}
-
-/**
- * Slice 11Q: `Video.hlsRenditions` is a Prisma `Json?` column — at the type
- * level it comes back as `Prisma.JsonValue` (effectively `unknown` for our
- * purposes), which could in principle be `null`, a non-array value, or an
- * array containing malformed entries if ever hand-edited. This is a
- * defensive, non-throwing parser: anything that is not EXACTLY an array of
- * well-formed `HlsRenditionSummary`-shaped objects is filtered out (an
- * entirely malformed value yields an empty array, never a thrown error and
- * never a partially-trusted entry) — `VideosService` never trusts this
- * column's shape implicitly, even though the ONLY writer today
- * (`TranscodeIntentService.promoteIfCurrent`, Slice 11P) always writes a
- * well-formed array.
- */
-function parseHlsRenditions(value: unknown): HlsRenditionSummary[] {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-
-  return value.filter(isHlsRenditionSummary);
-}
-
-function isHlsRenditionSummary(value: unknown): value is HlsRenditionSummary {
-  if (typeof value !== 'object' || value === null) {
-    return false;
-  }
-
-  const candidate = value as Record<string, unknown>;
-  return (
-    typeof candidate.name === 'string' &&
-    candidate.name.length > 0 &&
-    typeof candidate.width === 'number' &&
-    typeof candidate.height === 'number' &&
-    typeof candidate.bandwidth === 'number'
-  );
 }

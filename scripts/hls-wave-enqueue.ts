@@ -3,6 +3,7 @@ import { NestFactory } from '@nestjs/core';
 import { PrismaService } from '../src/prisma/prisma.service';
 import { StorageService } from '../src/storage/storage.service';
 import { buildSourceObjectKey } from '../src/media/media-storage-key.util';
+import { computeRenditionLadder } from '../src/transcode/hls/rendition-ladder';
 import { TranscodeIntentService } from '../src/transcode/transcode-intent.service';
 import { buildTranscodeJobId } from '../src/transcode/transcode.constants';
 import { WorkerModule } from '../src/worker/worker.module';
@@ -39,24 +40,76 @@ import { WorkerModule } from '../src/worker/worker.module';
  *  4. the row is not already mid-flight (`queued`/`running`), so a wave can
  *     never stack a second generation on top of one still being processed.
  *
+ * ## `--dry-run`
+ *
+ * The default is NOT a dry run — `--dry-run` must be passed explicitly. A dry
+ * run runs every preflight check above and reports, per candidate: the id, the
+ * source key, whether the source is expected to be there, portrait/landscape
+ * eligibility, the ladder the recorded dimensions imply, whether it WOULD be
+ * enqueued, and the reason if not. It performs ZERO database writes, ZERO
+ * BullMQ writes and ZERO object-storage writes — the only calls it makes are a
+ * `findUnique` and a `HEAD`, both read-only — and it exits non-zero unless
+ * every requested id would be enqueued, so it is usable as a gate.
+ *
  * Usage:
  *
+ *   npm run hls:wave-enqueue -- --ids=video-101-01,video-101-02 --dry-run
  *   npm run hls:wave-enqueue -- --ids=video-101-01,video-101-02
- *   npm run hls:wave-enqueue -- --ids=... --dry-run
  */
 
 interface EpisodeOutcome {
   videoId: string;
+  /** Whether this run actually enqueued. Always `false` under `--dry-run`. */
   enqueued: boolean;
+  /**
+   * Whether a REAL run would enqueue this episode. Under `--dry-run` this is
+   * the answer the operator is actually asking for; `enqueued` above only
+   * ever reports what this specific invocation did.
+   */
+  wouldEnqueue: boolean;
   reason?: string;
   processingVersion?: number;
   jobId?: string;
   enqueuedAt?: string;
   width?: number | null;
   height?: number | null;
-  sourceKey?: string;
+  /** Always populated — it is a pure function of the id, so it is known even for a row that does not exist. */
+  sourceKey: string;
+  sourceExpectation?: string;
   sourceBytes?: number;
+  /** Rung names the ladder would produce from the CATALOG dimensions. See `previewLadder`. */
+  expectedLadder?: string[];
+  expectedLadderCaveat?: string;
 }
+
+/**
+ * The rungs `computeRenditionLadder` would choose from the row's RECORDED
+ * `width`/`height` alone. This is a PREVIEW, not a promise: the worker
+ * re-probes the source and ladders on the probed, post-rotation dimensions,
+ * which is the only authority. A row whose recorded dimensions disagree with
+ * its actual file, or whose file carries display rotation, will produce a
+ * different ladder — hence the caveat carried alongside it in the report.
+ */
+function previewLadder(width: number, height: number): string[] {
+  return computeRenditionLadder({
+    width,
+    height,
+    // Not knowable from the database: the catalog stores no rotation, fps,
+    // or audio flag. These three placeholders do not affect WHICH rungs are
+    // selected (that is decided by the post-rotation short side alone), only
+    // the fps/audio fields of the result, which this preview ignores.
+    rotation: 0,
+    fps: 30,
+    hasAudio: true,
+    durationSeconds: 0,
+    videoCodec: 'h264',
+  }).rungs.map((rung) => `${rung.name} ${rung.width}x${rung.height}`);
+}
+
+const LADDER_CAVEAT =
+  'Preview only — derived from the catalog width/height. The worker ' +
+  're-probes the source and ladders on the probed, post-rotation ' +
+  'dimensions, which may differ.';
 
 function parseIds(argv: readonly string[]): string[] {
   const arg = argv.find((a) => a.startsWith('--ids='));
@@ -111,6 +164,21 @@ async function main(): Promise<void> {
     const intentService = app.get(TranscodeIntentService);
 
     for (const videoId of ids) {
+      // Pure function of the id, so it is knowable even for a row that does
+      // not exist — an operator chasing a `ROW_NOT_FOUND` still gets told
+      // which key this wave would have looked for.
+      const sourceKey = buildSourceObjectKey(videoId);
+      const skip = (reason: string, extra: Partial<EpisodeOutcome> = {}) => {
+        outcomes.push({
+          videoId,
+          enqueued: false,
+          wouldEnqueue: false,
+          reason,
+          sourceKey,
+          ...extra,
+        });
+      };
+
       const row = await prisma.video.findUnique({
         where: { id: videoId },
         select: {
@@ -126,15 +194,11 @@ async function main(): Promise<void> {
       });
 
       if (!row) {
-        outcomes.push({ videoId, enqueued: false, reason: 'ROW_NOT_FOUND' });
+        skip('ROW_NOT_FOUND');
         continue;
       }
       if (row.lifecycleState !== 'published') {
-        outcomes.push({
-          videoId,
-          enqueued: false,
-          reason: `NOT_PUBLISHED (${row.lifecycleState})`,
-        });
+        skip(`NOT_PUBLISHED (${row.lifecycleState})`);
         continue;
       }
 
@@ -142,18 +206,11 @@ async function main(): Promise<void> {
       // dimensions; a row with neither recorded cannot be proven portrait
       // from the database alone, so it is refused rather than assumed.
       if (row.width === null || row.height === null) {
-        outcomes.push({
-          videoId,
-          enqueued: false,
-          reason: 'DIMENSIONS_UNKNOWN — cannot prove portrait',
-        });
+        skip('DIMENSIONS_UNKNOWN — cannot prove portrait');
         continue;
       }
       if (row.width >= row.height) {
-        outcomes.push({
-          videoId,
-          enqueued: false,
-          reason: `NOT_PORTRAIT (${row.width}x${row.height})`,
+        skip(`NOT_PORTRAIT (${row.width}x${row.height})`, {
           width: row.width,
           height: row.height,
         });
@@ -166,36 +223,43 @@ async function main(): Promise<void> {
         row.processingState === 'queued' ||
         row.processingState === 'running'
       ) {
-        outcomes.push({
-          videoId,
-          enqueued: false,
-          reason: `ALREADY_IN_FLIGHT (${row.processingState})`,
+        skip(`ALREADY_IN_FLIGHT (${row.processingState})`, {
+          width: row.width,
+          height: row.height,
         });
         continue;
       }
 
-      const sourceKey = buildSourceObjectKey(videoId);
       const head = await storageService.headObject(sourceKey);
 
       if (!head || head.contentLength === 0) {
-        outcomes.push({
-          videoId,
-          enqueued: false,
-          reason: head ? 'SOURCE_EMPTY' : 'SOURCE_MISSING',
-          sourceKey,
+        skip(head ? 'SOURCE_EMPTY' : 'SOURCE_MISSING', {
+          width: row.width,
+          height: row.height,
+          sourceExpectation: head
+            ? 'present but ZERO bytes'
+            : 'absent — run the R2 media migration for this row first',
         });
         continue;
       }
+
+      const eligible = {
+        width: row.width,
+        height: row.height,
+        sourceKey,
+        sourceExpectation: 'present and non-empty (HEAD verified)',
+        sourceBytes: head.contentLength,
+        expectedLadder: previewLadder(row.width, row.height),
+        expectedLadderCaveat: LADDER_CAVEAT,
+      };
 
       if (dryRun) {
         outcomes.push({
           videoId,
           enqueued: false,
-          reason: 'DRY_RUN (all preflight checks passed)',
-          width: row.width,
-          height: row.height,
-          sourceKey,
-          sourceBytes: head.contentLength,
+          wouldEnqueue: true,
+          reason: 'DRY_RUN (all preflight checks passed — nothing was written)',
+          ...eligible,
         });
         continue;
       }
@@ -205,37 +269,52 @@ async function main(): Promise<void> {
       outcomes.push({
         videoId,
         enqueued: true,
+        wouldEnqueue: true,
         processingVersion,
         jobId: buildTranscodeJobId(videoId, processingVersion),
         enqueuedAt: new Date().toISOString(),
-        width: row.width,
-        height: row.height,
-        sourceKey,
-        sourceBytes: head.contentLength,
+        ...eligible,
       });
     }
 
     const enqueued = outcomes.filter((o) => o.enqueued).length;
+    const wouldEnqueue = outcomes.filter((o) => o.wouldEnqueue).length;
 
-    // eslint-disable-next-line no-console
     console.log(
       JSON.stringify(
-        { requested: ids.length, enqueued, dryRun, outcomes },
+        {
+          requested: ids.length,
+          enqueued,
+          wouldEnqueue,
+          dryRun,
+          writes: dryRun
+            ? {
+                database: 0,
+                bullmq: 0,
+                objectStorage: 0,
+                note: 'A dry run performs read-only queries and read-only HEADs. Nothing is written anywhere.',
+              }
+            : undefined,
+          outcomes,
+        },
         null,
         2,
       ),
     );
 
     // A wave that could not enqueue everything asked for is a failure, so the
-    // exit code is usable as a gate without parsing the JSON above.
-    process.exitCode = dryRun || enqueued === ids.length ? 0 : 1;
+    // exit code is usable as a gate without parsing the JSON above. A DRY RUN
+    // is held to the same standard against `wouldEnqueue` — otherwise the
+    // preflight gate an operator is supposed to run FIRST would exit 0 while
+    // silently reporting that three of five episodes are not eligible.
+    process.exitCode =
+      (dryRun ? wouldEnqueue : enqueued) === ids.length ? 0 : 1;
   } finally {
     await app.close();
   }
 }
 
 main().catch((error: unknown) => {
-  // eslint-disable-next-line no-console
   console.error(
     error instanceof Error ? (error.stack ?? error.message) : String(error),
   );

@@ -437,6 +437,51 @@ function checkFeaturePosture(env: EnvRecord, add: AddFinding): void {
     );
   }
 
+  // V1 INTEGRATION: the free-catalog policy is invisible in every other
+  // signal — the API answers 200 either way and no URL changes — but it
+  // decides whether 25 premium episodes are payable content or not. An
+  // operator must see which posture they are shipping, stated, rather than
+  // infer it from a viewer's experience after release.
+  if (env.CONTENT_ACCESS_MODE === 'free') {
+    add(
+      'WARNING',
+      'content access mode',
+      'CONTENT_ACCESS_MODE=free — EVERY episode resolves free, including rows ' +
+        'whose accessTierOverride is "premium". No database value is changed ' +
+        'and the entitlement branch stays live, so this is reversible by ' +
+        'unsetting the variable. Confirm this is the intended V1 posture.',
+    );
+  } else {
+    add(
+      'PASS',
+      'content access mode',
+      `CONTENT_ACCESS_MODE=${env.CONTENT_ACCESS_MODE ?? '(unset -> entitlement)'} — ` +
+        'per-row access tiers are enforced.',
+    );
+  }
+
+  // V1 INTEGRATION: reported so an enabled pipeline is never a surprise, and
+  // never wrongly flagged. TRANSCODE_ENABLED=false is a perfectly valid V1
+  // posture (HLS-ready rows simply fall back to their R2 source), so the
+  // flag-off case is a PASS, not a warning.
+  if (env.TRANSCODE_ENABLED === 'true') {
+    add(
+      'WARNING',
+      'HLS pipeline',
+      'TRANSCODE_ENABLED=true — this API mints HLS gateway tokens and a ' +
+        'separate worker process consumes the Redis queue. Confirm the ' +
+        'gateway at HLS_GATEWAY_BASE_URL is actually deployed and that the ' +
+        'worker is running; neither is verifiable from configuration alone.',
+    );
+  } else {
+    add(
+      'PASS',
+      'HLS pipeline',
+      'TRANSCODE_ENABLED is off — no Redis, no worker, and no gateway is ' +
+        'required. HLS-ready rows fall back to their R2 source.',
+    );
+  }
+
   if (env.DEV_TOOLS_ENABLED === 'true') {
     // Already a BLOCKER via the boot contract; repeated here so the reason
     // is legible without decoding a validator message.

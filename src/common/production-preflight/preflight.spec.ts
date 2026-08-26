@@ -340,6 +340,57 @@ describe('runProductionPreflight', () => {
       ).toEqual(['WARNING']);
     });
 
+    /**
+     * V1 INTEGRATION. The free-catalog policy changes nothing an operator
+     * can observe from configuration — no URL moves, every route still
+     * answers 200 — while deciding whether 25 premium episodes are payable
+     * content. It must be stated, and it must never block: it is a
+     * deliberate product posture, not a misconfiguration.
+     */
+    it('WARNS but does not block on CONTENT_ACCESS_MODE=free', () => {
+      const env = { ...VALID_PRODUCTION_ENV, CONTENT_ACCESS_MODE: 'free' };
+
+      expect(severityOf(env, 'content access mode')).toEqual(['WARNING']);
+      expect(runProductionPreflight(env).ok).toBe(true);
+    });
+
+    it.each(['entitlement', undefined])(
+      'passes CONTENT_ACCESS_MODE=%p, where per-row tiers are enforced',
+      (mode) => {
+        expect(
+          severityOf(
+            { ...VALID_PRODUCTION_ENV, CONTENT_ACCESS_MODE: mode },
+            'content access mode',
+          ),
+        ).toEqual(['PASS']);
+      },
+    );
+
+    /**
+     * HLS OFF IS A VALID V1 POSTURE and must not be flagged as a problem —
+     * HLS-ready rows fall back to their R2 source. Turning it ON is what
+     * introduces things configuration cannot verify (a deployed gateway, a
+     * running worker), so that is the direction that warns.
+     */
+    it('passes when the HLS pipeline is off, the shipped V1 default', () => {
+      expect(severityOf(VALID_PRODUCTION_ENV, 'HLS pipeline')).toEqual([
+        'PASS',
+      ]);
+    });
+
+    it('WARNS but does not block when the HLS pipeline is on', () => {
+      const env = {
+        ...VALID_PRODUCTION_ENV,
+        TRANSCODE_ENABLED: 'true',
+        REDIS_URL: 'redis://redis.internal:6379',
+        HLS_TOKEN_SECRET: 'd'.repeat(48),
+        HLS_GATEWAY_BASE_URL: 'https://hls.redpanda-not-a-real-domain.app',
+      };
+
+      expect(severityOf(env, 'HLS pipeline')).toEqual(['WARNING']);
+      expect(runProductionPreflight(env).ok).toBe(true);
+    });
+
     it('BLOCKS DEV_TOOLS_ENABLED=true with a legible reason, not only a validator message', () => {
       const report = runProductionPreflight({
         ...VALID_PRODUCTION_ENV,

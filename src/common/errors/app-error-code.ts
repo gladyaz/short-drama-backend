@@ -481,6 +481,34 @@ export enum AppErrorCode {
    */
   WHATSAPP_AUTH_DISABLED = 'WHATSAPP_AUTH_DISABLED',
   /**
+   * WHATSAPP LOGIN V1 — returned (503) by
+   * `POST /auth/whatsapp/otp/request` when the delivery provider
+   * DEFINITIVELY failed to accept the message: a timeout, a transport
+   * error, a 5xx, an expired access token, a template that does not exist
+   * or is paused, or a provider-side rate limit.
+   *
+   * THE ONE DELIBERATE HOLE IN THE `202` CONTRACT, and it is safe precisely
+   * because of what it is not. Every condition above is
+   * NUMBER-INDEPENDENT — the same request for any other number fails
+   * identically — so this answer carries no information about whether the
+   * number exists, has an account, or is on WhatsApp. Contrast
+   * `OTP_RESEND_COOLDOWN`, whose per-number nature is an accepted,
+   * documented tradeoff; this code has nothing to trade off.
+   *
+   * IT IS ALSO REQUIRED, not merely permitted. The alternative is answering
+   * `202 success: true` during a total delivery outage, leaving every user
+   * staring at a code-entry screen for a message that will never arrive and
+   * giving the client nothing to say. A provider that refused THIS
+   * RECIPIENT specifically is handled the opposite way — swallowed, still
+   * `202` — because that answer WOULD vary by number (see
+   * `WhatsAppDeliveryFailureKind`).
+   *
+   * NO CHALLENGE SURVIVES a response carrying this code: the row is
+   * withdrawn before it is thrown, so the caller's next attempt is not
+   * blocked by a cooldown for a code that was never sent.
+   */
+  WHATSAPP_PROVIDER_UNAVAILABLE = 'WHATSAPP_PROVIDER_UNAVAILABLE',
+  /**
    * Returned (400) when a supplied phone number cannot be normalized to
    * E.164 (see `normalizePhoneToE164`). A pure INPUT-SHAPE failure, decided
    * before any database read, so it reveals nothing about which numbers

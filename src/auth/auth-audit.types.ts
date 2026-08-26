@@ -262,6 +262,22 @@ export const AUTH_AUDIT_METADATA_ALLOWLIST = {
    * number is visible to an operator as its own signal.
    */
   otp_request_throttled: ['reason'],
+  /**
+   * WHATSAPP LOGIN V1: `POST /auth/whatsapp/otp/request` created a challenge
+   * but the delivery provider definitively refused it, so the challenge was
+   * withdrawn and the caller received `503
+   * WHATSAPP_PROVIDER_UNAVAILABLE`. `reason` is the provider-neutral
+   * `WhatsAppDeliveryFailureKind` (`provider_unavailable`), never a vendor
+   * error string.
+   *
+   * Its own event rather than an `otp_request_throttled` reason because it
+   * means something categorically different to whoever reads the trail: a
+   * throttle is the system working, and a burst of these is a WhatsApp
+   * login OUTAGE — nobody is signing in, and no amount of user retrying
+   * will change that. Carries no `userId` and no number, exactly like
+   * `otp_requested`.
+   */
+  otp_delivery_failed: ['reason'],
 } as const satisfies Record<string, readonly string[]>;
 
 export type AuthAuditEventName = keyof typeof AUTH_AUDIT_METADATA_ALLOWLIST;

@@ -32,7 +32,10 @@ import type {
   GoogleVerifiedIdentity,
 } from './google/google-identity.types';
 import { GoogleTokenRejected } from './google/google-id-token.util';
-import { WHATSAPP_OTP_PROVIDER } from './whatsapp/whatsapp-otp.types';
+import {
+  WHATSAPP_OTP_PROVIDER,
+  WhatsAppDeliveryError,
+} from './whatsapp/whatsapp-otp.types';
 import type {
   SendWhatsAppOtpInput,
   WhatsAppOtpProvider,
@@ -98,9 +101,20 @@ class ScriptedGoogleVerifier implements GoogleIdentityVerifier {
 /** Records what "was sent" without sending anything, like the local fake provider. */
 class RecordingOtpProvider implements WhatsAppOtpProvider {
   readonly sent: SendWhatsAppOtpInput[] = [];
+  /**
+   * `true` throws an UNCLASSIFIED error, which the service must treat as
+   * `provider_unavailable` — the fail-closed reading of a surprise.
+   */
   shouldFail = false;
+  /** A classified failure, to exercise both branches of the delivery split. */
+  failWith: 'provider_unavailable' | 'recipient_rejected' | undefined;
 
   sendOtp(input: SendWhatsAppOtpInput): Promise<void> {
+    if (this.failWith !== undefined) {
+      return Promise.reject(
+        new WhatsAppDeliveryError(this.failWith, 'simulated delivery failure'),
+      );
+    }
     if (this.shouldFail) {
       return Promise.reject(new Error('simulated vendor outage'));
     }
@@ -959,18 +973,84 @@ describe('AuthIdentityService', () => {
       ).rejects.toMatchObject({ code: AppErrorCode.WHATSAPP_AUTH_DISABLED });
     });
 
-    it('still answers 202 when delivery fails — a vendor outage is not a caller-visible signal', async () => {
+    /**
+     * WHATSAPP LOGIN V1 — the deliberate change to the `202` contract.
+     *
+     * The old behaviour was "swallow every delivery failure and answer 202".
+     * That is now split in two, because the two failures reveal different
+     * things: a provider OUTAGE is identical for every number and so leaks
+     * nothing, while a per-RECIPIENT refusal would vary by number and so
+     * must stay invisible. See `WhatsAppDeliveryFailureKind`.
+     */
+    it('CRITICAL: answers 503 when the provider is definitively unavailable, and withdraws the challenge', async () => {
+      const phone = fixturePhone();
+      otpProvider.failWith = 'provider_unavailable';
+
+      await expect(identityService.requestOtp({ phone })).rejects.toMatchObject(
+        {
+          code: AppErrorCode.WHATSAPP_PROVIDER_UNAVAILABLE,
+        },
+      );
+
+      // No row survives — the caller must not be blocked by a cooldown for a
+      // code that was never sent.
+      expect(
+        await prisma.phoneOtpChallenge.count({ where: { phoneE164: phone } }),
+      ).toBe(0);
+    });
+
+    it('a withdrawn challenge leaves the number immediately retryable', async () => {
+      const phone = fixturePhone();
+      otpProvider.failWith = 'provider_unavailable';
+      await identityService.requestOtp({ phone }).catch(() => undefined);
+
+      // The cooldown would normally refuse a second request inside 60s.
+      otpProvider.failWith = undefined;
+      await expect(
+        identityService.requestOtp({ phone }),
+      ).resolves.toMatchObject({ success: true });
+    });
+
+    it('an UNCLASSIFIED provider throw fails closed as provider_unavailable', async () => {
       const phone = fixturePhone();
       otpProvider.shouldFail = true;
 
+      await expect(identityService.requestOtp({ phone })).rejects.toMatchObject(
+        {
+          code: AppErrorCode.WHATSAPP_PROVIDER_UNAVAILABLE,
+        },
+      );
+    });
+
+    it('CRITICAL: still answers 202 when the provider refused THIS RECIPIENT', async () => {
+      const phone = fixturePhone();
+      otpProvider.failWith = 'recipient_rejected';
+
+      // Byte-identical to a successful send — a per-number answer here would
+      // be a phone-validity oracle on an unauthenticated route.
       await expect(
         identityService.requestOtp({ phone }),
-      ).resolves.toMatchObject({
-        success: true,
-      });
+      ).resolves.toMatchObject({ success: true });
       expect(
         await prisma.phoneOtpChallenge.count({ where: { phoneE164: phone } }),
       ).toBe(1);
+    });
+
+    it('records a delivery outage in the audit trail, without the number', async () => {
+      const phone = fixturePhone();
+      otpProvider.failWith = 'provider_unavailable';
+
+      await identityService.requestOtp({ phone }).catch(() => undefined);
+
+      const events = await prisma.authAuditEvent.findMany({
+        where: {
+          event: 'otp_delivery_failed',
+          userAgent: SPEC_AUDIT_USER_AGENT,
+        },
+      });
+      expect(events).toHaveLength(1);
+      expect(events[0].metadata).toEqual({ reason: 'provider_unavailable' });
+      expect(JSON.stringify(events[0])).not.toContain(phone);
     });
 
     it('exposes devCode ONLY when dev tools are enabled in a development/test NODE_ENV', async () => {

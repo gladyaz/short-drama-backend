@@ -37,10 +37,23 @@ export enum VideoContentKind {
   DRAMA = 'drama',
   /**
    * Internal technical fixture kept in the catalog on purpose (e.g. the 11R
-   * HLS sample used for playback testing). Served by the API exactly as
-   * before - never hidden server-side, never deleted - so internal tooling
-   * and QA keep working. Clients that present a consumer catalog are the
-   * ones expected to exclude it.
+   * HLS sample used for playback testing, and the `series-hlsproof` rows
+   * `scripts/hls-real-media-proof.ts` seeds). Never deleted.
+   *
+   * WHERE IT IS AND IS NOT SERVED (updated by the V1 integration; this
+   * comment previously said clients were expected to exclude it, which was
+   * true before `/series` started filtering and is no longer the whole
+   * rule):
+   *
+   *  - LISTING routes EXCLUDE it server-side: `GET /videos/feed`,
+   *    `GET /series`, `GET /series/:id`'s episode list. A consumer catalog
+   *    must not depend on every client remembering to filter, and a fixture
+   *    is indistinguishable from an episode once it is in the list.
+   *  - DIRECT-ADDRESSING routes still serve it unchanged: `GET /videos/:id`,
+   *    `/videos/:id/playback`, `/videos/:id/stream`. Internal tooling and QA
+   *    depend on exactly this — the HLS proof harness exercises
+   *    `/videos/:id/playback` against seeded fixture rows — and hiding a row
+   *    whose id you must already know buys nothing.
    */
   QA_FIXTURE = 'qa_fixture',
 }

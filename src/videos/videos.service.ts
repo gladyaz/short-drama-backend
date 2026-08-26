@@ -15,6 +15,7 @@ import {
   resolveAccessTier,
 } from '../entitlements/entitlement.constants';
 import { MediaLifecycleState } from '../media/media-lifecycle.types';
+import { VideoContentKind } from './video-content-kind.types';
 import { PrismaService } from '../prisma/prisma.service';
 import { PLAYBACK_URL_EXPIRY_SECONDS } from '../storage/storage.constants';
 import { StorageService } from '../storage/storage.service';
@@ -97,9 +98,33 @@ export class VideosService {
     // source is present; it is excluded only when both are absent. Every one
     // of the 40 pre-existing seed rows has a non-empty `storageKey`, so this
     // is a no-op for them and does not change `findAll`'s existing behavior.
+    // V1 INTEGRATION FIX: exclude QA fixtures from the consumer feed.
+    //
+    // `GET /series` and `GET /series/:id` have filtered
+    // `contentKind: DRAMA` since the "explicit contentKind" work unit, but
+    // this feed never did — so the four `qa_fixture` rows
+    // (`series-hlsproof`, `series-11rqa`, the `7` fixture) reached ordinary
+    // viewers as if they were episodes. They are real, published and
+    // streamable by design, which is exactly why they are indistinguishable
+    // from catalog content once they are in the list.
+    //
+    // APPLIED IN THE QUERY, NOT AFTER IT. Filtering the returned array would
+    // be correct only while this route returns everything; the moment a
+    // `take`/`skip` is added, a post-filter silently shrinks pages below
+    // their requested size and shifts every subsequent offset. Putting the
+    // rule in the `where` makes the page size mean what it says.
+    //
+    // SCOPE IS LISTINGS ONLY, deliberately. `GET /videos/:id`,
+    // `/videos/:id/playback` and `/videos/:id/stream` are direct-addressing
+    // routes that still serve fixtures, because `scripts/hls-real-media-proof.ts`
+    // seeds `media-hlsproof-*` rows and exercises `/videos/:id/playback`
+    // against them to prove the gateway, and `hls:demote` reasons about the
+    // same route. Hiding a row you must already know the id of buys nothing
+    // and would break proven QA tooling.
     const records = await this.prisma.video.findMany({
       where: {
         lifecycleState: MediaLifecycleState.PUBLISHED,
+        contentKind: VideoContentKind.DRAMA,
         OR: [{ storageKey: { not: '' } }, { objectStorageKey: { not: null } }],
       },
       orderBy: { sortOrder: 'asc' },

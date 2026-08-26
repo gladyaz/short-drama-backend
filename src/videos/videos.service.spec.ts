@@ -261,6 +261,127 @@ describe('VideosService', () => {
         expect(specVideoIds).toContain(testVideos[0].id);
       });
 
+      /**
+       * V1 INTEGRATION FIX — the consumer feed must not carry QA fixtures.
+       *
+       * `GET /series` has filtered `contentKind: DRAMA` since the "explicit
+       * contentKind" work unit; this feed did not, so the four published
+       * `qa_fixture` rows in the real catalog reached ordinary viewers as if
+       * they were episodes. They are real, published and streamable BY
+       * DESIGN, which is precisely why nothing downstream could tell them
+       * apart once they were in the list.
+       *
+       * The fixture row below is created and removed by this suite, so the
+       * assertion never depends on the catalog's own fixture rows existing.
+       */
+      it('EXCLUDES a published qa_fixture row from the feed', async () => {
+        const fixtureId = `${testVideoIdPrefix}-fixture`;
+        await prisma.video.create({
+          data: {
+            id: fixtureId,
+            seriesId: `${testVideoIdPrefix}-series`,
+            title: 'Spec QA Fixture',
+            episodeNumber: 99,
+            channelName: 'Spec Channel',
+            caption: 'internal fixture',
+            category: 'drama',
+            storageKey: 'Spec Series/fixture.mp4',
+            sourceLanguage: 'zh',
+            hasEmbeddedIndonesianSubtitle: true,
+            likeCount: 0,
+            width: 720,
+            height: 1280,
+            contentKind: VideoContentKind.QA_FIXTURE,
+          },
+        });
+
+        const videos = await service.findAll();
+        const ids = videos.map((video) => video.id);
+
+        expect(ids).not.toContain(fixtureId);
+        // ...and the ordinary drama rows beside it are untouched, so this is
+        // an exclusion rule and not an accidental narrowing of the feed.
+        expect(ids).toContain(testVideos[0].id);
+        expect(ids).toContain(testVideos[1].id);
+      });
+
+      it('excludes a qa_fixture row even when it is R2-backed and fully playable', async () => {
+        const fixtureId = `${testVideoIdPrefix}-fixture-r2`;
+        await prisma.video.create({
+          data: {
+            id: fixtureId,
+            seriesId: `${testVideoIdPrefix}-series`,
+            title: 'Spec QA Fixture R2',
+            episodeNumber: 98,
+            channelName: 'Spec Channel',
+            caption: 'internal fixture',
+            category: 'drama',
+            storageKey: '',
+            objectStorageKey: 'admin-media/spec-fixture/source',
+            sourceLanguage: 'zh',
+            hasEmbeddedIndonesianSubtitle: true,
+            likeCount: 0,
+            width: 720,
+            height: 1280,
+            contentKind: VideoContentKind.QA_FIXTURE,
+          },
+        });
+
+        const videos = await service.findAll();
+
+        expect(videos.map((video) => video.id)).not.toContain(fixtureId);
+      });
+
+      /**
+       * The feed must return ONLY drama. Asserted as a property over the
+       * whole response rather than against named ids, so a fixture added to
+       * the catalog later cannot slip in without failing here.
+       */
+      it('returns nothing but drama content, whatever the catalog contains', async () => {
+        const videos = await service.findAll();
+
+        expect(videos.length).toBeGreaterThan(0);
+        for (const video of videos) {
+          expect(video.contentKind).toBe(VideoContentKind.DRAMA);
+        }
+      });
+
+      /**
+       * DIRECT ADDRESSING IS DELIBERATELY UNCHANGED. `scripts/hls-real-media-proof.ts`
+       * seeds `media-hlsproof-*` fixture rows and exercises
+       * `GET /videos/:id/playback` against them to prove the HLS gateway, and
+       * `hls:demote` reasons about the same route. Hiding a row whose id the
+       * caller must already know buys nothing and would break that tooling —
+       * so this test pins the boundary rather than leaving it to be
+       * "tidied up" later.
+       */
+      it('still serves a qa_fixture row by direct id lookup, which QA tooling depends on', async () => {
+        const fixtureId = `${testVideoIdPrefix}-fixture-byid`;
+        await prisma.video.create({
+          data: {
+            id: fixtureId,
+            seriesId: `${testVideoIdPrefix}-series`,
+            title: 'Spec QA Fixture ById',
+            episodeNumber: 97,
+            channelName: 'Spec Channel',
+            caption: 'internal fixture',
+            category: 'drama',
+            storageKey: 'Spec Series/fixture-byid.mp4',
+            sourceLanguage: 'zh',
+            hasEmbeddedIndonesianSubtitle: true,
+            likeCount: 0,
+            width: 720,
+            height: 1280,
+            contentKind: VideoContentKind.QA_FIXTURE,
+          },
+        });
+
+        const video = await service.findById(fixtureId);
+
+        expect(video.id).toBe(fixtureId);
+        expect(video.contentKind).toBe(VideoContentKind.QA_FIXTURE);
+      });
+
       it('does not change feed length behavior for the real 40 seed rows (all still present)', async () => {
         const videos = await service.findAll();
         const returnedIds = new Set(videos.map((video) => video.id));
@@ -371,11 +492,14 @@ describe('VideosService', () => {
     });
 
     it('classifies an explicitly declared fixture as qa_fixture', async () => {
-      const feed = await service.findAll();
+      // UPDATED BY THE V1 INTEGRATION. This assertion used to read the
+      // classification off `findAll()`, which is no longer possible now that
+      // the consumer feed excludes fixtures. The CLASSIFICATION contract this
+      // test exists to pin is unchanged, so it is asserted through the
+      // direct-id route, which still serves fixtures on purpose.
+      const video = await service.findById(qaFixtureId);
 
-      expect(feed.find((video) => video.id === qaFixtureId)?.contentKind).toBe(
-        VideoContentKind.QA_FIXTURE,
-      );
+      expect(video.contentKind).toBe(VideoContentKind.QA_FIXTURE);
     });
 
     it('pins the migration statement that reclassifies the two known QA rows', () => {
@@ -407,25 +531,40 @@ describe('VideosService', () => {
     });
 
     it('classifies the two real reconciled QA rows as qa_fixture, where they exist', async () => {
-      const feed = await service.findAll();
-      const present = REAL_QA_FIXTURE_IDS.filter((id) =>
-        feed.some((video) => video.id === id),
-      );
-
-      // A fresh test/CI database legitimately has neither fixture; the
-      // statement itself is pinned by the test above, so this one only has to
-      // prove the applied result wherever they are present.
-      for (const id of present) {
-        expect(feed.find((video) => video.id === id)?.contentKind).toBe(
-          VideoContentKind.QA_FIXTURE,
-        );
+      // UPDATED BY THE V1 INTEGRATION, same reason as the test above: the
+      // feed no longer carries fixtures, so the applied classification is
+      // read through the direct-id route instead. A fresh test/CI database
+      // legitimately has neither fixture; the migration statement itself is
+      // pinned by the test above, so this one only has to prove the applied
+      // result wherever they are present.
+      for (const id of REAL_QA_FIXTURE_IDS) {
+        let video: Awaited<ReturnType<typeof service.findById>> | null = null;
+        try {
+          video = await service.findById(id);
+        } catch {
+          continue; // not present in this database — nothing to assert.
+        }
+        expect(video.contentKind).toBe(VideoContentKind.QA_FIXTURE);
       }
     });
 
-    it('drops no row: a qa_fixture is still served by the feed', async () => {
-      // The classification is metadata for clients, NOT a server-side filter.
-      // The 11R HLS sample has to stay reachable for internal playback QA.
-      //
+    /**
+     * DELIBERATELY REVERSED BY THE V1 INTEGRATION.
+     *
+     * This test previously asserted the opposite — "the classification is
+     * metadata for clients, NOT a server-side filter" — and it was right at
+     * the time: `/series` did not filter either, so the rule was uniform.
+     * That is no longer the shipped contract. `/series` began excluding
+     * fixtures server-side, and leaving the video feed as the one consumer
+     * surface that did not meant four published `qa_fixture` rows reached
+     * ordinary viewers as episodes.
+     *
+     * THE CONCERN THE OLD TEST PROTECTED IS PRESERVED, NOT DISCARDED: "the
+     * 11R HLS sample has to stay reachable for internal playback QA" is
+     * still true, and is now pinned by the direct-id assertion below and by
+     * the dedicated test in the `findAll` block. Only the LISTING changed.
+     */
+    it('excludes a qa_fixture from the feed while keeping it reachable by id for QA', async () => {
       // Asserted against rows THIS spec owns rather than a global COUNT:
       // other suites create and delete fixtures in the same database
       // concurrently, so comparing findAll()'s length to a separately-executed
@@ -433,10 +572,14 @@ describe('VideosService', () => {
       const feed = await service.findAll();
       const ids = new Set(feed.map((video) => video.id));
 
-      expect(ids.has(qaFixtureId)).toBe(true);
-      expect(feed.find((video) => video.id === qaFixtureId)?.contentKind).toBe(
-        VideoContentKind.QA_FIXTURE,
-      );
+      expect(ids.has(qaFixtureId)).toBe(false);
+
+      // Still reachable the way internal tooling reaches it.
+      const direct = await service.findById(qaFixtureId);
+      expect(direct.contentKind).toBe(VideoContentKind.QA_FIXTURE);
+
+      // Ordinary drama rows are untouched — this is an exclusion rule, not a
+      // narrowing of the feed.
       for (const seeded of testVideos) {
         expect(ids.has(seeded.id)).toBe(true);
       }
@@ -451,23 +594,32 @@ describe('VideosService', () => {
       const ids = feed.map((video) => video.id);
 
       expect(new Set(ids).size).toBe(ids.length);
-      for (const owned of [
-        ...testVideos.map((video) => video.id),
-        qaFixtureId,
-      ]) {
+      // `qaFixtureId` was dropped from this list by the V1 integration: the
+      // feed no longer carries fixtures. Everything else about the contract
+      // — single page, no duplicates, every owned DRAMA row present — is
+      // unchanged, which is what this test is for.
+      for (const owned of testVideos.map((video) => video.id)) {
         expect(ids).toContain(owned);
       }
+      expect(ids).not.toContain(qaFixtureId);
     });
 
-    it('reports the same classification from findById as from the feed', async () => {
+    it('reports the same classification from findById as from the feed, for rows the feed carries', async () => {
+      // Narrowed by the V1 integration to the rows the feed can still
+      // return. A fixture no longer appears in the feed at all, so
+      // "the same classification from both" is not a question that can be
+      // asked of one — its classification via findById is pinned by the
+      // dedicated test above instead.
       const feed = await service.findAll();
 
-      for (const id of [`${testVideoIdPrefix}-01`, qaFixtureId]) {
-        const fromFeed = feed.find((video) => video.id === id);
-        const fromById = await service.findById(id);
+      const fromFeed = feed.find(
+        (video) => video.id === `${testVideoIdPrefix}-01`,
+      );
+      const fromById = await service.findById(`${testVideoIdPrefix}-01`);
 
-        expect(fromById.contentKind).toBe(fromFeed?.contentKind);
-      }
+      expect(fromFeed).toBeDefined();
+      expect(fromById.contentKind).toBe(fromFeed?.contentKind);
+      expect(fromById.contentKind).toBe(VideoContentKind.DRAMA);
     });
   });
 

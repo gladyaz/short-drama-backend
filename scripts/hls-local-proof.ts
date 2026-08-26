@@ -18,6 +18,14 @@ import { HlsSmokeRunner } from '../src/transcode/hls/hls-smoke-runner.service';
  * Usage:
  *
  *   npm run hls:local-proof
+ *   npm run hls:local-proof -- --keep
+ *
+ * `--keep` retains the produced package directory instead of deleting it, and
+ * prints its absolute path as `packageRoot` in the JSON summary — for a manual
+ * investigation that needs to `ffprobe` each rendition or serve the manifests
+ * to a real HLS client. The caller must delete that directory afterwards; it
+ * holds several megabytes per run. Without the flag, behavior is exactly as
+ * before (the package is always removed).
  *
  * Exits `0` when the local package validated successfully, `1` otherwise
  * (including any thrown error, e.g. an ffmpeg failure) — so this script's
@@ -25,16 +33,24 @@ import { HlsSmokeRunner } from '../src/transcode/hls/hls-smoke-runner.service';
  * without needing to parse the JSON output.
  */
 async function main(): Promise<void> {
-  const app = await NestFactory.createApplicationContext(WorkerModule.register(), {
-    logger: false,
-  });
+  const app = await NestFactory.createApplicationContext(
+    WorkerModule.register(),
+    {
+      logger: false,
+    },
+  );
 
   try {
     const runner = app.get(HlsSmokeRunner);
-    const result = await runner.run();
+    const keepPackage = process.argv.includes('--keep');
+    const result = await runner.run({ keepPackage });
 
     const summary = {
       wallClockMs: result.wallClockMs,
+      // Only meaningful with `--keep`; without it this directory is already
+      // gone by the time this line runs, so it is reported as `null` rather
+      // than as a path that no longer exists.
+      packageRoot: keepPackage ? result.packageRoot : null,
       sourceProbe: result.sourceProbe,
       ladderRungs: result.ladder.rungs.map((rung) => ({
         name: rung.name,

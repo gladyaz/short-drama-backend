@@ -217,6 +217,26 @@ export interface HlsSmokeRunOptions {
    * `false`.
    */
   upload?: boolean;
+  /**
+   * When `true`, the produced local package root is NOT removed by `run()`'s
+   * `finally` block, and the caller becomes responsible for deleting it. The
+   * synthetic source's own temp directory is still always removed — only the
+   * HLS package (master + per-rung playlists/segments) is retained.
+   *
+   * Exists so an operator can inspect a REAL pipeline output by hand
+   * (`ffprobe` each rendition, serve the manifests to an HLS client, diff a
+   * suspect playlist) without needing a second, parallel implementation of
+   * the pipeline just to keep its bytes around. Defaults to `false`, so every
+   * pre-existing caller — every offline test and the default
+   * `hls:local-proof` invocation — keeps the original always-clean-up
+   * behavior unchanged.
+   *
+   * NEVER set together with `upload: true` by anything other than a
+   * deliberate manual investigation: the R2 cleanup path is independent of
+   * this flag (uploaded objects are always deleted), but retaining a
+   * multi-megabyte package on disk is a leak if nothing removes it.
+   */
+  keepPackage?: boolean;
 }
 
 export interface HlsSmokeRunResult {

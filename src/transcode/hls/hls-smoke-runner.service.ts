@@ -77,6 +77,7 @@ export class HlsSmokeRunner {
   async run(options: HlsSmokeRunOptions = {}): Promise<HlsSmokeRunResult> {
     const startedAt = Date.now();
     const upload = options.upload ?? false;
+    const keepPackage = options.keepPackage ?? false;
 
     const source = await this.syntheticSourceService.generate();
     const packageRoot = await mkdtemp(
@@ -176,7 +177,22 @@ export class HlsSmokeRunner {
       }
 
       await rm(source.tempDir, { recursive: true, force: true });
-      await rm(packageRoot, { recursive: true, force: true });
+
+      // The synthetic source above is ALWAYS removed; the produced package is
+      // retained only on an explicit `keepPackage` opt-in (see that option's
+      // doc comment) so a manual investigation can probe the real artifacts.
+      // Uploaded R2 objects are unaffected either way — they are cleaned up
+      // unconditionally by `cleanupUploadedObjects` above.
+      if (keepPackage) {
+        this.logger.warn(
+          redactSensitiveText(
+            `HLS smoke run retained its local package at "${packageRoot}" ` +
+              `(keepPackage: true) — the CALLER is responsible for deleting it.`,
+          ),
+        );
+      } else {
+        await rm(packageRoot, { recursive: true, force: true });
+      }
 
       // Only flag a cleanup-specific error when the run would OTHERWISE have
       // succeeded (`result` was assigned) — never mask an earlier, more

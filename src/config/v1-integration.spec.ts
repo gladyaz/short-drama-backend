@@ -177,3 +177,134 @@ describe('V1 integration — HLS disabled is a valid V1 posture', () => {
     ).toThrow(/it must use https/);
   });
 });
+
+/**
+ * RED PANDA V1 INTEGRATION — WHATSAPP LOGIN × REWARDS at the BOOT CONTRACT.
+ *
+ * `feat/v1-whatsapp-auth` and `feat/v1-rewards-social` both added rules to
+ * `validateEnv` without knowing about the other, and both import a constants
+ * module into `env.validation.ts` to do it. Each rule is covered in isolation
+ * by `env.validation.spec.ts`; what nothing covered until this merge is that
+ * the two coexist — that a production posture satisfying one still has to
+ * satisfy the other, and that neither import quietly broke the other's
+ * ordering.
+ *
+ * Every value here is a placeholder. No real Meta credential, no real social
+ * account, and nothing in this file opens a connection or sends a message.
+ */
+const V1_WHATSAPP: Record<string, unknown> = {
+  WHATSAPP_AUTH_ENABLED: 'true',
+  WHATSAPP_OTP_PROVIDER_DRIVER: 'cloud-api',
+  WHATSAPP_CLOUD_API_PHONE_NUMBER_ID: '111122223333444',
+  WHATSAPP_CLOUD_API_ACCESS_TOKEN: 'placeholder-access-token',
+  WHATSAPP_CLOUD_API_TEMPLATE_NAME: 'red_panda_login_otp',
+  WHATSAPP_CLOUD_API_TEMPLATE_LANGUAGE: 'id',
+};
+
+const V1_REWARDS: Record<string, unknown> = {
+  REWARDS_ENABLED: 'true',
+  REWARDS_SOCIAL_INSTAGRAM_URL: 'https://www.instagram.com/redpanda',
+  REWARDS_SOCIAL_TIKTOK_URL: 'https://www.tiktok.com/@redpanda',
+  REWARDS_SOCIAL_YOUTUBE_URL: 'https://www.youtube.com/@redpanda',
+};
+
+/** The full V1 product: free content + ads + rewards + Google + WhatsApp. */
+const PRODUCTION_V1: Record<string, unknown> = {
+  ...PRODUCTION_BASE,
+  ...V1_WHATSAPP,
+  ...V1_REWARDS,
+  CONTENT_ACCESS_MODE: 'free',
+};
+
+describe('V1 integration — WhatsApp and Rewards coexist at boot', () => {
+  it('CRITICAL: accepts the complete V1 production posture', () => {
+    expect(() => validateEnv({ ...PRODUCTION_V1 })).not.toThrow();
+  });
+
+  it('still refuses a bad WhatsApp sender when the rewards config is perfect', () => {
+    // The failure mode this guards: an import added for rewards reordering or
+    // short-circuiting `validateWhatsAppConfig`, so a broken sender boots.
+    expect(() =>
+      validateEnv({
+        ...PRODUCTION_V1,
+        WHATSAPP_CLOUD_API_ACCESS_TOKEN: '',
+      }),
+    ).toThrow(/WHATSAPP_CLOUD_API_ACCESS_TOKEN/);
+  });
+
+  it('still refuses a bad social URL when the WhatsApp config is perfect', () => {
+    expect(() =>
+      validateEnv({
+        ...PRODUCTION_V1,
+        REWARDS_SOCIAL_TIKTOK_URL: 'https://www.instagram.com/redpanda',
+      }),
+    ).toThrow(/REWARDS_SOCIAL_TIKTOK_URL/);
+  });
+
+  it('CRITICAL: neither feature weakens the production https gate', () => {
+    expect(() =>
+      validateEnv({
+        ...PRODUCTION_V1,
+        PUBLIC_BASE_URL: 'http://api.redpanda-not-a-real-domain.app',
+      }),
+    ).toThrow();
+  });
+
+  it('CRITICAL: a WhatsApp boot failure never echoes the access token', () => {
+    let message = '';
+    try {
+      validateEnv({
+        ...PRODUCTION_V1,
+        WHATSAPP_CLOUD_API_ACCESS_TOKEN: '   ',
+        JWT_ACCESS_SECRET: 'super-secret-value-that-must-not-leak',
+      });
+    } catch (error) {
+      message = (error as Error).message;
+    }
+
+    expect(message).toContain('WHATSAPP_CLOUD_API_ACCESS_TOKEN');
+    expect(message).not.toContain('placeholder-access-token');
+    expect(message).not.toContain('super-secret-value-that-must-not-leak');
+  });
+
+  it('runs both features together with the HLS pipeline on', () => {
+    expect(() =>
+      validateEnv({ ...PRODUCTION_V1, ...PRODUCTION_HLS }),
+    ).not.toThrow();
+  });
+
+  it('runs both features together with R2 object storage on', () => {
+    expect(() =>
+      validateEnv({ ...PRODUCTION_V1, ...PRODUCTION_R2 }),
+    ).not.toThrow();
+  });
+
+  /**
+   * DEVELOPMENT MUST STAY UNBLOCKED. The V1 requirement is a RELEASE rule
+   * enforced by the production preflight, never a boot rule — a laptop with
+   * no Meta credentials and no social URLs has to keep starting, or nobody
+   * can work on anything else.
+   */
+  it('CRITICAL: still boots in development with neither feature configured', () => {
+    expect(() =>
+      validateEnv({
+        ...PRODUCTION_BASE,
+        NODE_ENV: 'development',
+        PUBLIC_BASE_URL: 'http://localhost:3000',
+      }),
+    ).not.toThrow();
+  });
+
+  it('CRITICAL: still boots in production with both features simply switched off', () => {
+    // The boot contract's job is "will it run", not "is it V1". A deployment
+    // with rewards dark and WhatsApp off is a running backend; the preflight
+    // is what refuses to call it a V1 release.
+    expect(() =>
+      validateEnv({
+        ...PRODUCTION_BASE,
+        WHATSAPP_AUTH_ENABLED: 'false',
+        REWARDS_ENABLED: 'false',
+      }),
+    ).not.toThrow();
+  });
+});

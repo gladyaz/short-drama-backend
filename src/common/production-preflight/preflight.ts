@@ -406,19 +406,35 @@ function checkForbiddenVariables(env: EnvRecord, add: AddFinding): void {
  * shipping it sends every user who taps the tile to a profile Red Panda does
  * not own — while still paying them the points.
  *
- * Everything else here is posture: a deployment may legitimately run no
- * social missions at all, or run rewards with the flag off. Those are stated,
- * not blocked.
+ * REWARDS ARE REQUIRED V1, so the flag being off and the V1 platforms being
+ * unconfigured both BLOCK. On `feat/v1-rewards-social` these were warnings,
+ * for the same reason the WhatsApp check warned: a feature branch cannot
+ * decide on its own whether a release without it is still the release. THE
+ * V1 INTEGRATION DECIDES IT — the product is free content + ads + REWARDS —
+ * and a preflight that answered "no blockers" for a build with no earn loop
+ * would be certifying a V1 that is not V1.
+ *
+ * WHICH PLATFORMS COUNT IS READ FROM THE CATALOG (`requiredForV1`), never
+ * re-listed here. Instagram, TikTok and YouTube are the three V1 specifies;
+ * FACEBOOK IS DELIBERATELY NOT REQUIRED — its tile exists only because the
+ * foundation slice already served it, and a release is not broken for
+ * omitting a platform the product never asked for.
+ *
+ * STILL NOT BLOCKED: everything about whether the accounts are any good. This
+ * check cannot see whether the profile has followers, whether the handle is
+ * the brand's, or whether the link resolves — only that it is present,
+ * well-shaped, and not a leftover template.
  */
 function checkRewardsPosture(env: EnvRecord, add: AddFinding): void {
   if (env.REWARDS_ENABLED !== 'true') {
     add(
-      'WARNING',
+      'BLOCKER',
       'rewards',
       'REWARDS_ENABLED is not "true" — every /rewards/* route answers 503 ' +
         'REWARDS_DISABLED, no watch credit is recorded, and the app ships ' +
-        'with no earn or spend loop at all. V1 is specified as free content ' +
-        '+ ads + rewards, so confirm this is deliberate.',
+        'with no earn or spend loop at all. Red Panda V1 is specified as ' +
+        'free content + ads + REWARDS, so this is not a shippable V1 ' +
+        'posture.',
     );
     return;
   }
@@ -455,14 +471,28 @@ function checkRewardsPosture(env: EnvRecord, add: AddFinding): void {
     }
   }
 
-  if (configured.length === 0) {
+  // Read from the catalog, so adding a V1 platform cannot leave this check
+  // silently grading the old list. A URL that is SET but malformed is not in
+  // `configured` and is therefore reported missing here too — correctly: the
+  // mission it names is not served either way, and the boot-contract blocker
+  // above already names the malformed value itself.
+  const missingRequired = SOCIAL_MISSION_DEFINITIONS.filter(
+    (mission) =>
+      mission.requiredForV1 && !configured.includes(mission.platform),
+  );
+
+  if (missingRequired.length > 0) {
     add(
-      'WARNING',
+      'BLOCKER',
       'social missions',
-      'REWARDS_ENABLED=true but no REWARDS_SOCIAL_*_URL is configured, so no ' +
-        'social follow mission is served. The daily check-in and the watch ' +
-        'milestones still work. Set the Instagram, TikTok and YouTube URLs ' +
-        'to ship the full V1 earn loop.',
+      `REWARDS_ENABLED=true but ${missingRequired.length} of the V1 social ` +
+        'missions has no usable profile URL: ' +
+        `${missingRequired.map((mission) => mission.envKey).join(', ')}. ` +
+        'A mission with no URL is not served at all, so this ships a Rewards ' +
+        'Center missing part of the V1 earn loop — silently, with no error ' +
+        'anywhere for anyone to notice. The daily check-in and the watch ' +
+        'milestones are unaffected. REWARDS_SOCIAL_FACEBOOK_URL is NOT ' +
+        'required and is not counted here.',
     );
     return;
   }
@@ -470,9 +500,11 @@ function checkRewardsPosture(env: EnvRecord, add: AddFinding): void {
   add(
     'PASS',
     'social missions',
-    `${configured.length} social mission(s) configured (${configured.join(', ')}). ` +
-      'These are USER-CONFIRMED external actions — no platform verifies a ' +
-      'follow, and the backend does not claim one.',
+    `${configured.length} social mission(s) configured (${configured.join(', ')}), ` +
+      'including every platform V1 requires. These are USER-CONFIRMED ' +
+      'external actions — no platform verifies a follow, and the backend ' +
+      'does not claim one. STRUCTURAL ONLY: this cannot confirm that a URL ' +
+      'points at an account Red Panda actually owns.',
   );
 }
 
@@ -614,16 +646,26 @@ function checkFeaturePosture(env: EnvRecord, add: AddFinding): void {
  * WHATSAPP LOGIN V1 — the named `WhatsApp sign-in` verdict.
  *
  * V1 SHIPS WHATSAPP LOGIN AS A REQUIRED SIGN-IN METHOD, so "not enabled" is
- * a WARNING here rather than the silent pass an optional provider would get:
- * a build that reaches the Play Store with `WHATSAPP_AUTH_ENABLED` unset
- * answers `503` to every OTP route, and an operator must see that stated
- * before release rather than discover it from a review.
+ * a BLOCKER: a build that reaches the Play Store with `WHATSAPP_AUTH_ENABLED`
+ * unset answers `503` to every OTP route, and half the login screen is dead.
  *
- * A BLOCKER means "this will not boot, or it will boot and be wrong" — the
- * same bar the rest of this file uses. Every blocker below is a posture
- * `validateEnv` also refuses, which is deliberate: the boot contract is the
- * enforcement, and this is the legible, per-feature reading of it an
- * operator gets BEFORE spending a deploy to find out.
+ * WHY THIS IS A BLOCKER AND NOT THE WARNING THE FEATURE BRANCH SHIPPED. On
+ * `feat/v1-whatsapp-auth` this check could only speak for its own feature; it
+ * had no standing to decide whether a release without WhatsApp was a release,
+ * so it stated the posture and let a human judge. THE V1 INTEGRATION DECIDES
+ * IT: the product is free content + ads + rewards + Google + WhatsApp, and a
+ * preflight that answered "no blockers" for a build with no WhatsApp
+ * transport would be certifying a V1 that is not V1. Nothing was weakened to
+ * get here — a posture that used to warn now blocks.
+ *
+ * A BLOCKER otherwise means "this will not boot, or it will boot and be
+ * wrong" — the same bar the rest of this file uses. Every OTHER blocker below
+ * is a posture `validateEnv` also refuses, which is deliberate: the boot
+ * contract is the enforcement, and this is the legible, per-feature reading
+ * of it an operator gets BEFORE spending a deploy to find out. The
+ * feature-absent blocker is the one exception, and it is a RELEASE rule
+ * rather than a boot rule on purpose: development and test must keep starting
+ * with no Meta credentials at all.
  *
  * IT CHECKS PRESENCE, NEVER VALIDITY, and never echoes a value. Whether a
  * token is accepted by Meta, whether the template is approved, and whether
@@ -639,11 +681,16 @@ function addWhatsAppFindings(
 
   if (env.WHATSAPP_AUTH_ENABLED !== 'true') {
     add(
-      'WARNING',
+      'BLOCKER',
       CHECK,
       'WHATSAPP_AUTH_ENABLED is not "true" — every /auth/whatsapp/* route ' +
-        'answers 503 WHATSAPP_AUTH_DISABLED. V1 ships WhatsApp login as a ' +
-        'required sign-in method, so confirm this is deliberate.',
+        'answers 503 WHATSAPP_AUTH_DISABLED, so the app ships with half its ' +
+        'login screen dead. Red Panda V1 ships WhatsApp login as a REQUIRED ' +
+        'sign-in method alongside Google, so this is not a shippable V1 ' +
+        'posture. Set WHATSAPP_AUTH_ENABLED=true with ' +
+        'WHATSAPP_OTP_PROVIDER_DRIVER=cloud-api and the Cloud API sender ' +
+        'variables (docs/WHATSAPP_LOGIN_SETUP.md), or ship a release that is ' +
+        'not V1.',
     );
     return;
   }

@@ -79,6 +79,23 @@ export interface SocialMissionDefinition {
   /** Server-decided reward. Never sent by, or influenced by, a client. */
   readonly rewardPoints: number;
   /**
+   * Whether the Red Panda V1 release is specified to ship this platform's
+   * mission.
+   *
+   * A FLAG RATHER THAN A LIST IN THE PREFLIGHT. The prose below already said
+   * which three V1 requires; `production-preflight/preflight.ts` now BLOCKS a
+   * release that is missing one, and a second hand-written list of platform
+   * names there is exactly the kind of duplicate that goes stale the first
+   * time the product adds a platform. The catalog is the one source of truth.
+   *
+   * IT DOES NOT MAKE THE VARIABLE MANDATORY AT BOOT. `env.validation.ts`
+   * still treats every social URL as optional, because a development or test
+   * process has no business refusing to start over a marketing link. The
+   * requirement is a RELEASE property, so it is enforced where release
+   * properties are enforced — the production preflight.
+   */
+  readonly requiredForV1: boolean;
+  /**
    * Hostnames a URL for this platform may legitimately use.
    *
    * WHY AN ALLOWLIST RATHER THAN "any https URL". `REWARDS_SOCIAL_TIKTOK_URL`
@@ -94,13 +111,16 @@ export interface SocialMissionDefinition {
 }
 
 /**
- * INSTAGRAM, TIKTOK and YOUTUBE are the three V1 requires. FACEBOOK is
+ * INSTAGRAM, TIKTOK and YOUTUBE are the three V1 requires, marked
+ * `requiredForV1: true` so the production preflight can BLOCK a release that
+ * is missing one without keeping its own copy of the list. FACEBOOK is
  * included because the foundation slice's placeholder catalog already served
  * a `task_social_facebook` tile and the mobile `SocialPlatform` union already
  * carries the member — dropping it here would silently remove a tile that has
- * been on screen for weeks. Like the other three it appears only when its URL
- * is configured, so a deployment that does not want it simply leaves the
- * variable unset.
+ * been on screen for weeks. It is `requiredForV1: false`: like the other
+ * three it appears only when its URL is configured, so a deployment that does
+ * not want it simply leaves the variable unset, and a RELEASE is never held
+ * up for a platform the product did not ask for.
  */
 export const SOCIAL_MISSION_DEFINITIONS: readonly SocialMissionDefinition[] = [
   {
@@ -108,6 +128,7 @@ export const SOCIAL_MISSION_DEFINITIONS: readonly SocialMissionDefinition[] = [
     platform: 'INSTAGRAM',
     envKey: 'REWARDS_SOCIAL_INSTAGRAM_URL',
     rewardPoints: 50,
+    requiredForV1: true,
     allowedHosts: ['instagram.com', 'www.instagram.com'],
   },
   {
@@ -115,6 +136,7 @@ export const SOCIAL_MISSION_DEFINITIONS: readonly SocialMissionDefinition[] = [
     platform: 'TIKTOK',
     envKey: 'REWARDS_SOCIAL_TIKTOK_URL',
     rewardPoints: 50,
+    requiredForV1: true,
     allowedHosts: ['tiktok.com', 'www.tiktok.com', 'm.tiktok.com'],
   },
   {
@@ -122,6 +144,7 @@ export const SOCIAL_MISSION_DEFINITIONS: readonly SocialMissionDefinition[] = [
     platform: 'YOUTUBE',
     envKey: 'REWARDS_SOCIAL_YOUTUBE_URL',
     rewardPoints: 50,
+    requiredForV1: true,
     allowedHosts: [
       'youtube.com',
       'www.youtube.com',
@@ -134,6 +157,7 @@ export const SOCIAL_MISSION_DEFINITIONS: readonly SocialMissionDefinition[] = [
     platform: 'FACEBOOK',
     envKey: 'REWARDS_SOCIAL_FACEBOOK_URL',
     rewardPoints: 50,
+    requiredForV1: false,
     allowedHosts: ['facebook.com', 'www.facebook.com', 'm.facebook.com'],
   },
 ];

@@ -9,6 +9,25 @@ import {
  * credential appears in this file, and the preflight itself never opens a
  * connection — these tests are pure in-memory evaluations of an env record.
  */
+/**
+ * A COMPLETE, SHIPPABLE RED PANDA V1 PRODUCTION POSTURE — which is a stronger
+ * thing than it was before the V1 integration, and deliberately so.
+ *
+ * Both feature branches shipped this fixture WITHOUT their own feature in it,
+ * because on a feature branch "V1 requires WhatsApp login" is an assertion the
+ * branch has no standing to make. Integrated, it is settled: V1 is free
+ * content + ads + rewards + Google + WhatsApp, so a configuration missing
+ * WhatsApp transport or the rewards earn loop is no longer "complete", and
+ * every `ok === true` assertion in this file would be certifying a release
+ * that is not V1 if this fixture stayed minimal.
+ *
+ * Each negative case below therefore SUBTRACTS from a good posture rather
+ * than adding to an incomplete one — which is also why the WhatsApp cases now
+ * pass `undefined` explicitly.
+ *
+ * GOOGLE SIGN-IN IS DELIBERATELY ABSENT: it warns rather than blocks, and one
+ * of the assertions below pins exactly that.
+ */
 const VALID_PRODUCTION_ENV: EnvRecord = {
   NODE_ENV: 'production',
   PORT: '3000',
@@ -21,6 +40,20 @@ const VALID_PRODUCTION_ENV: EnvRecord = {
   AUTH_AUDIT_IP_HASH_SECRET: 'c'.repeat(48),
   TRUST_PROXY_HOPS: '1',
   DEV_TOOLS_ENABLED: 'false',
+  // WHATSAPP LOGIN V1 — required. Fixture values only; none of these is a
+  // real Meta credential and none is ever sent anywhere by this suite.
+  WHATSAPP_AUTH_ENABLED: 'true',
+  WHATSAPP_OTP_PROVIDER_DRIVER: 'cloud-api',
+  WHATSAPP_CLOUD_API_PHONE_NUMBER_ID: '111122223333444',
+  WHATSAPP_CLOUD_API_ACCESS_TOKEN: 'spec-fixture-token',
+  WHATSAPP_CLOUD_API_TEMPLATE_NAME: 'red_panda_login_otp',
+  WHATSAPP_CLOUD_API_TEMPLATE_LANGUAGE: 'id',
+  // REWARDS V1 — required, with the three platforms V1 specifies. Facebook is
+  // left unset on purpose: it must NOT be required.
+  REWARDS_ENABLED: 'true',
+  REWARDS_SOCIAL_INSTAGRAM_URL: 'https://www.instagram.com/redpanda',
+  REWARDS_SOCIAL_TIKTOK_URL: 'https://www.tiktok.com/@redpanda',
+  REWARDS_SOCIAL_YOUTUBE_URL: 'https://www.youtube.com/@redpanda',
 };
 
 function severityOf(env: EnvRecord, check: string): string[] {
@@ -338,11 +371,30 @@ describe('runProductionPreflight', () => {
         WHATSAPP_CLOUD_API_TEMPLATE_LANGUAGE: 'id',
       };
 
-      it('WARNS when WhatsApp login is not enabled — V1 requires it', () => {
-        expect(severityOf(VALID_PRODUCTION_ENV, 'WhatsApp sign-in')).toEqual([
-          'WARNING',
-        ]);
-        expect(runProductionPreflight(VALID_PRODUCTION_ENV).ok).toBe(true);
+      it('BLOCKS a release with WhatsApp login not enabled — V1 requires it', () => {
+        const env = {
+          ...VALID_PRODUCTION_ENV,
+          WHATSAPP_AUTH_ENABLED: 'false',
+        };
+
+        expect(severityOf(env, 'WhatsApp sign-in')).toEqual(['BLOCKER']);
+        // THE POINT OF THE WHOLE CHECK: a V1 candidate with no WhatsApp
+        // transport must not be able to report itself ready.
+        expect(runProductionPreflight(env).ok).toBe(false);
+        // ...and it is a RELEASE rule, not a boot rule — the process still
+        // starts, which is what keeps development and test working with no
+        // Meta credentials at all.
+        expect(severityOf(env, 'boot contract')).not.toContain('BLOCKER');
+      });
+
+      it('BLOCKS a release with WHATSAPP_AUTH_ENABLED unset entirely', () => {
+        const env = {
+          ...VALID_PRODUCTION_ENV,
+          WHATSAPP_AUTH_ENABLED: undefined,
+        };
+
+        expect(severityOf(env, 'WhatsApp sign-in')).toEqual(['BLOCKER']);
+        expect(runProductionPreflight(env).ok).toBe(false);
       });
 
       it('BLOCKS the fake driver, which cannot start in production', () => {
@@ -359,7 +411,11 @@ describe('runProductionPreflight', () => {
       });
 
       it('BLOCKS an enabled provider with no driver named', () => {
-        const env = { ...VALID_PRODUCTION_ENV, WHATSAPP_AUTH_ENABLED: 'true' };
+        const env = {
+          ...VALID_PRODUCTION_ENV,
+          WHATSAPP_AUTH_ENABLED: 'true',
+          WHATSAPP_OTP_PROVIDER_DRIVER: undefined,
+        };
 
         expect(severityOf(env, 'WhatsApp sign-in')).toEqual(['BLOCKER']);
         expect(severityOf(env, 'boot contract')).toContain('BLOCKER');
@@ -512,10 +568,15 @@ describe('runProductionPreflight', () => {
       REWARDS_SOCIAL_YOUTUBE_URL: 'https://www.youtube.com/@redpanda',
     };
 
-    it('WARNS that a release with rewards off has no earn loop at all', () => {
-      expect(severityOf(VALID_PRODUCTION_ENV, 'rewards')).toEqual(['WARNING']);
-      // A posture, not a defect: it does not block a release.
-      expect(runProductionPreflight(VALID_PRODUCTION_ENV).ok).toBe(true);
+    it('BLOCKS a release with rewards off — it has no earn loop at all', () => {
+      const env = { ...VALID_PRODUCTION_ENV, REWARDS_ENABLED: 'false' };
+
+      expect(severityOf(env, 'rewards')).toEqual(['BLOCKER']);
+      // V1 IS SPECIFIED AS free content + ads + REWARDS, so this is a defect
+      // in the release, not a posture to be confirmed by hand.
+      expect(runProductionPreflight(env).ok).toBe(false);
+      // A RELEASE rule, not a boot rule: the process still starts.
+      expect(severityOf(env, 'boot contract')).not.toContain('BLOCKER');
     });
 
     it('PASSES a fully configured V1 rewards posture', () => {
@@ -534,11 +595,47 @@ describe('runProductionPreflight', () => {
       expect(finding?.detail).toMatch(/no platform verifies a follow/i);
     });
 
-    it('WARNS when rewards are on but no social mission is configured', () => {
-      const env = { ...VALID_PRODUCTION_ENV, REWARDS_ENABLED: 'true' };
+    it('BLOCKS when rewards are on but no social mission is configured', () => {
+      const env = {
+        ...VALID_PRODUCTION_ENV,
+        REWARDS_ENABLED: 'true',
+        REWARDS_SOCIAL_INSTAGRAM_URL: undefined,
+        REWARDS_SOCIAL_TIKTOK_URL: undefined,
+        REWARDS_SOCIAL_YOUTUBE_URL: undefined,
+      };
 
-      expect(severityOf(env, 'social missions')).toEqual(['WARNING']);
-      expect(runProductionPreflight(env).ok).toBe(true);
+      expect(severityOf(env, 'social missions')).toEqual(['BLOCKER']);
+      expect(runProductionPreflight(env).ok).toBe(false);
+    });
+
+    it.each([
+      'REWARDS_SOCIAL_INSTAGRAM_URL',
+      'REWARDS_SOCIAL_TIKTOK_URL',
+      'REWARDS_SOCIAL_YOUTUBE_URL',
+    ])('BLOCKS when only %s is missing, and names it', (key) => {
+      // Partial configuration is the realistic failure: three variables to
+      // fill in, one forgotten, and the tile silently never appears.
+      const env = { ...VALID_PRODUCTION_ENV, [key]: undefined };
+
+      expect(severityOf(env, 'social missions')).toEqual(['BLOCKER']);
+      expect(
+        runProductionPreflight(env).findings.find(
+          (f) => f.check === 'social missions',
+        )?.detail,
+      ).toContain(key);
+    });
+
+    /**
+     * FACEBOOK IS NOT A V1 REQUIREMENT. Its tile exists only because the
+     * foundation slice already served it; requiring a platform the product
+     * never asked for would block releases for no reason.
+     */
+    it('does NOT require Facebook — the V1 three are enough to pass', () => {
+      expect(VALID_PRODUCTION_ENV.REWARDS_SOCIAL_FACEBOOK_URL).toBeUndefined();
+      expect(severityOf(VALID_PRODUCTION_ENV, 'social missions')).toEqual([
+        'PASS',
+      ]);
+      expect(runProductionPreflight(VALID_PRODUCTION_ENV).ok).toBe(true);
     });
 
     it('CRITICAL: BLOCKS a social URL still carrying a template handle', () => {

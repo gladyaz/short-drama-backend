@@ -1,8 +1,21 @@
 # Play Store V1 — Integrated Backend
 
 The single reference for the merged V1 backend line
-(`integration/playstore-v1-backend`), which joins the HLS/transcoding work
-and the production-HTTPS work that had diverged at `27b8389`.
+(`integration/v1-auth-rewards`), the Red Panda V1 release integration
+candidate.
+
+It builds on `integration/playstore-v1-backend` — which joined the
+HLS/transcoding work and the production-HTTPS work that had diverged at
+`27b8389` — and adds the two completed V1 feature lines:
+
+- `feat/v1-whatsapp-auth` — WhatsApp Login (Meta WhatsApp Cloud API OTP).
+- `feat/v1-rewards-social` — the Rewards V1 earn-and-spend loop.
+
+**RED PANDA V1 IS: free content + ads + rewards + Google Login + WhatsApp
+Login, served over HLS.** There is NO payment, NO subscription, NO premium
+paywall and NO coin purchase in V1. The entitlement and payment code paths
+remain in the tree, switched off, because a later release needs them — they
+are dormant architecture, not shipped product.
 
 **Nothing described here is deployed.** Every hostname is a `<placeholder>`
 the release owner fills in.
@@ -12,6 +25,11 @@ Companion documents:
 - `docs/PRODUCTION_DEPLOYMENT_REQUIREMENTS.md` — runtime, database, resources.
 - `docs/R2_MEDIA_MIGRATION.md` — moving catalog media into object storage.
 - `docs/HLS_TRANSCODE_WAVE.md` — running a controlled transcode wave.
+- `docs/WHATSAPP_LOGIN_SETUP.md` — what an operator must obtain from Meta.
+- `docs/rewards-api-contract.md` — the rewards API, including §6 on why a
+  social mission is `USER_CONFIRMED` and never a verified follow.
+- `docs/auth-identity-api-contract.md` — the Google and WhatsApp sign-in
+  contracts the mobile app codes against.
 
 ---
 
@@ -152,7 +170,7 @@ filter, so 4 published fixtures reached ordinary viewers as episodes.
 |---|---|
 | Email / password | **READY IN CODE.** No flag, no external dependency. |
 | Google | **READY IN CODE, NEEDS EXTERNAL CONFIG.** Real JWKS verifier. Needs `GOOGLE_AUTH_ENABLED=true` + `GOOGLE_OAUTH_CLIENT_IDS`, an OAuth client for `com.spark.redpanda`, and the **Play App Signing SHA-1**. No client secret is required or ever read. |
-| WhatsApp | **NOT IMPLEMENTED.** Only the `fake` driver exists; boot refuses it outside dev/test, so it cannot be enabled in production at all. |
+| WhatsApp | **READY IN CODE, NEEDS EXTERNAL CONFIG (Meta).** The production `cloud-api` driver (Meta WhatsApp Cloud API) ships and is fully tested. It cannot run until an operator obtains real Meta credentials — see "WhatsApp external requirements" below and `docs/WHATSAPP_LOGIN_SETUP.md`. The `fake` driver still exists for local/test only, and boot refuses it outside `NODE_ENV=development/test`. |
 | Payments | **OUT OF V1.** `PAYMENTS_ENABLED=false`; `/payments/*` answers 503. |
 | Ads (AdMob) | External. Owner supplies the AdMob app id and unit ids to the mobile app; the backend only serves pacing config via `GET /config/ads`. |
 | Rewards | **READY IN CODE, NEEDS CONFIG.** Set `REWARDS_ENABLED=true` plus the three `REWARDS_SOCIAL_*_URL` values. Earn: daily check-in, social follow missions (Instagram/TikTok/YouTube), watch milestones. Spend: ad-skip and temporary ad-pass perks. See `docs/rewards-api-contract.md`. |
@@ -162,6 +180,56 @@ subscription and no coin purchase. Coins are earned only through the three
 paths above and spent only on ad perks; the VIP redemptions in the catalog are
 withheld entirely while `CONTENT_ACCESS_MODE=free`, because unlocking content
 that is already free would charge points and change nothing.
+
+### WhatsApp external requirements — NOT YET SATISFIED
+
+Nothing below can be invented, generated, or worked around in code. The
+backend is complete; these are the facts only Meta holds.
+
+| Needed from Meta | Variable |
+|---|---|
+| WhatsApp Business sender's Graph API **Phone number ID** | `WHATSAPP_CLOUD_API_PHONE_NUMBER_ID` |
+| **System User access token** (permanent, `whatsapp_business_messaging`) | `WHATSAPP_CLOUD_API_ACCESS_TOKEN` — **secret** |
+| An **approved AUTHENTICATION-category template** | `WHATSAPP_CLOUD_API_TEMPLATE_NAME` |
+| That template's approved language code | `WHATSAPP_CLOUD_API_TEMPLATE_LANGUAGE` |
+
+**This provisioning has NOT been done.** No Meta account, app, sender number,
+token or template exists for this project yet, and no fake value for any of
+them ships in this repository. `npm run production:preflight` reports a
+`BLOCKER` until all four are set, and it can only check that they are
+PRESENT — whether the token is valid, whether the template is approved and
+un-paused, and whether the number can actually send are unknowable from
+configuration. **One real end-to-end OTP to a handset you control is the only
+proof of delivery**, and it has not been performed.
+
+### Rewards external requirements — NOT YET SATISFIED
+
+| Needed from the product owner | Variable |
+|---|---|
+| Official Red Panda **Instagram** profile URL | `REWARDS_SOCIAL_INSTAGRAM_URL` |
+| Official Red Panda **TikTok** profile URL | `REWARDS_SOCIAL_TIKTOK_URL` |
+| Official Red Panda **YouTube** channel URL | `REWARDS_SOCIAL_YOUTUBE_URL` |
+
+**These URLs have NOT been supplied.** No real Red Panda social account URL
+appears anywhere in this repository. Facebook
+(`REWARDS_SOCIAL_FACEBOOK_URL`) is **optional** — V1 specifies Instagram,
+TikTok and YouTube only, and a release is never blocked for omitting a
+platform the product did not ask for.
+
+Boot refuses a URL that is not https, is not on that platform's own domains,
+or points at a platform home page instead of a profile. The preflight
+additionally **BLOCKS** a release whose URL still carries a template segment
+such as `your-handle`, and **BLOCKS** a release missing any of the three V1
+platforms.
+
+### Ads external requirements — NOT YET SATISFIED
+
+AdMob configuration is **entirely mobile/external**. The owner supplies the
+AdMob app id and ad unit ids to the Android app. **No AdMob SDK, no ad-network
+integration and no ad-serving decision exists in this backend, and none
+should** — the backend only serves pacing config via `GET /config/ads` and
+records the two ad perks a user has bought with points. These ids have not
+been supplied.
 
 **Social missions are user-confirmed, not verified.** No platform exposes a
 "did user X follow page Y" check for an arbitrary user, so the server records
@@ -184,11 +252,29 @@ API_BASE_URL=https://<origin> npm run smoke:production   # after deploy
 ```
 
 The preflight reports `PASS`/`WARNING`/`BLOCKER`, exits non-zero on blockers,
-prints no secret, and reports the integrated postures — `CONTENT_ACCESS_MODE`,
-whether the HLS pipeline is on, and the rewards posture. It **BLOCKS** a
-release whose social mission URL still carries a template segment such as
-`your-handle`, and **WARNS** when rewards are off or when no social mission is
-configured.
+prints no secret, and reports every integrated posture.
+
+**IT ENFORCES THE V1 RELEASE POLICY, AND THAT IS NEW IN THIS MERGE.** Each
+feature branch, on its own, could only state its posture and let a human
+judge — a branch has no standing to decide whether a release without it is
+still the release. The integration settles it, so these are now **BLOCKERS**:
+
+| Posture | Verdict |
+|---|---|
+| `WHATSAPP_AUTH_ENABLED` not `true` | **BLOCKER** — V1 ships WhatsApp login as a required sign-in method |
+| WhatsApp enabled, driver missing / `fake` / unimplemented | **BLOCKER** (the boot contract also refuses it) |
+| `cloud-api` with any of the four sender variables missing | **BLOCKER**, naming the variables — never their values |
+| `REWARDS_ENABLED` not `true` | **BLOCKER** — V1 is free content + ads + rewards |
+| Any of Instagram / TikTok / YouTube URL missing | **BLOCKER**, naming which |
+| A social URL still carrying `your-handle` | **BLOCKER** |
+| `REWARDS_SOCIAL_FACEBOOK_URL` missing | not required, not counted |
+| `CONTENT_ACCESS_MODE=free`, HLS off, Google off | `WARNING` — deliberate postures |
+
+**These are RELEASE rules, not BOOT rules.** `validateEnv` still starts a
+process with both features switched off, and development and test still run
+with no Meta credentials and no social URLs at all. Nothing was weakened to
+get here: postures that used to warn now block, and no blocker became a
+warning.
 
 ## 10. Remaining before release
 
@@ -199,8 +285,17 @@ Code is not the blocker. What remains is owner/external:
 3. Google OAuth client + Play App Signing SHA-1.
 4. AdMob ids; privacy-policy and account-deletion URLs.
 4b. The three official Red Panda social profile URLs (Instagram, TikTok,
-   YouTube), for `REWARDS_SOCIAL_*_URL`. Until they are set, those missions
-   are simply not served.
+   YouTube), for `REWARDS_SOCIAL_*_URL`. **Not yet supplied.** Until they are
+   set the preflight blocks the release, and the missions are not served.
+4c. **Meta WhatsApp Cloud API provisioning — not yet started.** A Meta app, a
+   WhatsApp Business sender number, a permanent System User access token, and
+   an APPROVED authentication-category template. See
+   `docs/WHATSAPP_LOGIN_SETUP.md`. Template approval is a review process with
+   a lead time that is outside this project's control, so it is the
+   longest-lead external item in this list.
+4d. **One real end-to-end WhatsApp OTP** to a handset you control, after
+   provisioning. Preflight and the test suite prove the code; only a real
+   message proves delivery.
 5. Decide `CONTENT_ACCESS_MODE`, then migrate the content that decision makes
    user-visible.
 6. **Physical Android device HLS QA** — paused while the device is

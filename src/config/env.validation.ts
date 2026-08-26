@@ -1,4 +1,10 @@
 import { existsSync, statSync } from 'fs';
+// The single source of truth for which OTP delivery drivers exist. Imported
+// rather than re-listed here so that adding a driver cannot leave the boot
+// contract silently disagreeing with the module factory that binds it. The
+// module is a pure constants/types file with no framework imports, so this
+// does not pull the auth stack into config validation.
+import { WHATSAPP_OTP_DRIVERS } from '../auth/identity/whatsapp/whatsapp-otp.types';
 import {
   isLoopbackHostname,
   isPrivateHostname,
@@ -1050,17 +1056,42 @@ function validateGoogleAuthConfig(config: Record<string, unknown>): void {
  *    `MIDTRANS_IS_PRODUCTION`.
  *
  * 2. With `WHATSAPP_AUTH_ENABLED=true`, the driver must name an IMPLEMENTED
- *    provider. `fake` is currently the only one, because no WhatsApp vendor
- *    credentials exist for this project and no vendor client has been
- *    written or tested against them. Combined with rule 1, that means
- *    WhatsApp OTP cannot presently be enabled in production AT ALL — the
- *    process refuses to start. That is the intended, honest outcome: a
+ *    provider (`WHATSAPP_OTP_DRIVERS`), and if that provider is
+ *    `cloud-api`, every setting it cannot function without must be present.
+ *    Combined with rule 1, a PRODUCTION deployment therefore has exactly one
+ *    way to enable WhatsApp login — `cloud-api` with complete credentials —
+ *    and every incomplete posture fails the BOOT rather than starting a
  *    backend that accepts OTP requests, answers 202, and silently delivers
- *    nothing would be strictly worse than one that will not boot. See the
- *    final report's "requirements still needed for real provider
- *    activation" section for exactly what unblocks it.
+ *    nothing. See `docs/WHATSAPP_LOGIN_SETUP.md` for what an operator must
+ *    obtain from Meta.
+ *
+ * NOTHING HERE READS OR ECHOES A VALUE. Every message names VARIABLES only —
+ * `WHATSAPP_CLOUD_API_ACCESS_TOKEN` is a real credential, and a boot error
+ * is exactly the kind of text that ends up pasted into a chat window.
  */
 const FAKE_WHATSAPP_ALLOWED_NODE_ENVS = ['development', 'test'] as const;
+
+/**
+ * `WHATSAPP_CLOUD_API_GRAPH_VERSION` is interpolated into the Graph API URL,
+ * so its shape is constrained rather than trusted: `v` followed by
+ * `<major>.<minor>`, which is the only form Meta publishes. This blocks a
+ * mis-set (or hostile) value from steering the request at a different host
+ * or edge — `WhatsAppCloudApiOtpProvider` additionally percent-encodes the
+ * segment, making this the first of two independent guards.
+ */
+const GRAPH_VERSION_PATTERN = /^v\d+\.\d+$/;
+
+/**
+ * The settings `cloud-api` cannot function without. Listed as data rather
+ * than four copy-pasted `if` blocks so that adding one cannot accidentally
+ * ship without its check — and so the error text is identical for each.
+ */
+const REQUIRED_WHATSAPP_CLOUD_API_KEYS = [
+  'WHATSAPP_CLOUD_API_PHONE_NUMBER_ID',
+  'WHATSAPP_CLOUD_API_ACCESS_TOKEN',
+  'WHATSAPP_CLOUD_API_TEMPLATE_NAME',
+  'WHATSAPP_CLOUD_API_TEMPLATE_LANGUAGE',
+] as const;
 
 function validateWhatsAppConfig(config: Record<string, unknown>): void {
   const driver =
@@ -1078,11 +1109,16 @@ function validateWhatsAppConfig(config: Record<string, unknown>): void {
       'Refusing to boot with WHATSAPP_OTP_PROVIDER_DRIVER=fake: NODE_ENV is ' +
         'not exactly "development" or "test". The fake provider retains ' +
         'plaintext OTP codes in memory and delivers no message, so it must ' +
-        'never run outside local development or automated tests. Unset ' +
-        'WHATSAPP_OTP_PROVIDER_DRIVER, or run with NODE_ENV=development/test. ' +
-        'Values are never logged.',
+        'never run outside local development or automated tests. Use ' +
+        'WHATSAPP_OTP_PROVIDER_DRIVER=cloud-api for a real deployment, or run ' +
+        'with NODE_ENV=development/test. Values are never logged.',
     );
   }
+
+  // Shape-checked even while the feature is OFF, exactly as the `fake`
+  // allowlist above is: a misspelled version is a configuration error worth
+  // failing loudly on before it is activated, not after.
+  validateGraphVersion(config);
 
   if (config.WHATSAPP_AUTH_ENABLED !== 'true') {
     return;
@@ -1092,21 +1128,63 @@ function validateWhatsAppConfig(config: Record<string, unknown>): void {
     throw new Error(
       'Missing required environment variable: WHATSAPP_OTP_PROVIDER_DRIVER. ' +
         'WHATSAPP_AUTH_ENABLED=true requires an explicit OTP delivery driver ' +
-        '(see .env.example). There is deliberately no default: a backend that ' +
-        'accepts OTP requests without a real delivery provider would answer ' +
-        '202 while silently sending nothing.',
+        `(one of: ${WHATSAPP_OTP_DRIVERS.join(', ')}; see .env.example). ` +
+        'There is deliberately no default: a backend that accepts OTP ' +
+        'requests without a real delivery provider would answer 202 while ' +
+        'silently sending nothing.',
     );
   }
 
-  if (driver !== 'fake') {
+  if (!(WHATSAPP_OTP_DRIVERS as readonly string[]).includes(driver)) {
     throw new Error(
-      `Unsupported WHATSAPP_OTP_PROVIDER_DRIVER: "${driver}". The only ` +
-        'implemented driver is "fake" (development/test only) — no WhatsApp ' +
-        'vendor client ships in this build, because no vendor credentials ' +
-        'exist to build or test one against. Implement a WhatsAppOtpProvider ' +
-        'for the chosen vendor and register it in AuthModule before enabling ' +
-        'WHATSAPP_AUTH_ENABLED in this environment.',
+      `Unsupported WHATSAPP_OTP_PROVIDER_DRIVER: "${driver}". Implemented ` +
+        `drivers are: ${WHATSAPP_OTP_DRIVERS.join(', ')}. "cloud-api" is the ` +
+        'production driver (Meta WhatsApp Cloud API); "fake" delivers nothing ' +
+        'and is permitted only under NODE_ENV=development/test.',
     );
+  }
+
+  if (driver === 'cloud-api') {
+    validateWhatsAppCloudApiConfig(config);
+  }
+}
+
+function validateGraphVersion(config: Record<string, unknown>): void {
+  const rawVersion = config.WHATSAPP_CLOUD_API_GRAPH_VERSION;
+
+  if (typeof rawVersion !== 'string' || rawVersion.trim().length === 0) {
+    return;
+  }
+
+  if (!GRAPH_VERSION_PATTERN.test(rawVersion.trim())) {
+    throw new Error(
+      'Invalid WHATSAPP_CLOUD_API_GRAPH_VERSION: it must look like "v21.0" ' +
+        '(a "v" followed by major.minor), because it is interpolated into the ' +
+        'Graph API request URL. Unset it to use the version this client was ' +
+        'written against.',
+    );
+  }
+}
+
+/**
+ * The four settings `WhatsAppCloudApiOtpProvider` refuses to be constructed
+ * without. Checked here so the failure names the ENVIRONMENT VARIABLE an
+ * operator must set, rather than the constructor field an operator has never
+ * heard of — the constructor check remains as the second, independent guard.
+ */
+function validateWhatsAppCloudApiConfig(config: Record<string, unknown>): void {
+  for (const key of REQUIRED_WHATSAPP_CLOUD_API_KEYS) {
+    const value = config[key];
+
+    if (typeof value !== 'string' || value.trim().length === 0) {
+      throw new Error(
+        `Missing required environment variable: ${key}. ` +
+          'WHATSAPP_AUTH_ENABLED=true with WHATSAPP_OTP_PROVIDER_DRIVER=cloud-api ' +
+          'requires the complete WhatsApp Cloud API sender configuration — a ' +
+          'partial one would accept OTP requests and deliver nothing. See ' +
+          'docs/WHATSAPP_LOGIN_SETUP.md. Values are never logged.',
+      );
+    }
   }
 }
 

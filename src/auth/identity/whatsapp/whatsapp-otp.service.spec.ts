@@ -1,3 +1,4 @@
+import { Logger } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../../../prisma/prisma.service';
@@ -11,6 +12,7 @@ import {
   OTP_TTL_MS,
 } from '../auth-identity.constants';
 import {
+  OtpDeliveryFailed,
   OtpRejected,
   OtpRequestThrottled,
   WhatsAppOtpService,
@@ -19,7 +21,10 @@ import type {
   SendWhatsAppOtpInput,
   WhatsAppOtpProvider,
 } from './whatsapp-otp.types';
-import { WHATSAPP_OTP_PROVIDER } from './whatsapp-otp.types';
+import {
+  WHATSAPP_OTP_PROVIDER,
+  WhatsAppDeliveryError,
+} from './whatsapp-otp.types';
 
 /**
  * PHASE 10B, fix cycle 1 — a unit spec for the OTP challenge lifecycle
@@ -45,8 +50,27 @@ const TEST_AUTH_CONFIG = {
 
 class RecordingOtpProvider implements WhatsAppOtpProvider {
   readonly sent: SendWhatsAppOtpInput[] = [];
+  /**
+   * How the next send should fail. `undefined` delivers normally;
+   * `'unclassified'` throws a bare `Error`, which the service must treat as
+   * `provider_unavailable` — the fail-closed reading of a surprise.
+   */
+  failWith:
+    'provider_unavailable' | 'recipient_rejected' | 'unclassified' | undefined;
 
   sendOtp(input: SendWhatsAppOtpInput): Promise<void> {
+    if (this.failWith === 'unclassified') {
+      return Promise.reject(new Error('simulated unclassified vendor throw'));
+    }
+    if (this.failWith !== undefined) {
+      return Promise.reject(
+        new WhatsAppDeliveryError(
+          this.failWith,
+          'simulated delivery failure',
+          503,
+        ),
+      );
+    }
     this.sent.push(input);
     return Promise.resolve();
   }
@@ -453,6 +477,130 @@ describe('WhatsAppOtpService', () => {
 
     it('reports no local fake provider when a different implementation is bound', () => {
       expect(service.localFakeProvider).toBeUndefined();
+    });
+  });
+
+  /**
+   * WHATSAPP LOGIN V1 — delivery failure is no longer uniformly swallowed.
+   *
+   * The split is NUMBER-INDEPENDENT vs NUMBER-SPECIFIC, and these tests
+   * assert both halves, because getting either one wrong is a real defect:
+   * swallowing an outage strands every user on a code-entry screen forever,
+   * and surfacing a per-recipient refusal turns an unauthenticated route into
+   * a phone-validity oracle.
+   */
+  describe('delivery failure handling', () => {
+    afterEach(() => {
+      provider.failWith = undefined;
+    });
+
+    it.each(['provider_unavailable', 'unclassified'] as const)(
+      'CRITICAL: a %s failure PROPAGATES rather than reporting success',
+      async (kind) => {
+        const phone = fixturePhone();
+        provider.failWith = kind;
+
+        await expect(service.issueChallenge(phone, {})).rejects.toBeInstanceOf(
+          OtpDeliveryFailed,
+        );
+      },
+    );
+
+    it('CRITICAL: a provider outage leaves NO challenge row behind', async () => {
+      const phone = fixturePhone();
+      provider.failWith = 'provider_unavailable';
+
+      await service.issueChallenge(phone, {}).catch(() => undefined);
+
+      expect(
+        await prisma.phoneOtpChallenge.count({ where: { phoneE164: phone } }),
+      ).toBe(0);
+    });
+
+    it('the withdrawal clears the cooldown, so the user can retry at once', async () => {
+      const phone = fixturePhone();
+      provider.failWith = 'provider_unavailable';
+      await service.issueChallenge(phone, {}).catch(() => undefined);
+
+      // Without the withdrawal this would throw OtpRequestThrottled.
+      provider.failWith = undefined;
+      await expect(service.issueChallenge(phone, {})).resolves.toMatchObject({
+        expiresInSeconds: Math.floor(OTP_TTL_MS / 1000),
+      });
+    });
+
+    it('the withdrawal does not spend the rolling request budget', async () => {
+      const phone = fixturePhone();
+
+      // Exhaust the window entirely on failed deliveries.
+      provider.failWith = 'provider_unavailable';
+      for (let i = 0; i < OTP_MAX_REQUESTS_PER_WINDOW + 2; i += 1) {
+        await service.issueChallenge(phone, {}).catch(() => undefined);
+      }
+
+      // An outage must not lock a real user out of their own number.
+      provider.failWith = undefined;
+      await expect(service.issueChallenge(phone, {})).resolves.toBeDefined();
+    });
+
+    it('CRITICAL: a recipient_rejected failure is SWALLOWED and keeps the challenge live', async () => {
+      const phone = fixturePhone();
+      provider.failWith = 'recipient_rejected';
+
+      // Byte-identical to a successful send, by design.
+      await expect(service.issueChallenge(phone, {})).resolves.toMatchObject({
+        expiresInSeconds: Math.floor(OTP_TTL_MS / 1000),
+      });
+
+      const live = await prisma.phoneOtpChallenge.findMany({
+        where: { phoneE164: phone },
+      });
+      expect(live).toHaveLength(1);
+      expect(live[0].consumedAt).toBeNull();
+      expect(live[0].liveKey).toBe(phone);
+    });
+
+    it('a withdrawal never destroys an already-CONSUMED challenge', async () => {
+      const phone = fixturePhone();
+
+      // A real, delivered, then consumed challenge.
+      await service.issueChallenge(phone, {});
+      await service.claimChallenge(phone, provider.lastCodeFor(phone));
+      const consumedBefore = await prisma.phoneOtpChallenge.count({
+        where: { phoneE164: phone, consumedAt: { not: null } },
+      });
+
+      // A later request whose delivery fails must withdraw only ITS OWN row.
+      provider.failWith = 'provider_unavailable';
+      await service.issueChallenge(phone, {}).catch(() => undefined);
+
+      expect(
+        await prisma.phoneOtpChallenge.count({
+          where: { phoneE164: phone, consumedAt: { not: null } },
+        }),
+      ).toBe(consumedBefore);
+    });
+
+    it('CRITICAL: no delivery-failure log line carries the code or the full number', async () => {
+      const phone = fixturePhone();
+      const written: string[] = [];
+      const spy = jest
+        .spyOn(Logger.prototype, 'error')
+        .mockImplementation((value: unknown) => {
+          written.push(String(value));
+        });
+
+      try {
+        provider.failWith = 'provider_unavailable';
+        await service.issueChallenge(phone, {}).catch(() => undefined);
+      } finally {
+        spy.mockRestore();
+      }
+
+      const all = written.join('\n');
+      expect(all).toContain(`...${phone.slice(-4)}`);
+      expect(all).not.toContain(phone);
+      expect(all).not.toMatch(/\b\d{6}\b/);
     });
   });
 });

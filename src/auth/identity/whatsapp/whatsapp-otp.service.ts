@@ -19,7 +19,10 @@ import {
 } from '../auth-identity.constants';
 import { classifyUniqueViolation } from '../unique-violation';
 import { LocalFakeWhatsAppOtpProvider } from './whatsapp-local-fake.provider';
-import { WHATSAPP_OTP_PROVIDER } from './whatsapp-otp.types';
+import {
+  WHATSAPP_OTP_PROVIDER,
+  WhatsAppDeliveryError,
+} from './whatsapp-otp.types';
 // `import type` is REQUIRED for an interface referenced in a decorated
 // constructor signature under `isolatedModules` + `emitDecoratorMetadata`
 // (TS1272) — see `auth-identity.service.ts` for the same note.
@@ -83,6 +86,24 @@ export type OtpThrottleReason = 'cooldown' | 'window_exhausted';
 export class OtpRequestThrottled extends Error {
   constructor(readonly reason: OtpThrottleReason) {
     super(`otp request throttled: ${reason}`);
+  }
+}
+
+/**
+ * WHATSAPP LOGIN V1 — delivery DEFINITIVELY failed for a reason that has
+ * nothing to do with which number was targeted (see
+ * `WhatsAppDeliveryFailureKind`). The challenge has already been withdrawn
+ * by the time this is thrown, so the caller may safely tell the user to try
+ * again — there is no live code, and nothing was charged against the
+ * number's cooldown or rolling budget.
+ *
+ * Kept as its own signal class rather than an `AppException` for the same
+ * reason as `OtpRejected`/`OtpRequestThrottled`: this service does not own
+ * the HTTP contract. `AuthIdentityService` decides what a client sees.
+ */
+export class OtpDeliveryFailed extends Error {
+  constructor(readonly httpStatus?: number) {
+    super('otp delivery failed: provider unavailable');
   }
 }
 
@@ -159,10 +180,13 @@ export class WhatsAppOtpService {
    *      reconciliation that two concurrent callers could BOTH win, leaving
    *      a number with no usable code at all (see the `liveKey` doc comment
    *      in `prisma/schema.prisma`);
-   *   4. delivery, whose failure is logged and swallowed — the caller's
-   *      response must be identical whether or not the vendor was
-   *      reachable, and a vendor outage is an operator problem rather than
-   *      a signal to hand an unauthenticated caller.
+   *   4. delivery. A failure here is NO LONGER uniformly swallowed — see
+   *      `deliverOrWithdraw`. A number-INDEPENDENT provider outage withdraws
+   *      the challenge just created and propagates, because answering `202`
+   *      to a user who will never receive a message is a lie the login
+   *      screen cannot recover from. A number-SPECIFIC refusal is still
+   *      swallowed, because answering differently for one number is the
+   *      enumeration oracle the `202` contract exists to prevent.
    */
   async issueChallenge(
     phoneE164: string,
@@ -205,7 +229,7 @@ export class WhatsAppOtpService {
       throw error;
     }
 
-    await this.deliver(phoneE164, code, expiresAt, now);
+    await this.deliverOrWithdraw(phoneE164, code, expiresAt, now);
 
     return {
       expiresInSeconds: Math.floor(OTP_TTL_MS / 1000),
@@ -422,7 +446,40 @@ export class WhatsAppOtpService {
     }
   }
 
-  private async deliver(
+  /**
+   * Hands the code to the provider and decides what a failure MEANS.
+   *
+   * ===================== THE TWO OUTCOMES, AND WHY =====================
+   *
+   * `recipient_rejected` — SWALLOWED, exactly as every delivery failure used
+   * to be. The provider refused this destination specifically, so answering
+   * differently would tell an unauthenticated caller something true about
+   * one number that they could not learn about another. The challenge is
+   * left live so the response is byte-identical to a successful send, and
+   * the operator sees the reason in the log.
+   *
+   * `provider_unavailable` — PROPAGATED, after withdrawing the challenge.
+   * This is the change this work unit exists to make. The failure is
+   * number-independent by definition (see `WhatsAppDeliveryFailureKind`), so
+   * surfacing it reveals nothing: the same request for any number fails the
+   * same way. And it must be surfaced, because the alternative is a login
+   * screen that says "we sent you a code" during a total delivery outage,
+   * which is the single worst thing this endpoint can do.
+   *
+   * ANYTHING ELSE — an implementation that threw something other than a
+   * `WhatsAppDeliveryError` — is treated as `provider_unavailable`. That is
+   * the fail-closed reading: an unclassified throw is a failure nobody has
+   * reasoned about, and quietly claiming success is never the safe response
+   * to a surprise.
+   *
+   * THE WITHDRAWAL IS NOT OPTIONAL. Leaving the row in place would bill an
+   * outage to the user twice over — a cooldown they must wait out and a slot
+   * out of their hourly budget — for a code that was never sent. Deleting it
+   * is safe precisely because nothing was sent: there is no message anyone
+   * could be replaying, and no bombing that a retained row would be evidence
+   * of.
+   */
+  private async deliverOrWithdraw(
     phoneE164: string,
     code: string,
     expiresAt: Date,
@@ -437,12 +494,58 @@ export class WhatsAppOtpService {
           0,
         ),
       });
+      return;
     } catch (error) {
       // Never the code, and never the full number — this line is the one
       // thing about OTP delivery that plausibly ends up in a shared log.
+      // Provider messages are contractually secret-free (see
+      // `WhatsAppDeliveryError`), and are redacted again anyway.
       this.logger.error(
         redactSensitiveText(
           `WhatsApp OTP delivery failed for ...${phoneE164.slice(-4)}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        ),
+      );
+
+      if (
+        error instanceof WhatsAppDeliveryError &&
+        error.kind === 'recipient_rejected'
+      ) {
+        return;
+      }
+
+      await this.withdrawChallenge(phoneE164);
+
+      throw new OtpDeliveryFailed(
+        error instanceof WhatsAppDeliveryError ? error.httpStatus : undefined,
+      );
+    }
+  }
+
+  /**
+   * Removes this number's live challenge after a delivery that definitively
+   * did not happen, so the failed attempt costs the user neither a cooldown
+   * nor a slot in their rolling budget.
+   *
+   * Scoped by `consumedAt: null` so it can only ever remove a LIVE row: a
+   * concurrent verify that consumed the challenge between the send and this
+   * cleanup has already released `liveKey` itself, and deleting a consumed
+   * row would destroy the record of a code that genuinely was used.
+   *
+   * Failure is logged and swallowed. The caller is about to be told the send
+   * failed either way, and turning a cleanup problem into a different error
+   * would only make the outage harder to read.
+   */
+  private async withdrawChallenge(phoneE164: string): Promise<void> {
+    try {
+      await this.prisma.phoneOtpChallenge.deleteMany({
+        where: { phoneE164, consumedAt: null },
+      });
+    } catch (error) {
+      this.logger.warn(
+        redactSensitiveText(
+          `Failed to withdraw an undelivered PhoneOtpChallenge for ...${phoneE164.slice(-4)}: ${
             error instanceof Error ? error.message : String(error)
           }`,
         ),

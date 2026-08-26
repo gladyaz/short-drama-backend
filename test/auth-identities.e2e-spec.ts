@@ -16,7 +16,14 @@ import type {
   GoogleVerifiedIdentity,
 } from './../src/auth/identity/google/google-identity.types';
 import { GoogleTokenRejected } from './../src/auth/identity/google/google-id-token.util';
-import { WHATSAPP_OTP_PROVIDER } from './../src/auth/identity/whatsapp/whatsapp-otp.types';
+import {
+  WHATSAPP_OTP_PROVIDER,
+  WhatsAppDeliveryError,
+} from './../src/auth/identity/whatsapp/whatsapp-otp.types';
+import type {
+  SendWhatsAppOtpInput,
+  WhatsAppDeliveryFailureKind,
+} from './../src/auth/identity/whatsapp/whatsapp-otp.types';
 import { LocalFakeWhatsAppOtpProvider } from './../src/auth/identity/whatsapp/whatsapp-local-fake.provider';
 import { WhatsAppOtpService } from './../src/auth/identity/whatsapp/whatsapp-otp.service';
 import {
@@ -78,19 +85,42 @@ describe('Auth identities (e2e)', () => {
   let prisma: PrismaService;
   let throttlerStorage: ThrottlerStorageService;
   let google: ScriptedGoogleVerifier;
-  let fakeOtpProvider: LocalFakeWhatsAppOtpProvider;
+  let fakeOtpProvider: ControllableFakeOtpProvider;
 
   const emailPrefix = TEST_FIXTURE_NAMESPACE;
   const uniqueEmail = (label: string): string => fixtureEmail(`aie-${label}`);
   const uniqueSubject = (label: string): string =>
     `${TEST_FIXTURE_NAMESPACE}-g-${label}`;
 
+  /**
+   * WHATSAPP LOGIN V1 — `LocalFakeWhatsAppOtpProvider` with a switch for
+   * making one send fail, so the two delivery-failure outcomes are reachable
+   * through the REAL HTTP stack rather than only at the service layer.
+   *
+   * A SUBCLASS rather than a separate stub, deliberately: the suite's
+   * `WhatsAppOtpService wiring` test asserts that
+   * `otpService.localFakeProvider` is this exact instance, which holds only
+   * because an `instanceof LocalFakeWhatsAppOtpProvider` is what is bound.
+   */
+  class ControllableFakeOtpProvider extends LocalFakeWhatsAppOtpProvider {
+    failWith: WhatsAppDeliveryFailureKind | undefined;
+
+    override sendOtp(input: SendWhatsAppOtpInput): Promise<void> {
+      if (this.failWith !== undefined) {
+        return Promise.reject(
+          new WhatsAppDeliveryError(this.failWith, 'e2e simulated failure'),
+        );
+      }
+      return super.sendOtp(input);
+    }
+  }
+
   beforeAll(async () => {
     google = new ScriptedGoogleVerifier();
     // Constructed with an explicit `'test'` rather than reading `NODE_ENV`,
     // so this line also documents the class's own refusal to exist outside
     // development/test — passing anything else here throws.
-    fakeOtpProvider = new LocalFakeWhatsAppOtpProvider('test');
+    fakeOtpProvider = new ControllableFakeOtpProvider('test');
 
     const moduleFixture: TestingModule = await Test.createTestingModule({
       imports: [AppModule],
@@ -137,6 +167,7 @@ describe('Auth identities (e2e)', () => {
     // explicitly in their own test below, which does its own counting.
     resetThrottlerStorage(throttlerStorage);
     fakeOtpProvider.reset();
+    fakeOtpProvider.failWith = undefined;
   });
 
   afterAll(async () => {
@@ -403,6 +434,95 @@ describe('Auth identities (e2e)', () => {
       expect(
         responses.some((r) => r.status === HttpStatus.TOO_MANY_REQUESTS),
       ).toBe(true);
+    });
+  });
+
+  /**
+   * WHATSAPP LOGIN V1 — the two delivery-failure outcomes, over real HTTP.
+   *
+   * These are the tests that pin the ONE deliberate hole in the `202`
+   * anti-enumeration contract: a number-INDEPENDENT provider outage is
+   * surfaced, a number-SPECIFIC refusal is not. Asserted at the HTTP layer
+   * because the status code is the contract a mobile client branches on.
+   */
+  describe('WhatsApp OTP delivery failure over HTTP', () => {
+    it('CRITICAL: answers 503 WHATSAPP_PROVIDER_UNAVAILABLE when delivery definitively fails', async () => {
+      const phone = fixturePhone();
+      fakeOtpProvider.failWith = 'provider_unavailable';
+
+      const response = await request(server())
+        .post('/auth/whatsapp/otp/request')
+        .send({ phone })
+        .expect(HttpStatus.SERVICE_UNAVAILABLE);
+
+      expect((response.body as ErrorResponseBody).code).toBe(
+        'WHATSAPP_PROVIDER_UNAVAILABLE',
+      );
+    });
+
+    it('CRITICAL: leaves no challenge behind, so the caller can retry at once', async () => {
+      const phone = fixturePhone();
+      fakeOtpProvider.failWith = 'provider_unavailable';
+
+      await request(server())
+        .post('/auth/whatsapp/otp/request')
+        .send({ phone })
+        .expect(HttpStatus.SERVICE_UNAVAILABLE);
+
+      expect(
+        await prisma.phoneOtpChallenge.count({ where: { phoneE164: phone } }),
+      ).toBe(0);
+
+      // Immediately retryable — no cooldown was spent on a message that was
+      // never sent. (The per-IP throttle is a separate limiter; reset it so
+      // this asserts the per-NUMBER cooldown specifically.)
+      resetThrottlerStorage(throttlerStorage);
+      fakeOtpProvider.failWith = undefined;
+      await request(server())
+        .post('/auth/whatsapp/otp/request')
+        .send({ phone })
+        .expect(HttpStatus.ACCEPTED);
+    });
+
+    it('never leaks the provider failure detail to the caller', async () => {
+      const phone = fixturePhone();
+      fakeOtpProvider.failWith = 'provider_unavailable';
+
+      const response = await request(server())
+        .post('/auth/whatsapp/otp/request')
+        .send({ phone })
+        .expect(HttpStatus.SERVICE_UNAVAILABLE);
+
+      const body = JSON.stringify(response.body);
+      expect(body).not.toContain('e2e simulated failure');
+      expect(body).not.toContain(phone);
+    });
+
+    it('CRITICAL: a per-RECIPIENT refusal still answers 202, identically to a success', async () => {
+      const rejected = fixturePhone();
+      const delivered = fixturePhone();
+
+      fakeOtpProvider.failWith = 'recipient_rejected';
+      const refusedResponse = await request(server())
+        .post('/auth/whatsapp/otp/request')
+        .send({ phone: rejected })
+        .expect(HttpStatus.ACCEPTED);
+
+      resetThrottlerStorage(throttlerStorage);
+      fakeOtpProvider.failWith = undefined;
+      const okResponse = await request(server())
+        .post('/auth/whatsapp/otp/request')
+        .send({ phone: delivered })
+        .expect(HttpStatus.ACCEPTED);
+
+      // Deep-equal, not merely both-202: a per-number difference in ANY
+      // field would be the phone-validity oracle this contract refuses to be.
+      expect(refusedResponse.body).toEqual(okResponse.body);
+      expect(
+        await prisma.phoneOtpChallenge.count({
+          where: { phoneE164: rejected },
+        }),
+      ).toBe(1);
     });
   });
 

@@ -141,7 +141,7 @@ Each is gated off by default; none needs provisioning.
 | Worker process | `TRANSCODE_ENABLED=false` | `dist/worker/main` is a separate entrypoint. Not started for V1. |
 | HLS gateway Worker | `TRANSCODE_ENABLED=false` | The Cloudflare Worker in `workers/hls-gateway` is **not deployed**; its `wrangler.toml` is an unmodified template. |
 | Payment provider | `PAYMENTS_ENABLED=false` | Every `/payments/*` route answers `503`. |
-| WhatsApp OTP vendor | `WHATSAPP_AUTH_ENABLED=false` | Cannot be enabled in production — the only implemented driver is `fake`, and boot refuses it outside dev/test. |
+| WhatsApp OTP vendor | Meta WhatsApp Business (Cloud API) | **REQUIRED for V1.** Set `WHATSAPP_AUTH_ENABLED=true`, `WHATSAPP_OTP_PROVIDER_DRIVER=cloud-api`, plus the four `WHATSAPP_CLOUD_API_*` sender variables. Needs a Meta app, a verified sender number, a System User token and an APPROVED authentication template — see [WHATSAPP_LOGIN_SETUP.md](WHATSAPP_LOGIN_SETUP.md). Boot refuses every incomplete posture. |
 | Cron / scheduler | `RETENTION_SCHEDULE_ENABLED=false` | Registers no job when off. |
 
 ## 9. Environment variables

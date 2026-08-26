@@ -297,17 +297,57 @@ export interface PaymentsConfig {
  * and a secret that is never held cannot be leaked.
  *
  * `whatsappOtpDriver` names WHICH `WhatsAppOtpProvider` implementation to
- * bind. `fake` — the only implemented driver — is refused outside
- * `development`/`test` by `env.validation.ts`. There is no default: with
+ * bind: `cloud-api` (the production driver) or `fake` (refused outside
+ * `development`/`test` by `env.validation.ts`). There is no default: with
  * `WHATSAPP_AUTH_ENABLED=true` and no valid driver, the process refuses to
  * boot rather than starting a backend that accepts OTP requests and
  * delivers nothing.
+ *
+ * ================= THE `whatsappCloudApi*` GROUP =================
+ *
+ * Read unconditionally here and required by `env.validation.ts` only when
+ * the flag is on AND the driver is `cloud-api` — the same split every other
+ * provider group in this file uses.
+ *
+ * EXACTLY ONE OF THEM IS SECRET: `whatsappCloudApiAccessToken`. The phone
+ * number id, template name and template language are operational
+ * identifiers, not credentials — they appear in Meta's own dashboard URLs —
+ * but they are still read from the environment rather than committed,
+ * because they differ per deployment and a code change to move between a
+ * test number and a production number would be absurd. The token is the one
+ * value that must never be logged, echoed in an error, or printed by
+ * preflight; `redactSensitiveText`'s `token` keyword already covers the
+ * variable name, and `WhatsAppCloudApiOtpProvider` never reads it back after
+ * construction.
+ *
+ * `whatsappCloudApiGraphVersion` is OPTIONAL and falls back to the version
+ * the client was written against (`DEFAULT_WHATSAPP_GRAPH_VERSION`). It
+ * exists so an operator can move to a newer Graph version deliberately,
+ * without a code change — never so the client can silently float.
+ *
+ * `whatsappCloudApiTemplateHasOtpButton` defaults to TRUE, matching Meta's
+ * requirement that an OTP be delivered by an AUTHENTICATION-category
+ * template, which must carry a one-time-password button. It exists only for
+ * the genuinely different case of a non-authentication template with no
+ * button — see `WhatsAppCloudApiOtpProvider`. Note the inverted flag
+ * parsing: this one defaults ON, so it is `!== 'false'` rather than the
+ * `=== 'true'` shape used by every fail-closed FEATURE flag here. That is
+ * deliberate and not an inconsistency — a feature flag must fail closed
+ * (off), whereas this describes the shape of the operator's template, whose
+ * safe default is the shape Meta requires.
  */
 export interface IdentityProvidersConfig {
   googleEnabled: boolean;
   googleClientIds: string[];
   whatsappEnabled: boolean;
   whatsappOtpDriver: string | undefined;
+  whatsappCloudApiPhoneNumberId: string | undefined;
+  /** SECRET. Never logged, never echoed, never returned by preflight. */
+  whatsappCloudApiAccessToken: string | undefined;
+  whatsappCloudApiTemplateName: string | undefined;
+  whatsappCloudApiTemplateLanguage: string | undefined;
+  whatsappCloudApiGraphVersion: string | undefined;
+  whatsappCloudApiTemplateHasOtpButton: boolean;
 }
 
 /**
@@ -475,6 +515,17 @@ export default (): RootConfig => ({
     googleClientIds: parseCsvEnv(process.env.GOOGLE_OAUTH_CLIENT_IDS),
     whatsappEnabled: process.env.WHATSAPP_AUTH_ENABLED === 'true',
     whatsappOtpDriver: process.env.WHATSAPP_OTP_PROVIDER_DRIVER,
+    whatsappCloudApiPhoneNumberId:
+      process.env.WHATSAPP_CLOUD_API_PHONE_NUMBER_ID,
+    whatsappCloudApiAccessToken: process.env.WHATSAPP_CLOUD_API_ACCESS_TOKEN,
+    whatsappCloudApiTemplateName: process.env.WHATSAPP_CLOUD_API_TEMPLATE_NAME,
+    whatsappCloudApiTemplateLanguage:
+      process.env.WHATSAPP_CLOUD_API_TEMPLATE_LANGUAGE,
+    whatsappCloudApiGraphVersion: process.env.WHATSAPP_CLOUD_API_GRAPH_VERSION,
+    // Defaults ON — see `IdentityProvidersConfig` for why this one flag is
+    // parsed as `!== 'false'` rather than the fail-closed `=== 'true'`.
+    whatsappCloudApiTemplateHasOtpButton:
+      process.env.WHATSAPP_CLOUD_API_TEMPLATE_HAS_OTP_BUTTON !== 'false',
   },
 });
 

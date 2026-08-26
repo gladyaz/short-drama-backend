@@ -38,6 +38,7 @@ import {
   normalizePhoneToE164,
 } from './whatsapp/phone-normalization.util';
 import {
+  OtpDeliveryFailed,
   OtpRejected,
   OtpRequestThrottled,
   WhatsAppOtpService,
@@ -220,10 +221,16 @@ export class AuthIdentityService {
    *
    * ALWAYS answers `202` when it answers at all, whether or not the number
    * belongs to an existing account — the same frozen anti-enumeration
-   * contract as `POST /auth/password-reset/request`. The one observable
-   * deviation is the per-number cooldown's `429`; see
-   * `AppErrorCode.OTP_RESEND_COOLDOWN` for exactly what that does and does
-   * not reveal, and why the tradeoff is accepted.
+   * contract as `POST /auth/password-reset/request`.
+   *
+   * EXACTLY TWO observable deviations exist, and neither reveals whether an
+   * ACCOUNT exists:
+   *   - `429 OTP_RESEND_COOLDOWN` — per-number, and therefore an accepted,
+   *     documented tradeoff. See that error code.
+   *   - `503 WHATSAPP_PROVIDER_UNAVAILABLE` — number-INDEPENDENT, and
+   *     therefore not a tradeoff at all: an outage answers every number the
+   *     same way. See that error code for why answering `202` during a
+   *     delivery outage is the one thing this endpoint must not do.
    *
    * Normalization happens before any database access, so a malformed number
    * costs nothing and reveals nothing.
@@ -250,6 +257,23 @@ export class AuthIdentityService {
           AppErrorCode.OTP_RESEND_COOLDOWN,
           'A verification code was already requested for this number recently. Please wait before requesting another.',
           HttpStatus.TOO_MANY_REQUESTS,
+        );
+      }
+      if (error instanceof OtpDeliveryFailed) {
+        // The challenge has already been withdrawn by `WhatsAppOtpService`,
+        // so "try again" is honest advice rather than a suggestion the
+        // cooldown will immediately refuse. The provider's HTTP status is
+        // deliberately NOT echoed to the caller — it is an operator
+        // diagnostic, and it is already in the log.
+        await this.authAuditService.emit('otp_delivery_failed', {
+          ip: context.ip,
+          userAgent: context.userAgent,
+          metadata: { reason: 'provider_unavailable' },
+        });
+        throw new AppException(
+          AppErrorCode.WHATSAPP_PROVIDER_UNAVAILABLE,
+          'The verification code could not be sent right now. Please try again in a moment.',
+          HttpStatus.SERVICE_UNAVAILABLE,
         );
       }
       throw error;

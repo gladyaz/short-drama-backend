@@ -289,6 +289,7 @@ the verify response, on `GET /auth/me`, and on the stored row.
 | `INVALID_OTP` | 401 | OTP failed — **any** reason. |
 | `OTP_RESEND_COOLDOWN` | 429 | Per-number cooldown or rolling budget. |
 | `WHATSAPP_AUTH_DISABLED` | 503 | WhatsApp not configured on this server. |
+| `WHATSAPP_PROVIDER_UNAVAILABLE` | 503 | Delivery definitively failed. No challenge survives; retry is immediate. |
 | `AUTH_ACCOUNT_LINK_REQUIRED` | 409 | Provider email collides with an existing account. |
 | `AUTH_IDENTITY_ALREADY_LINKED` | 409 | That identity belongs to a different account. |
 | `AUTH_PROVIDER_ALREADY_LINKED` | 409 | This account already has a different identity for that provider. |
@@ -301,6 +302,29 @@ alike; `INVALID_OTP` covers wrong code, expired, exhausted, already-used and
 no-challenge alike. Splitting either would tell an attacker which check to
 defeat next, or turn the OTP endpoint into a phone-number enumeration
 oracle. The **specific** cause is recorded server-side in `AuthAuditEvent`.
+
+**`WHATSAPP_PROVIDER_UNAVAILABLE` is the one deliberate exception, and it is
+not a leak.** It is returned when the delivery provider definitively refused
+the message for a reason that has nothing to do with *which* number was
+targeted — a timeout, a transport error, a 5xx, an expired access token, a
+template that does not exist or is paused, a provider-side rate limit. The
+same request for any other number fails identically, so the answer carries no
+information about this number, this account, or this user. Contrast
+`OTP_RESEND_COOLDOWN`, whose per-number nature is an accepted tradeoff; this
+one has nothing to trade off.
+
+It is also *required*, not merely permitted: the alternative is answering
+`202 success: true` during a total delivery outage, stranding every user on a
+code-entry screen for a message that will never arrive and giving the client
+nothing to say. A provider that refused **this recipient specifically** (e.g.
+the number is not on WhatsApp) is handled the opposite way — swallowed, still
+`202`, challenge left live — because *that* answer would vary by number.
+
+**No challenge survives a `WHATSAPP_PROVIDER_UNAVAILABLE` response.** The row
+is withdrawn before the error is thrown, so the caller is not blocked by a
+cooldown for a code that was never sent, and the failed attempt does not
+spend a slot in the number's hourly budget. A client should present this as
+"couldn't send, try again", with the retry button **enabled**.
 
 ---
 
@@ -503,11 +527,22 @@ verification is proven against generated RSA keys and controlled fixtures
 at its DI seam. Turning this on for real is a configuration + QA step, not a
 code change.
 
-**WhatsApp cannot currently be enabled in production.** With
-`WHATSAPP_AUTH_ENABLED=true` and any driver other than `fake`, the process
-refuses to boot; with `fake` and a `NODE_ENV` other than
-`development`/`test`, it also refuses to boot. No vendor client ships,
-because no vendor credentials exist to build or test one against. See §8.
+**WhatsApp production driver: `cloud-api`** (Meta WhatsApp Cloud API). Enable
+it with `WHATSAPP_AUTH_ENABLED=true`, `WHATSAPP_OTP_PROVIDER_DRIVER=cloud-api`
+and the four `WHATSAPP_CLOUD_API_*` sender variables. The boot refuses every
+incomplete posture: a missing or unimplemented driver, a `cloud-api` driver
+with an incomplete sender, or `fake` under any `NODE_ENV` other than
+`development`/`test`. `npm run production:preflight` reports a named
+`WhatsApp sign-in` READY/BLOCKER line without printing any value.
+
+**No live WhatsApp credential has been exercised by this repository.** The
+Cloud API client is proven against a mocked transport
+(`whatsapp-cloud-api.provider.spec.ts`) — request URL, headers, body shape
+and every documented failure mode — and the e2e suite substitutes the
+provider at its DI seam. Obtaining the Meta account, sender number, access
+token and approved authentication template, and sending one real message to
+prove delivery, are configuration + QA steps: see
+`docs/WHATSAPP_LOGIN_SETUP.md` and §8.
 
 ---
 
@@ -515,8 +550,12 @@ because no vendor credentials exist to build or test one against. See §8.
 
 Stated plainly so nothing here is mistaken for more than it is:
 
-- **No real WhatsApp message has ever been sent by this code.** The only
-  implemented provider delivers nothing.
+- **No real WhatsApp message has ever been sent by this code.** A production
+  driver now exists (`cloud-api`, Meta WhatsApp Cloud API) and is fully
+  exercised against a mocked transport, but this project holds no Meta
+  credentials, so delivery itself is unproven. One real end-to-end OTP to a
+  handset you control is the remaining step —
+  `docs/WHATSAPP_LOGIN_SETUP.md` §6.
 - **No real Google credential has been exercised.** Verification is proven
   against generated RSA keys and controlled fixtures, not against a live
   Google token.

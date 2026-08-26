@@ -17,11 +17,7 @@ import {
   GoogleIdentityVerifier,
 } from './identity/google/google-identity.types';
 import { GoogleOidcIdentityVerifier } from './identity/google/google-oidc.verifier';
-import { DisabledWhatsAppOtpProvider } from './identity/whatsapp/whatsapp-disabled.provider';
-import {
-  isFakeWhatsAppProviderAllowed,
-  LocalFakeWhatsAppOtpProvider,
-} from './identity/whatsapp/whatsapp-local-fake.provider';
+import { createWhatsAppOtpProvider } from './identity/whatsapp/whatsapp-provider.factory';
 import { WhatsAppOtpService } from './identity/whatsapp/whatsapp-otp.service';
 import {
   WHATSAPP_OTP_PROVIDER,
@@ -111,31 +107,9 @@ import {
           infer: true,
         })!;
 
-        // THREE conditions, all required, and the `NODE_ENV` allowlist is
-        // repeated here even though `env.validation.ts` already enforces it
-        // at boot. That duplication is deliberate: this factory is the last
-        // point before a provider that retains PLAINTEXT OTP CODES IN MEMORY
-        // is constructed, and a fail-closed check at the point of
-        // construction cannot be bypassed by a code path that skipped
-        // validation (a test harness building the module directly, a future
-        // refactor of `validateEnv`). `LocalFakeWhatsAppOtpProvider`'s own
-        // constructor then refuses a third time. See that class's doc
-        // comment for all four gates.
-        //
-        // There is deliberately NO real-vendor branch: no WhatsApp vendor
-        // client ships in this build, because no vendor credentials exist to
-        // build or test one against. `env.validation.ts` refuses to boot
-        // with `WHATSAPP_AUTH_ENABLED=true` and any driver other than
-        // `fake`, so this factory can never silently fall back to an inert
-        // provider on a server that believes WhatsApp sign-in is enabled.
-        if (
-          identity.whatsappEnabled &&
-          identity.whatsappOtpDriver === 'fake' &&
-          isFakeWhatsAppProviderAllowed(process.env.NODE_ENV)
-        ) {
-          return new LocalFakeWhatsAppOtpProvider(process.env.NODE_ENV);
-        }
-        return new DisabledWhatsAppOtpProvider();
+        // The binding decision lives in `createWhatsAppOtpProvider` so it can
+        // be tested directly — see that function for the fail-closed order.
+        return createWhatsAppOtpProvider(identity, process.env.NODE_ENV);
       },
       inject: [ConfigService],
     },

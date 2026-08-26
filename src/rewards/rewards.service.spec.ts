@@ -8,8 +8,11 @@ import {
 import { EntitlementsService } from '../entitlements/entitlements.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { previousPeriodKey, toPeriodKey } from './reward-period.util';
+import { RewardsMissionsService } from './rewards-missions.service';
+import { RewardsPerksService } from './rewards-perks.service';
 import { RewardsService } from './rewards.service';
 import { RewardsWalletService } from './rewards-wallet.service';
+import { RewardsWatchService } from './rewards-watch.service';
 import { CHECK_IN_REWARD_CURVE } from './rewards.constants';
 
 const TEST_TIMEZONE = 'Asia/Jakarta';
@@ -44,12 +47,24 @@ describe('RewardsService', () => {
       providers: [
         RewardsService,
         RewardsWalletService,
+        RewardsMissionsService,
+        RewardsPerksService,
+        RewardsWatchService,
         EntitlementsService,
         PrismaService,
         {
           provide: ConfigService,
           useValue: {
-            get: () => ({ enabled: true, timezone: TEST_TIMEZONE }),
+            // Work unit "REWARDS V1 EARN AND SPEND": the mock now answers on
+            // the `content` key too, because `buildRedemptions`/`redeem` read
+            // the content-access mode to decide whether a VIP offer means
+            // anything. Held at `entitlement` here so this file keeps testing
+            // the premium redemption path it was written for; the free-mode
+            // suppression has its own describe block below.
+            get: (key: string) =>
+              key === 'content'
+                ? { accessMode: 'entitlement' }
+                : { enabled: true, timezone: TEST_TIMEZONE },
           },
         },
       ],
@@ -273,19 +288,54 @@ describe('RewardsService', () => {
     });
 
     it('CRITICAL: reports watchTime as null rather than inventing a figure', async () => {
-      // There is no server-side watch-analytics feed; `WatchProgress` is a
-      // resume position, not accumulated watch time.
+      // Still null, and still for the original reason: there is no measure of
+      // watch DURATION here. Work unit "REWARDS V1 EARN AND SPEND" added
+      // `WATCH_EPISODES` missions, which count episodes STARTED from
+      // server-observed playback authorisations — a different, provable
+      // quantity that is deliberately not reported through this field.
       const snapshot = await service.getSnapshot(userId);
       expect(snapshot.watchTime).toBeNull();
     });
 
-    it('CRITICAL: serves tasks, but none of them claimable', async () => {
+    it('CRITICAL: every claimable task states how strong its evidence is', async () => {
       const snapshot = await service.getSnapshot(userId);
 
       expect(snapshot.tasks.length).toBeGreaterThan(0);
+
       for (const task of snapshot.tasks) {
-        expect(task.isClaimSupported).toBe(false);
+        if (task.isClaimSupported) {
+          // A claimable task must SAY what the server actually observed.
+          // Without this the surface could pay for a social confirmation and
+          // present it exactly like a server-verified one.
+          expect(['USER_CONFIRMED', 'SERVER_OBSERVED']).toContain(
+            task.verification,
+          );
+        } else {
+          // An unclaimable one must say why, so the client renders an
+          // explanation rather than a dead button.
+          expect(task.unsupportedReason).toBeDefined();
+        }
       }
+    });
+
+    it('CRITICAL: still refuses to pay a rewarded ad, which has no server callback', async () => {
+      const snapshot = await service.getSnapshot(userId);
+      const rewardedAd = snapshot.tasks.find(
+        (task) => task.type === 'REWARDED_AD',
+      );
+
+      expect(rewardedAd?.isClaimSupported).toBe(false);
+      expect(rewardedAd?.unsupportedReason).toBe('NO_VERIFIABLE_SIGNAL');
+    });
+
+    it('reports the caller active perks alongside everything else', async () => {
+      const snapshot = await service.getSnapshot(userId);
+
+      expect(snapshot.activePerks).toEqual({
+        perks: [],
+        skipNextInterstitial: false,
+        adFreeUntil: null,
+      });
     });
 
     it('computes redemption availability from the authoritative balance', async () => {
@@ -537,5 +587,119 @@ describe('RewardsService', () => {
         code: AppErrorCode.REWARD_LEDGER_INVALID_DELTA,
       });
     });
+  });
+});
+
+/**
+ * Work unit "REWARDS V1 EARN AND SPEND": the V1 posture — every episode free,
+ * so a VIP offer sells nothing.
+ *
+ * A SEPARATE MODULE rather than a mutated mock, because the content-access
+ * mode is read per call from `ConfigService` and building the second module
+ * makes the two postures independently readable rather than order-dependent.
+ */
+describe('RewardsService under CONTENT_ACCESS_MODE=free', () => {
+  let service: RewardsService;
+  let prisma: PrismaService;
+  let userId: string;
+
+  beforeEach(async () => {
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        RewardsService,
+        RewardsWalletService,
+        RewardsMissionsService,
+        RewardsPerksService,
+        RewardsWatchService,
+        EntitlementsService,
+        PrismaService,
+        {
+          provide: ConfigService,
+          useValue: {
+            get: (key: string) =>
+              key === 'content'
+                ? { accessMode: 'free' }
+                : { enabled: true, timezone: TEST_TIMEZONE },
+          },
+        },
+      ],
+    }).compile();
+
+    service = module.get(RewardsService);
+    prisma = module.get(PrismaService);
+    await prisma.onModuleInit();
+
+    const user = await prisma.user.create({
+      data: {
+        email: fixtureEmail('rewards-free-mode'),
+        passwordHash: 'irrelevant-for-this-spec',
+      },
+    });
+    userId = user.id;
+  });
+
+  afterEach(async () => {
+    await prisma.user.deleteMany({
+      where: { email: { contains: TEST_FIXTURE_NAMESPACE } },
+    });
+    await prisma.onModuleDestroy();
+  });
+
+  it('CRITICAL: withholds every premium offer, and says why', async () => {
+    await service.devGrantPoints(userId, 90_000, 'free-mode-seed');
+
+    const snapshot = await service.getSnapshot(userId);
+    const premium = snapshot.redemptions.filter(
+      (offer) => offer.kind === 'PREMIUM_DAYS',
+    );
+
+    expect(premium.length).toBeGreaterThan(0);
+    for (const offer of premium) {
+      // Not "you cannot afford it" — the balance is 90,000. The offer simply
+      // does not mean anything in a deployment with nothing locked.
+      expect(offer.availability).toBe('COMING_SOON');
+      expect(offer.isRedeemSupported).toBe(false);
+      expect(offer.unavailableReason).toBe('NOT_APPLICABLE_IN_FREE_MODE');
+    }
+  });
+
+  it('CRITICAL: refuses a premium redemption server-side, and charges nothing', async () => {
+    await service.devGrantPoints(userId, 90_000, 'free-mode-seed-2');
+
+    // A client working from a stale catalog must not be able to buy it
+    // either — the snapshot withholding it is not the control.
+    await expect(
+      service.redeem(userId, 'redeem_vip_1d', 'free-mode-key-01'),
+    ).rejects.toMatchObject({
+      code: AppErrorCode.REWARD_OFFER_UNAVAILABLE,
+    });
+
+    const wallet = await prisma.rewardWallet.findUniqueOrThrow({
+      where: { userId },
+    });
+    expect(wallet.balancePoints).toBe(90_000);
+    expect(await prisma.rewardRedemption.count({ where: { userId } })).toBe(0);
+  });
+
+  it('CRITICAL: still sells ad perks, so coins keep a use', async () => {
+    await service.devGrantPoints(userId, 90_000, 'free-mode-seed-3');
+
+    const snapshot = await service.getSnapshot(userId);
+    const adPerks = snapshot.redemptions.filter(
+      (offer) => offer.kind === 'AD_PERK',
+    );
+
+    expect(adPerks.length).toBeGreaterThan(0);
+    for (const offer of adPerks) {
+      expect(offer.availability).toBe('AVAILABLE');
+      expect(offer.isRedeemSupported).toBe(true);
+    }
+
+    const receipt = await service.redeem(
+      userId,
+      'redeem_skip_next_ad',
+      'free-mode-key-02',
+    );
+    expect(receipt.perk).not.toBeNull();
   });
 });

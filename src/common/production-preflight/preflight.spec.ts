@@ -496,4 +496,89 @@ describe('runProductionPreflight', () => {
       expect(finding?.detail).toMatch(/admin-role/);
     });
   });
+
+  /**
+   * Work unit "REWARDS V1 EARN AND SPEND": V1 ships free content + ads +
+   * rewards, so a release with no earn loop, or with social missions still
+   * pointing at a template handle, is worth stating before it ships rather
+   * than discovering afterwards.
+   */
+  describe('rewards posture', () => {
+    const REWARDS_ON: EnvRecord = {
+      ...VALID_PRODUCTION_ENV,
+      REWARDS_ENABLED: 'true',
+      REWARDS_SOCIAL_INSTAGRAM_URL: 'https://www.instagram.com/redpanda',
+      REWARDS_SOCIAL_TIKTOK_URL: 'https://www.tiktok.com/@redpanda',
+      REWARDS_SOCIAL_YOUTUBE_URL: 'https://www.youtube.com/@redpanda',
+    };
+
+    it('WARNS that a release with rewards off has no earn loop at all', () => {
+      expect(severityOf(VALID_PRODUCTION_ENV, 'rewards')).toEqual(['WARNING']);
+      // A posture, not a defect: it does not block a release.
+      expect(runProductionPreflight(VALID_PRODUCTION_ENV).ok).toBe(true);
+    });
+
+    it('PASSES a fully configured V1 rewards posture', () => {
+      expect(severityOf(REWARDS_ON, 'social missions')).toEqual(['PASS']);
+      expect(runProductionPreflight(REWARDS_ON).ok).toBe(true);
+    });
+
+    it('states plainly that a social mission is user-confirmed, not verified', () => {
+      const finding = runProductionPreflight(REWARDS_ON).findings.find(
+        (f) => f.check === 'social missions',
+      );
+
+      // The report an operator reads before shipping must not let them
+      // believe the backend verifies a follow.
+      expect(finding?.detail).toMatch(/USER-CONFIRMED/);
+      expect(finding?.detail).toMatch(/no platform verifies a follow/i);
+    });
+
+    it('WARNS when rewards are on but no social mission is configured', () => {
+      const env = { ...VALID_PRODUCTION_ENV, REWARDS_ENABLED: 'true' };
+
+      expect(severityOf(env, 'social missions')).toEqual(['WARNING']);
+      expect(runProductionPreflight(env).ok).toBe(true);
+    });
+
+    it('CRITICAL: BLOCKS a social URL still carrying a template handle', () => {
+      // `https://www.instagram.com/your-handle` is a valid https URL on the
+      // right platform with a non-empty profile path, so the boot contract
+      // accepts it. It is also an account Red Panda does not own — and users
+      // would be paid for visiting it.
+      const env = {
+        ...REWARDS_ON,
+        REWARDS_SOCIAL_INSTAGRAM_URL: 'https://www.instagram.com/your-handle',
+      };
+      const report = runProductionPreflight(env);
+      const finding = report.findings.find((f) =>
+        f.check.includes('REWARDS_SOCIAL_INSTAGRAM_URL placeholder'),
+      );
+
+      expect(finding?.severity).toBe('BLOCKER');
+      expect(report.ok).toBe(false);
+      // The boot contract is NOT what catches this — that is the whole reason
+      // the check exists here.
+      expect(severityOf(env, 'boot contract')).toEqual(['PASS']);
+    });
+
+    it('BLOCKS a template handle written with the platform @ prefix', () => {
+      const env = {
+        ...REWARDS_ON,
+        REWARDS_SOCIAL_TIKTOK_URL: 'https://www.tiktok.com/@your-handle',
+      };
+
+      expect(runProductionPreflight(env).ok).toBe(false);
+    });
+
+    it('BLOCKS a malformed social URL through the boot contract', () => {
+      const env = {
+        ...REWARDS_ON,
+        REWARDS_SOCIAL_YOUTUBE_URL: 'https://youtube.evil.example/redpanda',
+      };
+
+      expect(severityOf(env, 'boot contract')).toEqual(['BLOCKER']);
+      expect(runProductionPreflight(env).ok).toBe(false);
+    });
+  });
 });

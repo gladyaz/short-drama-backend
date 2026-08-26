@@ -4,6 +4,7 @@ import {
   Get,
   HttpCode,
   HttpStatus,
+  Param,
   Post,
   Query,
   UseGuards,
@@ -15,6 +16,10 @@ import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import {
   REWARD_CHECK_IN_RATE_LIMIT,
   REWARD_CHECK_IN_RATE_TTL_MS,
+  REWARD_MISSION_RATE_LIMIT,
+  REWARD_MISSION_RATE_TTL_MS,
+  REWARD_PERK_CONSUME_RATE_LIMIT,
+  REWARD_PERK_CONSUME_RATE_TTL_MS,
   REWARD_REDEEM_RATE_LIMIT,
   REWARD_REDEEM_RATE_TTL_MS,
 } from '../common/rate-limit.constants';
@@ -23,9 +28,15 @@ import { DevGrantPointsDto } from './dto/dev-grant-points.dto';
 import { RedeemRewardDto } from './dto/redeem-reward.dto';
 import { RewardLedgerQueryDto } from './dto/reward-ledger-query.dto';
 import { RewardsEnabledGuard } from './guards/rewards-enabled.guard';
+import { RewardsMissionsService } from './rewards-missions.service';
+import { RewardsPerksService } from './rewards-perks.service';
 import { RewardsService } from './rewards.service';
 import {
+  ActivePerksDto,
   CheckInResponseDto,
+  MissionClaimResponseDto,
+  MissionOpenResponseDto,
+  PerkConsumeResponseDto,
   RedeemResponseDto,
   RewardLedgerPageDto,
   RewardsSnapshotDto,
@@ -54,7 +65,11 @@ import {
  */
 @Controller()
 export class RewardsController {
-  constructor(private readonly rewardsService: RewardsService) {}
+  constructor(
+    private readonly rewardsService: RewardsService,
+    private readonly missionsService: RewardsMissionsService,
+    private readonly perksService: RewardsPerksService,
+  ) {}
 
   /**
    * The whole Rewards Center in one read. Deliberately one call rather than
@@ -133,6 +148,123 @@ export class RewardsController {
       body.offerId,
       body.idempotencyKey,
     );
+  }
+
+  /**
+   * Work unit "REWARDS V1 EARN AND SPEND": records that the user is being
+   * sent to a social profile, and returns the URL to send them to.
+   *
+   * TAKES NO BODY, and the URL in the RESPONSE is the one to open — never a
+   * URL the client sends. A route that accepted a destination would let a
+   * caller nominate where the app opens an external browser, which is a
+   * phishing primitive handed out with the app's own branding on it.
+   *
+   * 200, not 201: the row it upserts is bookkeeping, not a resource the
+   * caller created and can address.
+   */
+  @UseGuards(JwtAuthGuard, RewardsEnabledGuard)
+  @Throttle({
+    default: {
+      limit: REWARD_MISSION_RATE_LIMIT,
+      ttl: REWARD_MISSION_RATE_TTL_MS,
+    },
+  })
+  @HttpCode(HttpStatus.OK)
+  @Post('rewards/missions/:missionId/open')
+  openMission(
+    @CurrentUser() user: AuthenticatedUser,
+    @Param('missionId') missionId: string,
+  ): Promise<MissionOpenResponseDto> {
+    return this.missionsService.openMission(user.id, missionId);
+  }
+
+  /**
+   * Work unit "REWARDS V1 EARN AND SPEND": claims a social mission (the user
+   * confirming they did the external action) or a watch milestone.
+   *
+   * TAKES NO BODY, exactly like `POST /rewards/check-in` and for the same
+   * reason: the amount is the server's, the reward day is the server's, and
+   * the idempotency key is derived from the mission id (plus the period, for
+   * a daily mission). There is nothing a client could send that would change
+   * the outcome — including which mission it is, which comes from the path
+   * and is resolved against the catalog before anything is paid.
+   *
+   * 200 in both cases. A repeat claim is `alreadyClaimed: true` with
+   * `awardedPoints: 0`, not a 409 — a double-tap is a successful no-op.
+   */
+  @UseGuards(JwtAuthGuard, RewardsEnabledGuard)
+  @Throttle({
+    default: {
+      limit: REWARD_MISSION_RATE_LIMIT,
+      ttl: REWARD_MISSION_RATE_TTL_MS,
+    },
+  })
+  @HttpCode(HttpStatus.OK)
+  @Post('rewards/missions/:missionId/claim')
+  claimMission(
+    @CurrentUser() user: AuthenticatedUser,
+    @Param('missionId') missionId: string,
+  ): Promise<MissionClaimResponseDto> {
+    return this.missionsService.claimMission(user.id, missionId);
+  }
+
+  /**
+   * Work unit "REWARDS V1 EARN AND SPEND": the question the mobile ad layer
+   * asks before showing an interstitial — "does this account hold a perk
+   * that says not to?"
+   *
+   * Deliberately SEPARATE from `/rewards/snapshot` even though the snapshot
+   * carries the same object: the ad gate consults this far more often than
+   * anyone opens the Rewards Center, and making it pay for a wallet read, a
+   * streak read, a mission-state read and a `COUNT` every time would be a
+   * tax on every ad break.
+   *
+   * No `@Throttle()` override — see `REWARD_PERK_CONSUME_RATE_LIMIT`'s doc
+   * for why a read on the ad path keeps the generous app-wide default.
+   */
+  @UseGuards(JwtAuthGuard, RewardsEnabledGuard)
+  @Get('rewards/perks')
+  getPerks(@CurrentUser() user: AuthenticatedUser): Promise<ActivePerksDto> {
+    return this.perksService.getActivePerks(user.id);
+  }
+
+  /**
+   * Work unit "REWARDS V1 EARN AND SPEND": spends a single-use ad-skip perk.
+   *
+   * THE CLIENT MUST CALL THIS WHEN IT ACTUALLY SKIPS. A perk that the app
+   * "uses" by quietly not showing an ad is a perk the server still believes
+   * the user holds — the balance and the entitlement would disagree with
+   * what the user experienced, and the next ad break would skip again for
+   * free. Recording the spend server-side is what makes "you bought one
+   * skip" true.
+   *
+   * 200 with `alreadyConsumed: true` on a repeat, not 409: a retried consume
+   * after a dropped response is the ordinary case, and the client's correct
+   * reaction is identical either way.
+   */
+  @UseGuards(JwtAuthGuard, RewardsEnabledGuard)
+  @Throttle({
+    default: {
+      limit: REWARD_PERK_CONSUME_RATE_LIMIT,
+      ttl: REWARD_PERK_CONSUME_RATE_TTL_MS,
+    },
+  })
+  @HttpCode(HttpStatus.OK)
+  @Post('rewards/perks/:perkId/consume')
+  async consumePerk(
+    @CurrentUser() user: AuthenticatedUser,
+    @Param('perkId') perkId: string,
+  ): Promise<PerkConsumeResponseDto> {
+    const outcome = await this.perksService.consume(user.id, perkId);
+
+    return {
+      perkId,
+      consumed: outcome.consumed,
+      alreadyConsumed: outcome.alreadyConsumed,
+      // The refreshed set, so a client never has to guess what it holds
+      // after spending something.
+      perks: await this.perksService.getActivePerks(user.id),
+    };
   }
 
   /**

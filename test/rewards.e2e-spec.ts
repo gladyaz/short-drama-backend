@@ -8,9 +8,16 @@ import { AppExceptionFilter } from './../src/common/filters/app-exception.filter
 import { e2eSuiteBootBudgetMs } from './../src/common/testing/e2e-boot-budget.helpers';
 import type { EntitlementStatusDto } from './../src/entitlements/entitlement.types';
 import { PrismaService } from './../src/prisma/prisma.service';
-import { CHECK_IN_REWARD_CURVE } from './../src/rewards/rewards.constants';
+import {
+  CHECK_IN_REWARD_CURVE,
+  findRedemptionOffer,
+} from './../src/rewards/rewards.constants';
 import type {
+  ActivePerksDto,
   CheckInResponseDto,
+  MissionClaimResponseDto,
+  MissionOpenResponseDto,
+  PerkConsumeResponseDto,
   RedeemResponseDto,
   RewardLedgerPageDto,
   RewardsSnapshotDto,
@@ -21,6 +28,12 @@ interface ErrorResponseBody {
   code: string;
   message: string;
 }
+
+const INSTAGRAM_URL = 'https://www.instagram.com/redpanda';
+const TIKTOK_URL = 'https://www.tiktok.com/@redpanda';
+const YOUTUBE_URL = 'https://www.youtube.com/@redpanda';
+
+const SKIP_OFFER_ID = 'redeem_skip_next_ad';
 
 /**
  * e2e coverage for the `/rewards/*` surface, hitting real HTTP against the
@@ -98,6 +111,12 @@ describe('Rewards (e2e)', () => {
         ['get', '/rewards/snapshot'],
         ['post', '/rewards/check-in'],
         ['get', '/rewards/ledger'],
+        // Work unit "REWARDS V1 EARN AND SPEND": the new surface answers the
+        // same way. A feature that ships dark must not expose HALF of itself.
+        ['post', '/rewards/missions/task_social_instagram/open'],
+        ['post', '/rewards/missions/task_social_instagram/claim'],
+        ['get', '/rewards/perks'],
+        ['post', '/rewards/perks/some-perk-id/consume'],
       ];
 
       for (const [method, path] of routes) {
@@ -136,13 +155,27 @@ describe('Rewards (e2e)', () => {
     let prisma: PrismaService;
     let accessToken: string;
     let userId: string;
+    /** A second account, registered once — see the account budget note below. */
+    let v1AccessToken: string;
+    let v1UserId: string;
 
     beforeAll(async () => {
       process.env.REWARDS_ENABLED = 'true';
       process.env.DEV_TOOLS_ENABLED = 'true';
+      // Work unit "REWARDS V1 EARN AND SPEND": the social catalog is read
+      // from `process.env` once, when the module is constructed, so these
+      // must be set BEFORE `buildApp()`.
+      process.env.REWARDS_SOCIAL_INSTAGRAM_URL = INSTAGRAM_URL;
+      process.env.REWARDS_SOCIAL_TIKTOK_URL = TIKTOK_URL;
+      process.env.REWARDS_SOCIAL_YOUTUBE_URL = YOUTUBE_URL;
+      delete process.env.REWARDS_SOCIAL_FACEBOOK_URL;
 
       ({ app, prisma } = await buildApp());
       ({ accessToken, userId } = await registerUser(app, 'enabled'));
+      ({ accessToken: v1AccessToken, userId: v1UserId } = await registerUser(
+        app,
+        'v1',
+      ));
     }, e2eSuiteBootBudgetMs(1));
 
     afterAll(async () => {
@@ -152,6 +185,9 @@ describe('Rewards (e2e)', () => {
       await app.close();
       delete process.env.REWARDS_ENABLED;
       delete process.env.DEV_TOOLS_ENABLED;
+      delete process.env.REWARDS_SOCIAL_INSTAGRAM_URL;
+      delete process.env.REWARDS_SOCIAL_TIKTOK_URL;
+      delete process.env.REWARDS_SOCIAL_YOUTUBE_URL;
     });
 
     const auth = () => `Bearer ${accessToken}`;
@@ -175,9 +211,18 @@ describe('Rewards (e2e)', () => {
       expect(snapshot.dailyCheckIn.days).toHaveLength(7);
       expect(snapshot.watchTime).toBeNull();
       expect(snapshot.redemptions.length).toBeGreaterThan(0);
-      // No task is claimable — see docs/rewards-api-contract.md section 6.
+      // Work unit "REWARDS V1 EARN AND SPEND": the social and watch missions
+      // ARE claimable now, and every claimable task must state how strong its
+      // evidence is. What is still unclaimable must say why — see
+      // docs/rewards-api-contract.md section 6.
       for (const task of snapshot.tasks) {
-        expect(task.isClaimSupported).toBe(false);
+        if (task.isClaimSupported) {
+          expect(['USER_CONFIRMED', 'SERVER_OBSERVED']).toContain(
+            task.verification,
+          );
+        } else {
+          expect(task.unsupportedReason).toBeDefined();
+        }
       }
     });
 
@@ -378,6 +423,222 @@ describe('Rewards (e2e)', () => {
         .set('Authorization', `Bearer ${other.accessToken}`)
         .expect(HttpStatus.OK);
       expect((ledger.body as RewardLedgerPageDto).entries).toHaveLength(0);
+    });
+
+    // -----------------------------------------------------------------
+    // Work unit "REWARDS V1 EARN AND SPEND"
+    //
+    // ACCOUNT BUDGET. `POST /auth/register` is limited to 3 per 10 minutes
+    // per IP, and this app instance already spends two of those (the suite's
+    // main account and the isolation account below). Every test here
+    // therefore reuses `accessToken` or the single extra `v1` account
+    // registered in `beforeAll` — registering per test would make the suite
+    // fail on the fourth one for a reason that has nothing to do with
+    // rewards.
+    // -----------------------------------------------------------------
+
+    it('CRITICAL: serves the configured social missions, and never claims they are verified', async () => {
+      const response = await request(app.getHttpServer())
+        .get('/rewards/snapshot')
+        .set('Authorization', auth())
+        .expect(HttpStatus.OK);
+
+      const social = (response.body as RewardsSnapshotDto).tasks.filter(
+        (task) => task.type === 'SOCIAL_FOLLOW',
+      );
+
+      expect(social.map((task) => task.socialPlatform)).toEqual([
+        'INSTAGRAM',
+        'TIKTOK',
+        'YOUTUBE',
+      ]);
+      expect(social.map((task) => task.destinationUrl)).toEqual([
+        INSTAGRAM_URL,
+        TIKTOK_URL,
+        YOUTUBE_URL,
+      ]);
+
+      for (const task of social) {
+        // The honesty flag, asserted on the wire and not only in a unit test.
+        expect(task.verification).toBe('USER_CONFIRMED');
+        expect(task.isClaimSupported).toBe(true);
+      }
+
+      // Facebook is not configured in this app, so it is not served at all.
+      expect(
+        (response.body as RewardsSnapshotDto).tasks.find(
+          (task) => task.id === 'task_social_facebook',
+        ),
+      ).toBeUndefined();
+    });
+
+    it('CRITICAL: refuses a social claim from a client that never opened the link', async () => {
+      const before = await prisma.rewardLedgerEntry.count({
+        where: { userId: v1UserId },
+      });
+
+      const response = await request(app.getHttpServer())
+        .post('/rewards/missions/task_social_tiktok/claim')
+        .set('Authorization', `Bearer ${v1AccessToken}`)
+        .expect(HttpStatus.CONFLICT);
+
+      expect((response.body as ErrorResponseBody).code).toBe(
+        'REWARD_MISSION_NOT_STARTED',
+      );
+      expect(
+        await prisma.rewardLedgerEntry.count({ where: { userId: v1UserId } }),
+      ).toBe(before);
+    });
+
+    it('CRITICAL: opens then claims a social mission exactly once', async () => {
+      const opened = await request(app.getHttpServer())
+        .post('/rewards/missions/task_social_instagram/open')
+        .set('Authorization', `Bearer ${v1AccessToken}`)
+        .expect(HttpStatus.OK);
+
+      const openBody = opened.body as MissionOpenResponseDto;
+      expect(openBody.destinationUrl).toBe(INSTAGRAM_URL);
+      expect(openBody.claimableAfter > openBody.openedAt).toBe(true);
+
+      // The route enforces a short dwell window. Back-date the RECORDED open
+      // rather than sleeping through it — the rule under test is the server's
+      // arithmetic over stored state, not the passage of wall-clock time.
+      await prisma.rewardMissionClaim.updateMany({
+        where: { userId: v1UserId, missionId: 'task_social_instagram' },
+        data: { openedAt: new Date(Date.now() - 60_000) },
+      });
+
+      const first = await request(app.getHttpServer())
+        .post('/rewards/missions/task_social_instagram/claim')
+        .set('Authorization', `Bearer ${v1AccessToken}`)
+        .expect(HttpStatus.OK);
+
+      const firstBody = first.body as MissionClaimResponseDto;
+      expect(firstBody.alreadyClaimed).toBe(false);
+      expect(firstBody.awardedPoints).toBeGreaterThan(0);
+      expect(firstBody.task.verification).toBe('USER_CONFIRMED');
+
+      const second = await request(app.getHttpServer())
+        .post('/rewards/missions/task_social_instagram/claim')
+        .set('Authorization', `Bearer ${v1AccessToken}`)
+        .expect(HttpStatus.OK);
+
+      const secondBody = second.body as MissionClaimResponseDto;
+      expect(secondBody.alreadyClaimed).toBe(true);
+      expect(secondBody.awardedPoints).toBe(0);
+      expect(secondBody.wallet.balancePoints).toBe(
+        firstBody.wallet.balancePoints,
+      );
+    });
+
+    it('CRITICAL: refuses a redemption the balance cannot cover, and issues no perk', async () => {
+      // `v1` has exactly one social reward at this point, which is less than
+      // any offer costs.
+      const response = await request(app.getHttpServer())
+        .post('/rewards/redemptions')
+        .set('Authorization', `Bearer ${v1AccessToken}`)
+        .send({ offerId: SKIP_OFFER_ID, idempotencyKey: 'e2e-perk-poor-001' })
+        .expect(HttpStatus.CONFLICT);
+
+      expect((response.body as ErrorResponseBody).code).toBe(
+        'INSUFFICIENT_REWARD_POINTS',
+      );
+      expect(
+        await prisma.rewardPerk.count({ where: { userId: v1UserId } }),
+      ).toBe(0);
+    });
+
+    it('CRITICAL: refuses a mission id that is not in the catalog', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/rewards/missions/task_social_give_me_points/claim')
+        .set('Authorization', auth())
+        .expect(HttpStatus.NOT_FOUND);
+
+      expect((response.body as ErrorResponseBody).code).toBe(
+        'REWARD_MISSION_NOT_FOUND',
+      );
+    });
+
+    it('refuses a real mission this deployment has not configured', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/rewards/missions/task_social_facebook/open')
+        .set('Authorization', auth())
+        .expect(HttpStatus.CONFLICT);
+
+      expect((response.body as ErrorResponseBody).code).toBe(
+        'REWARD_MISSION_UNAVAILABLE',
+      );
+    });
+
+    it('CRITICAL: buys an ad-skip perk, reports it to the ad gate, and spends it once', async () => {
+      const offer = findRedemptionOffer(SKIP_OFFER_ID)!;
+
+      const before = await request(app.getHttpServer())
+        .get('/rewards/snapshot')
+        .set('Authorization', auth())
+        .expect(HttpStatus.OK);
+      const balanceBefore = (before.body as RewardsSnapshotDto).wallet
+        .balancePoints;
+
+      const redeemed = await request(app.getHttpServer())
+        .post('/rewards/redemptions')
+        .set('Authorization', auth())
+        .send({ offerId: SKIP_OFFER_ID, idempotencyKey: 'e2e-perk-buy-0001' })
+        .expect(HttpStatus.OK);
+
+      const receipt = redeemed.body as RedeemResponseDto;
+      expect(receipt.perk).not.toBeNull();
+      expect(receipt.wallet.balancePoints).toBe(
+        balanceBefore - offer.costPoints,
+      );
+      // An ad perk buys no premium at all.
+      expect(receipt.entitlementExpiresAt).toBeNull();
+      expect(receipt.grantsDays).toBe(0);
+
+      const perks = await request(app.getHttpServer())
+        .get('/rewards/perks')
+        .set('Authorization', auth())
+        .expect(HttpStatus.OK);
+
+      expect((perks.body as ActivePerksDto).skipNextInterstitial).toBe(true);
+
+      // A different account must not be able to spend it.
+      await request(app.getHttpServer())
+        .post(`/rewards/perks/${receipt.perk!.id}/consume`)
+        .set('Authorization', `Bearer ${v1AccessToken}`)
+        .expect(HttpStatus.NOT_FOUND);
+
+      const consumed = await request(app.getHttpServer())
+        .post(`/rewards/perks/${receipt.perk!.id}/consume`)
+        .set('Authorization', auth())
+        .expect(HttpStatus.OK);
+
+      const consumedBody = consumed.body as PerkConsumeResponseDto;
+      expect(consumedBody.consumed).toBe(true);
+      expect(consumedBody.perks.skipNextInterstitial).toBe(false);
+
+      // A retried consume is a 200 no-op, not a failure to render.
+      const again = await request(app.getHttpServer())
+        .post(`/rewards/perks/${receipt.perk!.id}/consume`)
+        .set('Authorization', auth())
+        .expect(HttpStatus.OK);
+
+      expect((again.body as PerkConsumeResponseDto).alreadyConsumed).toBe(true);
+    });
+
+    it('rejects every new route without a credential', async () => {
+      const routes: ['get' | 'post', string][] = [
+        ['post', '/rewards/missions/task_social_instagram/open'],
+        ['post', '/rewards/missions/task_social_instagram/claim'],
+        ['get', '/rewards/perks'],
+        ['post', '/rewards/perks/anything/consume'],
+      ];
+
+      for (const [method, path] of routes) {
+        await request(app.getHttpServer())
+          [method](path)
+          .expect(HttpStatus.UNAUTHORIZED);
+      }
     });
   });
 

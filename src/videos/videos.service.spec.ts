@@ -629,6 +629,10 @@ describe('VideosService', () => {
       expect(info).toEqual({
         episodeNumber: testVideos[0].episodeNumber,
         accessTierOverride: null,
+        // Work unit "REWARDS V1 EARN AND SPEND": carried so the playback
+        // route can record WHICH series a watch credit belongs to without a
+        // second query. It is reported, never read by the access decision.
+        seriesId: testVideos[0].seriesId,
       });
     });
 

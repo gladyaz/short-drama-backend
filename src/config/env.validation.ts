@@ -6,6 +6,11 @@ import { existsSync, statSync } from 'fs';
 // does not pull the auth stack into config validation.
 import { WHATSAPP_OTP_DRIVERS } from '../auth/identity/whatsapp/whatsapp-otp.types';
 import {
+  rejectSocialUrl,
+  SOCIAL_MISSION_DEFINITIONS,
+  SocialUrlRejection,
+} from '../rewards/social-missions.constants';
+import {
   isLoopbackHostname,
   isPrivateHostname,
 } from '../common/net/public-host';
@@ -224,6 +229,13 @@ function validateAuthSecretDistinctness(config: Record<string, unknown>): void {
  * find out when it sets it, not weeks later when someone flips the flag.
  */
 function validateRewardsConfig(config: Record<string, unknown>): void {
+  // FIRST, and deliberately before the timezone block below, which RETURNS
+  // EARLY when `REWARDS_TIMEZONE` is unset (an unset optional variable is not
+  // a misconfiguration). Calling the social check after that return would
+  // have silently skipped it for every deployment using the default
+  // timezone — which is most of them.
+  validateRewardsSocialUrls(config);
+
   // Narrowed to `string` explicitly rather than coerced with `String()`.
   // Config values are always strings in practice; a non-string here is an
   // unexpected shape, not something to stringify — the same discipline
@@ -244,6 +256,86 @@ function validateRewardsConfig(config: Record<string, unknown>): void {
       `REWARDS_TIMEZONE is not a valid IANA timezone: "${timezone}". ` +
         'Use a zone name such as "Asia/Jakarta", or unset it to use the default.',
     );
+  }
+}
+
+/**
+ * Work unit "REWARDS V1 EARN AND SPEND": the four `REWARDS_SOCIAL_*_URL`
+ * variables, each OPTIONAL but strictly shaped if present.
+ *
+ * WHY AN UNSET VARIABLE IS FINE AND A MALFORMED ONE IS FATAL. Unset means "we
+ * do not run that mission", which is a legitimate posture and is how the
+ * feature rolls out one platform at a time. A value that is SET but unusable
+ * is a different thing entirely: an operator has decided to run the mission
+ * and typed something wrong, and the silent outcome — the tile quietly
+ * missing from every client — is exactly the failure that goes unnoticed
+ * until someone asks why the Instagram mission never appeared. Failing the
+ * boot puts the discovery at deploy time, next to the change that caused it.
+ *
+ * THE HOST ALLOWLIST IS THE SECURITY PART. These URLs are served to every
+ * client and opened in an external browser on the user's device. Pinning each
+ * one to its own platform's domains means a typo — or a compromised env
+ * store — cannot turn the Rewards Center into a phishing funnel carrying Red
+ * Panda's branding.
+ *
+ * VALIDATED UNCONDITIONALLY, not only when `REWARDS_ENABLED=true`, matching
+ * `REWARDS_TIMEZONE` above: a deployment that sets a broken URL while the
+ * feature is dark should find out when it sets it, not weeks later when
+ * someone flips the flag.
+ *
+ * NOT CHECKED HERE: whether the profile path is a real Red Panda account
+ * rather than a template placeholder like `/your-handle`. That is
+ * indistinguishable from a real handle by shape alone, so it belongs with the
+ * other placeholder rules in `production-preflight/preflight.ts`, which is
+ * where `https://api.example.com` is already caught for the same reason.
+ */
+function validateRewardsSocialUrls(config: Record<string, unknown>): void {
+  for (const mission of SOCIAL_MISSION_DEFINITIONS) {
+    const raw = config[mission.envKey];
+
+    // Unset or blank: this deployment does not run this mission.
+    if (typeof raw !== 'string' || raw.trim().length === 0) {
+      continue;
+    }
+
+    const rejection = rejectSocialUrl(raw, mission);
+
+    if (rejection !== null) {
+      throw new Error(
+        `Invalid ${mission.envKey}=${JSON.stringify(raw)}: ` +
+          `${explainSocialUrlRejection(rejection, mission.allowedHosts)} ` +
+          'This value is served to every client and opened in an external ' +
+          `browser, so the "${mission.id}" mission is refused rather than ` +
+          'pointed somewhere unintended. Unset the variable to disable the ' +
+          'mission entirely.',
+      );
+    }
+  }
+}
+
+/**
+ * The rejection reason as a sentence an operator can act on.
+ *
+ * THE VALUE IS ECHOED by the caller, deliberately and unlike every
+ * secret-bearing validator in this file — a public social profile URL is not
+ * a secret, it is a link about to be shown to every user, and naming it is
+ * what makes the failure obvious at a glance.
+ */
+function explainSocialUrlRejection(
+  rejection: SocialUrlRejection,
+  allowedHosts: readonly string[],
+): string {
+  switch (rejection) {
+    case 'NOT_A_STRING':
+      return 'it must be a non-empty string.';
+    case 'NOT_A_URL':
+      return 'it must be an absolute URL (for example https://www.instagram.com/redpanda).';
+    case 'NOT_HTTPS':
+      return 'it must use https — Android 9+ refuses cleartext, so an http:// link would silently fail to open.';
+    case 'WRONG_HOST':
+      return `its host must be one of: ${allowedHosts.join(', ')}.`;
+    case 'NO_PROFILE_PATH':
+      return 'it must point at a profile, not the platform home page (the path is empty).';
   }
 }
 

@@ -1,7 +1,9 @@
 import { AppErrorCode } from '../../../common/errors/app-error-code';
 import { AppException } from '../../../common/errors/app.exception';
 import {
+  MAX_E164_DIGITS,
   MAX_RAW_PHONE_INPUT_LENGTH,
+  MIN_E164_DIGITS,
   maskPhoneE164,
   normalizePhoneToE164,
 } from './phone-normalization.util';
@@ -135,3 +137,152 @@ function expectRejected(raw: string): void {
   const error = captureRejection(raw);
   expect(error.code).toBe(AppErrorCode.INVALID_PHONE_NUMBER);
 }
+
+/**
+ * WHATSAPP LOGIN V1 — boundary and malformed-input coverage, added because
+ * this function is the thing that decides whether two spellings of one
+ * person's number become one identity or two. Every case below is either an
+ * exact boundary of a documented rule or an input a real Indonesian user
+ * plausibly types.
+ */
+describe('normalizePhoneToE164 — boundaries and malformed input', () => {
+  describe('E.164 length boundaries are exact, not approximate', () => {
+    it('accepts exactly MIN_E164_DIGITS', () => {
+      const raw = `+${'6'.repeat(MIN_E164_DIGITS)}`;
+      expect(normalizePhoneToE164(raw)).toBe(raw);
+    });
+
+    it('rejects one digit below MIN_E164_DIGITS', () => {
+      expect(() =>
+        normalizePhoneToE164(`+${'6'.repeat(MIN_E164_DIGITS - 1)}`),
+      ).toThrow(AppException);
+    });
+
+    it('accepts exactly MAX_E164_DIGITS', () => {
+      const raw = `+${'6'.repeat(MAX_E164_DIGITS)}`;
+      expect(normalizePhoneToE164(raw)).toBe(raw);
+    });
+
+    it('rejects one digit above MAX_E164_DIGITS', () => {
+      expect(() =>
+        normalizePhoneToE164(`+${'6'.repeat(MAX_E164_DIGITS + 1)}`),
+      ).toThrow(AppException);
+    });
+
+    it('measures length AFTER the 0 -> 62 rewrite, not before', () => {
+      // 14 national digits become 15 with the country code — the ceiling.
+      expect(normalizePhoneToE164(`0${'8'.repeat(13)}`)).toBe(
+        `+62${'8'.repeat(13)}`,
+      );
+      // 15 national digits would become 16, which must be refused.
+      expect(() => normalizePhoneToE164(`0${'8'.repeat(14)}`)).toThrow(
+        AppException,
+      );
+    });
+
+    it('accepts input at exactly MAX_RAW_PHONE_INPUT_LENGTH', () => {
+      // Padded to the cap with ignorable separators.
+      const raw = '+6281234567890'.padEnd(MAX_RAW_PHONE_INPUT_LENGTH, '-');
+      expect(raw).toHaveLength(MAX_RAW_PHONE_INPUT_LENGTH);
+      expect(normalizePhoneToE164(raw)).toBe('+6281234567890');
+    });
+
+    it('rejects input one character over the raw cap', () => {
+      expect(() =>
+        normalizePhoneToE164('0'.repeat(MAX_RAW_PHONE_INPUT_LENGTH + 1)),
+      ).toThrow(AppException);
+    });
+  });
+
+  describe('real Indonesian spellings all reach one identity key', () => {
+    it.each([
+      '081234567890',
+      '  081234567890  ',
+      '0812-3456-7890',
+      '0812 3456 7890',
+      '(0812) 3456-7890',
+      '+6281234567890',
+      '+62 812 3456 7890',
+      '+62-812-3456-7890',
+      '006281234567890',
+    ])('%s normalizes to +6281234567890', (raw) => {
+      expect(normalizePhoneToE164(raw)).toBe('+6281234567890');
+    });
+  });
+
+  describe('international numbers are not assumed Indonesian', () => {
+    it.each([
+      ['+14155552671', '+14155552671'],
+      ['+442071838750', '+442071838750'],
+      ['+6591234567', '+6591234567'],
+      ['+60123456789', '+60123456789'],
+      ['0014155552671', '+14155552671'],
+    ])('%s normalizes to %s untouched by the +62 default', (raw, expected) => {
+      expect(normalizePhoneToE164(raw)).toBe(expected);
+    });
+
+    it('CRITICAL: the 0 -> 62 rewrite can never shadow an international number', () => {
+      // A leading 0 is invalid E.164 in EVERY country, so no legitimate
+      // international input can reach the Indonesian branch.
+      expect(() => normalizePhoneToE164('+0014155552671')).toThrow(
+        AppException,
+      );
+    });
+  });
+
+  describe('malformed input is refused, never repaired', () => {
+    it.each([
+      ['a lone plus', '+'],
+      ['a lone zero', '0'],
+      ['only separators', '---   ---'],
+      ['a doubled plus', '++6281234567890'],
+      ['a trailing plus', '6281234567890+'],
+      ['an embedded plus', '+62812+34567890'],
+      ['letters', '+62812ABC4567890'],
+      ['an extension marker', '+6281234567890x123'],
+      ['a unicode full-width digit', '+６２81234567890'],
+      ['an arabic-indic digit', '+٦٢81234567890'],
+      ['an interior newline', '+62812\n34567890'],
+      ['a null byte', '+6281234567890\u0000'],
+      ['a tab inside', '+62812\t34567890'],
+      ['an underscore', '+62812_34567890'],
+      ['a slash', '+62812/34567890'],
+      ['a comma', '+62,812,3456,7890'],
+    ])('rejects %s', (_label, raw) => {
+      expect(() => normalizePhoneToE164(raw)).toThrow(AppException);
+    });
+
+    it('trims surrounding whitespace, including a trailing newline, before parsing', () => {
+      // Deliberate: the explicit `.trim()` runs first, so a value pasted out
+      // of a text field with a stray newline is accepted rather than
+      // rejected for a reason a user cannot see. An INTERIOR newline is
+      // still refused (above) — trimming the ends is not the same as
+      // stripping characters from the middle.
+      expect(normalizePhoneToE164('  +6281234567890\n')).toBe('+6281234567890');
+    });
+
+    it('CRITICAL: separators are ignored but no OTHER character is stripped', () => {
+      // If a stray character were silently dropped, these two DIFFERENT
+      // inputs would collapse onto one identity — one human's account
+      // reachable by another's typo.
+      expect(normalizePhoneToE164('+62812-3456-7890')).toBe('+6281234567890');
+      expect(() => normalizePhoneToE164('+62812:3456:7890')).toThrow(
+        AppException,
+      );
+    });
+  });
+
+  describe('non-string input cannot crash the normalizer', () => {
+    it.each([
+      ['undefined', undefined],
+      ['null', null],
+      ['a number', 6281234567890],
+      ['an object', { phone: '+6281234567890' }],
+      ['an array', ['+6281234567890']],
+    ])('rejects %s with the same generic shape error', (_label, raw) => {
+      expect(() => normalizePhoneToE164(raw as unknown as string)).toThrow(
+        AppException,
+      );
+    });
+  });
+});

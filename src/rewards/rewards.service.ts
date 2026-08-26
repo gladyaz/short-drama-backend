@@ -1,9 +1,15 @@
 import { HttpStatus, Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { RewardCheckIn, RewardWallet } from '@prisma/client';
+import {
+  Prisma,
+  RewardCheckIn,
+  RewardPerk,
+  RewardWallet,
+} from '@prisma/client';
 import { AppErrorCode } from '../common/errors/app-error-code';
 import { AppException } from '../common/errors/app.exception';
 import { RootConfig } from '../config/configuration';
+import { readContentAccessMode } from '../config/content-access-mode.util';
 import { EntitlementsService } from '../entitlements/entitlements.service';
 import { PrismaService } from '../prisma/prisma.service';
 import {
@@ -19,6 +25,7 @@ import {
   CHECK_IN_REWARD_CURVE,
   DEV_GRANT_MAX_POINTS,
   findRedemptionOffer,
+  isOfferApplicable,
   LEDGER_PAGE_SIZE_DEFAULT,
   LEDGER_PAGE_SIZE_MAX,
   REWARD_ENTITLEMENT_SOURCE,
@@ -26,7 +33,10 @@ import {
   REWARD_REDEMPTION_OFFERS,
   REWARD_SOURCE_TYPES,
   REWARD_TASK_DEFINITIONS,
+  RewardRedemptionOffer,
 } from './rewards.constants';
+import { RewardsMissionsService } from './rewards-missions.service';
+import { RewardsPerksService, toPerkDto } from './rewards-perks.service';
 import { RewardsWalletService, WalletView } from './rewards-wallet.service';
 import {
   CheckInResponseDto,
@@ -70,6 +80,8 @@ export class RewardsService {
     private readonly prisma: PrismaService,
     private readonly wallet: RewardsWalletService,
     private readonly entitlements: EntitlementsService,
+    private readonly missions: RewardsMissionsService,
+    private readonly perks: RewardsPerksService,
     private readonly configService: ConfigService<RootConfig>,
   ) {}
 
@@ -79,17 +91,23 @@ export class RewardsService {
    */
   async getSnapshot(userId: string): Promise<RewardsSnapshotDto> {
     const now = new Date();
-    const [walletView, checkIn] = await Promise.all([
+    const [walletView, checkIn, missionTasks, activePerks] = await Promise.all([
       this.wallet.readWallet(userId),
       this.prisma.rewardCheckIn.findUnique({ where: { userId } }),
+      this.missions.buildMissionTasks(userId, now),
+      this.perks.getActivePerks(userId, now),
     ]);
 
     return {
       wallet: toWalletDto(walletView),
       dailyCheckIn: this.buildDailyCheckIn(checkIn, now),
       watchTime: null,
-      tasks: this.buildTasks(),
+      // Claimable missions FIRST, then the tiles that still have no
+      // verifiable signal. A client that renders the array in order shows a
+      // user what they can actually do before what they cannot.
+      tasks: [...missionTasks, ...this.buildTasks()],
       redemptions: this.buildRedemptions(walletView.balancePoints),
+      activePerks,
     };
   }
 
@@ -289,6 +307,19 @@ export class RewardsService {
       );
     }
 
+    // Work unit "REWARDS V1 EARN AND SPEND": refuse to SELL NOTHING. Under
+    // `CONTENT_ACCESS_MODE=free` every episode is already free, so a VIP
+    // offer would take the points and change nothing about the user's
+    // experience. The snapshot already withholds it; this is the server-side
+    // half, so a client working from a stale catalog cannot buy it either.
+    if (!isOfferApplicable(offer, readContentAccessMode(this.configService))) {
+      throw new AppException(
+        AppErrorCode.REWARD_OFFER_UNAVAILABLE,
+        'This redemption is not available in this deployment',
+        HttpStatus.CONFLICT,
+      );
+    }
+
     const existing = await this.prisma.rewardRedemption.findUnique({
       where: { userId_idempotencyKey: { userId, idempotencyKey } },
     });
@@ -301,6 +332,19 @@ export class RewardsService {
           HttpStatus.CONFLICT,
         );
       }
+
+      // The ORIGINAL perk, not a new one. A replay must hand back the receipt
+      // that already exists — issuing a second perk for one payment is the
+      // exact failure idempotency is here to prevent. Fetched by id rather
+      // than through a Prisma relation because `perkId`, like
+      // `entitlementId` beside it, is a plain unique scalar (see the schema
+      // comment on why the link is one-directional).
+      const perk = existing.perkId
+        ? await this.prisma.rewardPerk.findUnique({
+            where: { id: existing.perkId },
+          })
+        : null;
+
       return {
         redemptionId: existing.id,
         offerId: existing.offerId,
@@ -311,42 +355,40 @@ export class RewardsService {
         wallet: toWalletDto(await this.wallet.readWallet(userId)),
         entitlementExpiresAt:
           existing.entitlementExpiresAt?.toISOString() ?? null,
+        perk: perk ? toPerkDto(perk) : null,
       };
     }
 
+    const now = new Date();
+
     const result = await this.prisma.$transaction(async (tx) => {
-      // Debit first. `appendEntry` takes the `User` lock as its first
-      // statement (canonical lock order) and refuses an overdrawing debit
-      // with `INSUFFICIENT_REWARD_POINTS`, so an unaffordable redemption
-      // fails before any entitlement work happens.
+      // Debit first, whatever the offer buys. `appendEntry` takes the `User`
+      // lock as its first statement (canonical lock order) and refuses an
+      // overdrawing debit with `INSUFFICIENT_REWARD_POINTS`, so an
+      // unaffordable redemption fails before anything is issued.
       const append = await this.wallet.appendEntry(tx, {
         userId,
         deltaPoints: -offer.costPoints,
-        reason: REWARD_REASONS.VIP_REDEMPTION,
+        reason: reasonForOffer(offer),
         sourceType: REWARD_SOURCE_TYPES.REDEMPTION,
         sourceId: offer.id,
-        idempotencyKey: `${REWARD_REASONS.VIP_REDEMPTION}:${idempotencyKey}`,
-        metadata: { offerId: offer.id, grantsDays: offer.grantsDays },
+        idempotencyKey: `${reasonForOffer(offer)}:${idempotencyKey}`,
+        metadata: {
+          offerId: offer.id,
+          kind: offer.kind,
+          grantsDays: offer.grantsDays,
+          ...(offer.perk ? { perkType: offer.perk.type } : {}),
+        },
       });
 
-      const grant = await this.entitlements.grantTimedPremium(
-        tx,
-        userId,
-        offer.grantsDays,
-        REWARD_ENTITLEMENT_SOURCE,
-      );
-
-      if (!grant) {
-        // `grantTimedPremium` returns null only when the `User` row vanished
-        // — impossible here, because `appendEntry` already locked it in this
-        // same transaction and would have thrown `USER_NOT_FOUND` first.
-        // Throwing rolls the debit back rather than charging for nothing.
-        throw new AppException(
-          AppErrorCode.USER_NOT_FOUND,
-          'User not found',
-          HttpStatus.NOT_FOUND,
-        );
-      }
+      // ONE BRANCH PER OFFER KIND, both inside this transaction. Whatever the
+      // debit bought is created here or the debit does not commit — the user
+      // is never charged for something they did not receive, and never
+      // receives something nobody paid for.
+      const granted =
+        offer.kind === 'AD_PERK'
+          ? await this.issueAdPerk(tx, userId, offer, now)
+          : await this.grantPremiumDays(tx, userId, offer);
 
       const redemption = await tx.rewardRedemption.create({
         data: {
@@ -358,16 +400,17 @@ export class RewardsService {
           status: 'FULFILLED',
           idempotencyKey,
           ledgerEntryId: append.entry.id,
-          entitlementId: grant.id,
-          entitlementExpiresAt: grant.expiresAt,
+          entitlementId: granted.entitlementId,
+          entitlementExpiresAt: granted.entitlementExpiresAt,
+          perkId: granted.perk?.id ?? null,
         },
       });
 
-      return { append, redemption, grant };
+      return { append, redemption, granted };
     });
 
     this.logger.log(
-      `Reward redemption ${result.redemption.id} spent ${offer.costPoints} points for ${offer.grantsDays}d premium`,
+      `Reward redemption ${result.redemption.id} spent ${offer.costPoints} points on ${offer.id}`,
     );
 
     return {
@@ -378,8 +421,69 @@ export class RewardsService {
       status: 'FULFILLED',
       replayed: false,
       wallet: toWalletDto(fromWalletRow(result.append.wallet)),
-      entitlementExpiresAt: result.grant.expiresAt.toISOString(),
+      entitlementExpiresAt:
+        result.granted.entitlementExpiresAt?.toISOString() ?? null,
+      perk: result.granted.perk ? toPerkDto(result.granted.perk) : null,
     };
+  }
+
+  /**
+   * The `PREMIUM_DAYS` half of a redemption — unchanged from the foundation
+   * slice, extracted so the two offer kinds read as two branches rather than
+   * one method with a conditional tail.
+   */
+  private async grantPremiumDays(
+    tx: Prisma.TransactionClient,
+    userId: string,
+    offer: RewardRedemptionOffer,
+  ): Promise<GrantedBenefit> {
+    const grant = await this.entitlements.grantTimedPremium(
+      tx,
+      userId,
+      offer.grantsDays,
+      REWARD_ENTITLEMENT_SOURCE,
+    );
+
+    if (!grant) {
+      // `grantTimedPremium` returns null only when the `User` row vanished
+      // — impossible here, because `appendEntry` already locked it in this
+      // same transaction and would have thrown `USER_NOT_FOUND` first.
+      // Throwing rolls the debit back rather than charging for nothing.
+      throw new AppException(
+        AppErrorCode.USER_NOT_FOUND,
+        'User not found',
+        HttpStatus.NOT_FOUND,
+      );
+    }
+
+    return {
+      entitlementId: grant.id,
+      entitlementExpiresAt: grant.expiresAt,
+      perk: null,
+    };
+  }
+
+  /** The `AD_PERK` half of a redemption. */
+  private async issueAdPerk(
+    tx: Prisma.TransactionClient,
+    userId: string,
+    offer: RewardRedemptionOffer,
+    now: Date,
+  ): Promise<GrantedBenefit> {
+    if (!offer.perk) {
+      // A catalog bug, not a caller error: an `AD_PERK` offer with no perk
+      // spec would debit points and issue nothing. Throwing rolls the debit
+      // back, so the worst outcome of the mistake is a failed request.
+      throw new AppException(
+        AppErrorCode.REWARD_OFFER_UNAVAILABLE,
+        'This redemption is misconfigured',
+        HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+
+    const perk = await this.perks.issuePerk(tx, userId, offer.perk, now);
+
+    return { entitlementId: null, entitlementExpiresAt: null, perk };
   }
 
   /**
@@ -482,13 +586,23 @@ export class RewardsService {
     };
   }
 
+  /**
+   * The tiles that still have NO server-verifiable completion signal, served
+   * with `isClaimSupported: false` and a machine-readable reason.
+   *
+   * The social entries used to live here and no longer do — work unit
+   * "REWARDS V1 EARN AND SPEND" made them real, claimable missions built
+   * from configuration (`RewardsMissionsService`). What is left is what
+   * genuinely cannot be paid today: a rewarded ad with no server-side
+   * verification callback anywhere in this backend, and a campaign type with
+   * no defined completion signal at all.
+   */
   private buildTasks(): RewardTaskDto[] {
     return REWARD_TASK_DEFINITIONS.map((task) => ({
       id: task.id,
       type: task.type,
       rewardPoints: task.rewardPoints,
       status: task.status,
-      ...(task.socialPlatform ? { socialPlatform: task.socialPlatform } : {}),
       isClaimSupported: task.isClaimSupported,
       unsupportedReason: task.unsupportedReason,
     }));
@@ -498,24 +612,82 @@ export class RewardsService {
    * Availability is computed SERVER-SIDE against the authoritative balance,
    * so a client cannot enable a redeem button by lying about what it can
    * afford — and even if it tried, `redeem` re-checks under a row lock.
+   *
+   * TWO WAYS TO BE `COMING_SOON`, and the client is told which. An offer can
+   * be parked in the catalog (`isEnabled: false`), or it can be inapplicable
+   * to this deployment — a VIP offer under `CONTENT_ACCESS_MODE=free` sells
+   * access to content that is already free. Both are "a real tile you cannot
+   * buy right now"; `unavailableReason` is what lets the client word them
+   * differently instead of showing the same shrug for both.
    */
   private buildRedemptions(balancePoints: number): RewardRedemptionOfferDto[] {
-    return REWARD_REDEMPTION_OFFERS.map((offer) => ({
-      id: offer.id,
-      costPoints: offer.costPoints,
-      grantsDays: offer.grantsDays,
-      availability: !offer.isEnabled
-        ? ('COMING_SOON' as const)
-        : balancePoints >= offer.costPoints
-          ? ('AVAILABLE' as const)
-          : ('INSUFFICIENT_POINTS' as const),
-      isRedeemSupported: offer.isEnabled,
-    }));
+    const accessMode = readContentAccessMode(this.configService);
+
+    return REWARD_REDEMPTION_OFFERS.map((offer) => {
+      const isApplicable = isOfferApplicable(offer, accessMode);
+      const isPurchasable = offer.isEnabled && isApplicable;
+
+      return {
+        id: offer.id,
+        costPoints: offer.costPoints,
+        grantsDays: offer.grantsDays,
+        kind: offer.kind,
+        ...(offer.perk
+          ? {
+              perk: {
+                type: offer.perk.type,
+                uses: offer.perk.uses,
+                durationMinutes: offer.perk.durationMinutes,
+              },
+            }
+          : {}),
+        availability: !isPurchasable
+          ? ('COMING_SOON' as const)
+          : balancePoints >= offer.costPoints
+            ? ('AVAILABLE' as const)
+            : ('INSUFFICIENT_POINTS' as const),
+        isRedeemSupported: isPurchasable,
+        ...(isPurchasable
+          ? {}
+          : {
+              unavailableReason: isApplicable
+                ? ('NOT_YET_LAUNCHED' as const)
+                : ('NOT_APPLICABLE_IN_FREE_MODE' as const),
+            }),
+      };
+    });
   }
 
   private timezone(): string {
     return this.configService.get('rewards', { infer: true })!.timezone;
   }
+}
+
+/**
+ * What a redemption handed over. Exactly one of `entitlementId` / `perk` is
+ * non-null on a fulfilled redemption — expressed as a return type rather than
+ * a CHECK constraint because a FAILED receipt legitimately has neither.
+ */
+interface GrantedBenefit {
+  readonly entitlementId: string | null;
+  readonly entitlementExpiresAt: Date | null;
+  readonly perk: RewardPerk | null;
+}
+
+/**
+ * The ledger reason a redemption's debit carries.
+ *
+ * Two reasons rather than one, because the two offer kinds buy genuinely
+ * different things and a statement that called an ad skip "VIP" would make
+ * the one earn/spend report anyone actually reads unreadable. It also keeps
+ * the idempotency-key NAMESPACE per kind, so a key reused across kinds still
+ * collides on the redemption table's own
+ * `@@unique([userId, idempotencyKey])` and is refused as key reuse.
+ */
+function reasonForOffer(offer: RewardRedemptionOffer) {
+  return offer.kind === 'AD_PERK'
+    ? REWARD_REASONS.AD_PERK_REDEMPTION
+    : REWARD_REASONS.VIP_REDEMPTION;
 }
 
 function resolveDayState(

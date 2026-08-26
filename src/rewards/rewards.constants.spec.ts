@@ -4,10 +4,14 @@ import {
   CHECK_IN_REWARD_CURVE,
   DEV_GRANT_MAX_POINTS,
   findRedemptionOffer,
+  findWatchMissionDefinition,
+  isOfferApplicable,
   LEDGER_PAGE_SIZE_DEFAULT,
   LEDGER_PAGE_SIZE_MAX,
+  REWARD_PERK_TYPES,
   REWARD_REDEMPTION_OFFERS,
   REWARD_TASK_DEFINITIONS,
+  WATCH_MISSION_DEFINITIONS,
 } from './rewards.constants';
 
 /**
@@ -52,12 +56,58 @@ describe('rewards.constants', () => {
   });
 
   describe('redemption catalog', () => {
-    it('CRITICAL: every offer costs a positive integer and grants positive days', () => {
+    it('CRITICAL: every offer costs a positive integer and never grants negative days', () => {
       for (const offer of REWARD_REDEMPTION_OFFERS) {
         expect(Number.isInteger(offer.costPoints)).toBe(true);
         expect(offer.costPoints).toBeGreaterThan(0);
         expect(Number.isInteger(offer.grantsDays)).toBe(true);
-        expect(offer.grantsDays).toBeGreaterThan(0);
+        // Work unit "REWARDS V1 EARN AND SPEND" relaxed this from `> 0`:
+        // an AD_PERK offer buys an ad perk and no premium at all, and
+        // records 0 days. The invariant that still matters — and that the
+        // migration's CHECK now enforces — is that a receipt never claims a
+        // NEGATIVE benefit.
+        expect(offer.grantsDays).toBeGreaterThanOrEqual(0);
+      }
+    });
+
+    it('CRITICAL: every offer actually hands something over', () => {
+      // The failure this guards against is an offer that debits points and
+      // issues nothing — a catalog typo that would be a silent theft.
+      for (const offer of REWARD_REDEMPTION_OFFERS) {
+        if (offer.kind === 'AD_PERK') {
+          expect(offer.perk).toBeDefined();
+          expect(offer.perk!.durationMinutes).toBeGreaterThan(0);
+          expect(offer.grantsDays).toBe(0);
+        } else {
+          expect(offer.perk).toBeUndefined();
+          expect(offer.grantsDays).toBeGreaterThan(0);
+        }
+      }
+    });
+
+    it('CRITICAL: V1 has at least one purchasable ad perk, so coins have a use', () => {
+      // V1 ships free content + ads + rewards and NO paywall. If this list is
+      // ever empty, coins buy nothing that a free-mode deployment can deliver.
+      const adPerks = REWARD_REDEMPTION_OFFERS.filter(
+        (offer) => offer.kind === 'AD_PERK' && offer.isEnabled,
+      );
+
+      expect(adPerks.length).toBeGreaterThan(0);
+      expect(adPerks.map((offer) => offer.perk!.type)).toContain(
+        REWARD_PERK_TYPES.SKIP_NEXT_INTERSTITIAL,
+      );
+    });
+
+    it('CRITICAL: withholds premium offers where every episode is already free', () => {
+      for (const offer of REWARD_REDEMPTION_OFFERS) {
+        // Selling "unlock every premium episode" in a deployment with no
+        // locked episodes is selling nothing.
+        expect(isOfferApplicable(offer, 'free')).toBe(
+          offer.kind !== 'PREMIUM_DAYS',
+        );
+        // Ad perks are applicable in every mode; premium offers return under
+        // the entitlement policy.
+        expect(isOfferApplicable(offer, 'entitlement')).toBe(true);
       }
     });
 
@@ -90,11 +140,60 @@ describe('rewards.constants', () => {
       expect(new Set(ids).size).toBe(ids.length);
     });
 
-    it('every social task names its platform', () => {
+    it('CRITICAL: no longer carries the social tiles, which are now real missions', () => {
+      // Work unit "REWARDS V1 EARN AND SPEND" moved social follows out of
+      // this "cannot be paid" list and into a configured, claimable catalog
+      // (`SOCIAL_MISSION_DEFINITIONS`). A social id reappearing here would
+      // mean a user seeing the same tile twice — once payable, once not.
       for (const task of REWARD_TASK_DEFINITIONS) {
-        if (task.type === 'SOCIAL_FOLLOW') {
-          expect(task.socialPlatform).toBeDefined();
-        }
+        expect(task.id.startsWith('task_social_')).toBe(false);
+      }
+    });
+
+    it('CRITICAL: a rewarded ad stays unclaimable while no server callback exists', () => {
+      // The single honest statement about ads in this backend: the whole ads
+      // surface is `GET /config/ads`, a read-only frequency config with no
+      // callback endpoint, no shared secret and no transaction id. Until one
+      // exists, crediting "the ad finished" is crediting an untrusted device.
+      const rewardedAd = REWARD_TASK_DEFINITIONS.find(
+        (task) => task.type === 'REWARDED_AD',
+      );
+
+      expect(rewardedAd).toBeDefined();
+      expect(rewardedAd!.isClaimSupported).toBe(false);
+      expect(rewardedAd!.unsupportedReason).toBe('NO_VERIFIABLE_SIGNAL');
+    });
+  });
+
+  describe('watch missions', () => {
+    it('CRITICAL: every milestone has a positive integer goal and reward', () => {
+      for (const mission of WATCH_MISSION_DEFINITIONS) {
+        expect(Number.isInteger(mission.requiredEpisodes)).toBe(true);
+        expect(mission.requiredEpisodes).toBeGreaterThan(0);
+        expect(mission.rewardPoints).toBeGreaterThan(0);
+      }
+    });
+
+    it('mission ids are unique and resolvable', () => {
+      const ids = WATCH_MISSION_DEFINITIONS.map((mission) => mission.id);
+      expect(new Set(ids).size).toBe(ids.length);
+
+      for (const mission of WATCH_MISSION_DEFINITIONS) {
+        expect(findWatchMissionDefinition(mission.id)).toBe(mission);
+      }
+
+      expect(findWatchMissionDefinition('task_watch_nothing')).toBeUndefined();
+    });
+
+    it('pays more for the harder milestone, so the ladder is worth climbing', () => {
+      const sorted = [...WATCH_MISSION_DEFINITIONS].sort(
+        (a, b) => a.requiredEpisodes - b.requiredEpisodes,
+      );
+
+      for (let index = 1; index < sorted.length; index += 1) {
+        expect(sorted[index].rewardPoints).toBeGreaterThan(
+          sorted[index - 1].rewardPoints,
+        );
       }
     });
   });

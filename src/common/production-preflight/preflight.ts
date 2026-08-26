@@ -34,6 +34,10 @@
 // the one the process actually enforces, which is the failure mode a
 // preflight exists to prevent.
 import { validateEnv } from '../../config/env.validation';
+import {
+  rejectSocialUrl,
+  SOCIAL_MISSION_DEFINITIONS,
+} from '../../rewards/social-missions.constants';
 
 export type PreflightSeverity = 'PASS' | 'WARNING' | 'BLOCKER';
 
@@ -76,10 +80,19 @@ const RESERVED_DOMAINS = ['example.com', 'example.net', 'example.org'] as const;
 const PLACEHOLDER_LABELS = [
   'changeme',
   'change-me',
+  'change_me',
   'your-domain',
   'yourdomain',
   'placeholder',
   'todo',
+  // Work unit "REWARDS V1 EARN AND SPEND": the shapes a social-profile
+  // template leaves behind (`https://www.instagram.com/your-handle`). Safe to
+  // add to the shared list rather than a social-only one — no real DNS label
+  // is `your-handle`, so the hostname rules above are unaffected.
+  'your-handle',
+  'yourhandle',
+  'your-account',
+  'youraccount',
 ] as const;
 
 export function isPlaceholderHostname(hostname: string): boolean {
@@ -178,6 +191,7 @@ export function runProductionPreflight(env: EnvRecord): PreflightReport {
   checkProxyTopology(env, add);
   checkSecretStrength(env, add);
   checkForbiddenVariables(env, add);
+  checkRewardsPosture(env, add);
   checkFeaturePosture(env, add);
 
   const blockers = findings.filter((f) => f.severity === 'BLOCKER').length;
@@ -378,6 +392,116 @@ function checkForbiddenVariables(env: EnvRecord, add: AddFinding): void {
       `${key} is set. In production ${why}.`,
     );
   }
+}
+
+/**
+ * Work unit "REWARDS V1 EARN AND SPEND": whether the rewards economy this
+ * release ships is the one the operator thinks it is.
+ *
+ * THE PLACEHOLDER CHECK IS THE BLOCKER, and it is here rather than in
+ * `env.validation.ts` for the same reason the `PUBLIC_BASE_URL` placeholder
+ * rule is: `https://www.instagram.com/your-handle` passes every shape rule
+ * there is. It is a valid https URL on the right host with a non-empty
+ * profile path. It is also a template someone forgot to fill in, and
+ * shipping it sends every user who taps the tile to a profile Red Panda does
+ * not own — while still paying them the points.
+ *
+ * Everything else here is posture: a deployment may legitimately run no
+ * social missions at all, or run rewards with the flag off. Those are stated,
+ * not blocked.
+ */
+function checkRewardsPosture(env: EnvRecord, add: AddFinding): void {
+  if (env.REWARDS_ENABLED !== 'true') {
+    add(
+      'WARNING',
+      'rewards',
+      'REWARDS_ENABLED is not "true" — every /rewards/* route answers 503 ' +
+        'REWARDS_DISABLED, no watch credit is recorded, and the app ships ' +
+        'with no earn or spend loop at all. V1 is specified as free content ' +
+        '+ ads + rewards, so confirm this is deliberate.',
+    );
+    return;
+  }
+
+  const configured: string[] = [];
+
+  for (const mission of SOCIAL_MISSION_DEFINITIONS) {
+    const raw = env[mission.envKey];
+
+    if (!raw || raw.trim().length === 0) {
+      continue;
+    }
+
+    // A malformed value is already a BLOCKER via the boot contract; this
+    // check is only interested in values that BOOT and are still wrong.
+    if (rejectSocialUrl(raw, mission) !== null) {
+      continue;
+    }
+
+    configured.push(mission.platform);
+
+    const placeholder = firstPlaceholderSegment(raw);
+
+    if (placeholder !== null) {
+      add(
+        'BLOCKER',
+        `${mission.envKey} placeholder`,
+        `${mission.envKey}=${raw} still contains the template segment ` +
+          `"${placeholder}". It is a valid https URL on the right platform, ` +
+          'so nothing else rejects it — and it sends every user who taps the ' +
+          'tile to an account Red Panda does not own, while paying them for ' +
+          'the visit.',
+      );
+    }
+  }
+
+  if (configured.length === 0) {
+    add(
+      'WARNING',
+      'social missions',
+      'REWARDS_ENABLED=true but no REWARDS_SOCIAL_*_URL is configured, so no ' +
+        'social follow mission is served. The daily check-in and the watch ' +
+        'milestones still work. Set the Instagram, TikTok and YouTube URLs ' +
+        'to ship the full V1 earn loop.',
+    );
+    return;
+  }
+
+  add(
+    'PASS',
+    'social missions',
+    `${configured.length} social mission(s) configured (${configured.join(', ')}). ` +
+      'These are USER-CONFIRMED external actions — no platform verifies a ' +
+      'follow, and the backend does not claim one.',
+  );
+}
+
+/**
+ * The first path segment of `raw` that looks like a template placeholder, or
+ * `null`.
+ *
+ * Reuses `PLACEHOLDER_LABELS`, matched on WHOLE SEGMENTS only — `@todolist`
+ * is a plausible account name, `@todo` is what a half-filled template leaves
+ * behind. A leading `@` is stripped first because that is how three of the
+ * four platforms write a handle.
+ */
+function firstPlaceholderSegment(raw: string): string | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return null;
+  }
+
+  for (const segment of parsed.pathname.split('/')) {
+    const label = segment.replace(/^@/, '').toLowerCase();
+
+    if ((PLACEHOLDER_LABELS as readonly string[]).includes(label)) {
+      return segment;
+    }
+  }
+
+  return null;
 }
 
 /**

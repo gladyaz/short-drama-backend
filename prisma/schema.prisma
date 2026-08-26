@@ -130,10 +130,18 @@ model User {
   /// ORDER block in `auth.service.ts`), and every rewards transaction locks
   /// the same `User` row first too, so the two can never interleave into a
   /// cycle.
+  ///
+  /// Work unit "REWARDS V1 EARN AND SPEND" adds three more to the same
+  /// cascade group, for the same reason: a social-mission claim record, a
+  /// per-reward-day watch credit, and an ad perk are all internal loyalty
+  /// state with no external counterparty.
   rewardWallet        RewardWallet?
   rewardLedgerEntries RewardLedgerEntry[]
   rewardCheckIn       RewardCheckIn?
   rewardRedemptions   RewardRedemption[]
+  rewardMissionClaims RewardMissionClaim[]
+  rewardWatchCredits  RewardWatchCredit[]
+  rewardPerks         RewardPerk[]
 }
 
 // Phase 12, work unit 12A-B1: persistent (PostgreSQL, survives restart)
@@ -1231,6 +1239,17 @@ model RewardRedemption {
   ledgerEntryId        String?   @unique
   entitlementId        String?   @unique
   entitlementExpiresAt DateTime?
+  /// Work unit "REWARDS V1 EARN AND SPEND": the ad perk this redemption
+  /// issued, for an `AD_PERK` offer. `@unique` for the same reason
+  /// `entitlementId` is — one redemption funds at most one perk, so a
+  /// double-issue is refused by the database and not merely by a code path.
+  ///
+  /// EXACTLY ONE of `entitlementId` / `perkId` is set on a fulfilled
+  /// redemption, decided by the offer's `kind`. That is not expressed as a
+  /// CHECK constraint because a `FAILED` receipt legitimately has neither,
+  /// and a constraint that has to enumerate statuses to stay true is a
+  /// constraint that will be wrong the first time a status is added.
+  perkId               String?   @unique
   failureReason        String?
   createdAt            DateTime  @default(now())
   updatedAt            DateTime  @updatedAt
@@ -1238,4 +1257,146 @@ model RewardRedemption {
   @@unique([userId, idempotencyKey])
   @@index([userId, createdAt])
   @@index([status])
+}
+
+// ===========================================================================
+// REWARDS V1 — work unit "REWARDS V1 EARN AND SPEND"
+// ===========================================================================
+//
+// Three tables that close the V1 loop the foundation slice deliberately left
+// open: ACTIVITY -> EARN -> SPEND -> a real perk.
+//
+// They add NO new balance writer. Every point movement below still goes
+// through `RewardsWalletService.appendEntry`, so the "balance is a projection
+// of the ledger" invariant is untouched — these tables record what a movement
+// was ABOUT, never how much it was worth.
+
+/// One row per (user, mission) the user has interacted with. Covers BOTH V1
+/// mission families, because their state machine is identical up to which
+/// column decides "done":
+///
+///  - SOCIAL missions (`task_social_instagram` and friends) are ONE-TIME
+///    FOREVER. `openedAt` records that this server handed the user the
+///    destination URL; `claimedAt` records that they came back and confirmed.
+///  - WATCH missions (`task_watch_3_episodes`) RESET EVERY REWARD DAY, so
+///    `periodKey` is part of the unique key and a new day gets a new row.
+///
+/// `periodKey` is `'*'` for a one-time mission rather than nullable. A NULL
+/// in a composite unique index does not collide with another NULL in
+/// Postgres, so a nullable column here would silently permit two "one-time"
+/// claim rows for the same mission — the exact thing the index exists to
+/// prevent. A sentinel is uglier to read and correct to rely on.
+///
+/// THE LEDGER, NOT THIS TABLE, IS WHAT STOPS A DOUBLE PAYMENT. `claimedAt`
+/// is derived state written in the same transaction as the credit;
+/// the anti-double-pay control is the server-derived ledger
+/// `idempotencyKey` (`EXTERNAL_SOCIAL_ACTION:<missionId>` /
+/// `WATCH_MILESTONE:<missionId>:<periodKey>`) plus its unique index. This
+/// row exists so the snapshot can render "claimed" without scanning the
+/// ledger, and so `openedAt` has somewhere to live.
+///
+/// `openCount` is an observability counter, not a control. A user who taps
+/// "Open Instagram" nine times has done nothing wrong; a MISSION with
+/// thousands of opens and no claims is worth an operator's attention.
+model RewardMissionClaim {
+  id             String    @id @default(cuid())
+  userId         String
+  user           User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  missionId      String
+  missionType    String
+  /// `'*'` for one-time missions; the `YYYY-MM-DD` service-timezone reward
+  /// day for missions that reset daily. See the note above on why this is
+  /// not nullable.
+  periodKey      String
+  /// Snapshotted at OPEN time, so a later configuration change never
+  /// rewrites where a user was actually sent.
+  destinationUrl String?
+  openedAt       DateTime?
+  openCount      Int       @default(0)
+  claimedAt      DateTime?
+  awardedPoints  Int?
+  ledgerEntryId  String?   @unique
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@unique([userId, missionId, periodKey])
+  @@index([userId, claimedAt])
+  @@index([missionId])
+}
+
+/// SERVER-OBSERVED evidence that this backend authorised playback of one
+/// episode for one user on one reward day. Written by `RewardsWatchService`
+/// from inside `VideosController`'s playback path — never from a request
+/// body, and never from a client-reported position or duration.
+///
+/// WHAT THIS ROW DOES AND DOES NOT PROVE, stated plainly because a watch
+/// mission is only as honest as this sentence: it proves the SERVER decided
+/// this account was allowed to play this episode and handed it a playback
+/// URL. It does not prove the bytes were fetched, that anything was rendered,
+/// or for how long. Duration cannot be proven from a client-reported
+/// position (`WatchProgress.positionSeconds` is a resume marker a device
+/// writes), which is why the V1 watch mission counts EPISODES STARTED and is
+/// named for that rather than for watch time.
+///
+/// `@@unique([userId, periodKey, videoId])` is the whole anti-farming
+/// control: replaying `GET /videos/:id/playback` for the same episode all day
+/// produces exactly one credit, so progress can only advance by reaching for
+/// a DIFFERENT episode.
+model RewardWatchCredit {
+  id            String   @id @default(cuid())
+  userId        String
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// `YYYY-MM-DD` in the service timezone — the same reward day the
+  /// check-in uses, so "today" means one thing across the whole domain.
+  periodKey     String
+  videoId       String
+  seriesId      String?
+  episodeNumber Int?
+  /// How the credit was observed. `PLAYBACK_GRANT` is the only producer
+  /// today; the column exists so a future, stronger signal is
+  /// distinguishable in the data rather than silently merged into this one.
+  source        String
+  createdAt     DateTime @default(now())
+
+  @@unique([userId, periodKey, videoId])
+  @@index([userId, periodKey])
+}
+
+/// What points BUY in V1: an ad-related perk, issued by the same transaction
+/// that debits the points that paid for it.
+///
+/// TWO PERK SHAPES, one table:
+///  - `SKIP_NEXT_INTERSTITIAL` — `remainingUses = 1`. Spent by an explicit
+///    consume call, so the client cannot "use" it by simply not showing an
+///    ad; the server records that it was spent.
+///  - `TEMPORARY_AD_PASS` — `remainingUses = null`, `expiresAt` in the
+///    future. Spent by the clock alone, so there is nothing to consume.
+///
+/// BOTH carry `expiresAt`. An unconsumed skip that sat in an account for six
+/// months would be an unbounded liability against an ad configuration that
+/// has since changed; a stated shelf life is honest and finite.
+///
+/// `status` is DERIVED-BUT-STORED (`ACTIVE` / `CONSUMED` / `EXPIRED`).
+/// Expiry is evaluated against the clock on every read rather than by a
+/// sweeper job, so a perk is never treated as live merely because no job has
+/// run yet; the stored value is what a consume call flips, and what an
+/// operator reads.
+model RewardPerk {
+  id            String    @id @default(cuid())
+  userId        String
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  perkType      String
+  status        String
+  /// `1` for a single-use perk, `null` for a duration-based one. Never `0`:
+  /// a spent perk is `status = 'CONSUMED'` with `remainingUses = 0`, which
+  /// the read path treats as inactive regardless of the status column.
+  remainingUses Int?
+  grantedAt     DateTime  @default(now())
+  expiresAt     DateTime
+  consumedAt    DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([userId, status])
+  @@index([expiresAt])
 }

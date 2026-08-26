@@ -155,6 +155,20 @@ filter, so 4 published fixtures reached ordinary viewers as episodes.
 | WhatsApp | **NOT IMPLEMENTED.** Only the `fake` driver exists; boot refuses it outside dev/test, so it cannot be enabled in production at all. |
 | Payments | **OUT OF V1.** `PAYMENTS_ENABLED=false`; `/payments/*` answers 503. |
 | Ads (AdMob) | External. Owner supplies the AdMob app id and unit ids to the mobile app; the backend only serves pacing config via `GET /config/ads`. |
+| Rewards | **READY IN CODE, NEEDS CONFIG.** Set `REWARDS_ENABLED=true` plus the three `REWARDS_SOCIAL_*_URL` values. Earn: daily check-in, social follow missions (Instagram/TikTok/YouTube), watch milestones. Spend: ad-skip and temporary ad-pass perks. See `docs/rewards-api-contract.md`. |
+
+**V1 monetisation is free content + ads + rewards.** There is no paywall, no
+subscription and no coin purchase. Coins are earned only through the three
+paths above and spent only on ad perks; the VIP redemptions in the catalog are
+withheld entirely while `CONTENT_ACCESS_MODE=free`, because unlocking content
+that is already free would charge points and change nothing.
+
+**Social missions are user-confirmed, not verified.** No platform exposes a
+"did user X follow page Y" check for an arbitrary user, so the server records
+that it handed out the link and that the user came back and confirmed —
+nothing more. The ledger reason is `EXTERNAL_SOCIAL_ACTION` and the API sends
+`verification: "USER_CONFIRMED"`. This is stated here because it is a product
+decision the owner is making, not an implementation detail.
 
 ## 9. Health and preflight
 
@@ -170,8 +184,11 @@ API_BASE_URL=https://<origin> npm run smoke:production   # after deploy
 ```
 
 The preflight reports `PASS`/`WARNING`/`BLOCKER`, exits non-zero on blockers,
-prints no secret, and reports the integrated postures — `CONTENT_ACCESS_MODE`
-and whether the HLS pipeline is on.
+prints no secret, and reports the integrated postures — `CONTENT_ACCESS_MODE`,
+whether the HLS pipeline is on, and the rewards posture. It **BLOCKS** a
+release whose social mission URL still carries a template segment such as
+`your-handle`, and **WARNS** when rewards are off or when no social mission is
+configured.
 
 ## 10. Remaining before release
 
@@ -181,6 +198,9 @@ Code is not the blocker. What remains is owner/external:
 2. Three independently generated auth secrets.
 3. Google OAuth client + Play App Signing SHA-1.
 4. AdMob ids; privacy-policy and account-deletion URLs.
+4b. The three official Red Panda social profile URLs (Instagram, TikTok,
+   YouTube), for `REWARDS_SOCIAL_*_URL`. Until they are set, those missions
+   are simply not served.
 5. Decide `CONTENT_ACCESS_MODE`, then migrate the content that decision makes
    user-visible.
 6. **Physical Android device HLS QA** — paused while the device is

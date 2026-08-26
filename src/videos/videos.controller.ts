@@ -26,7 +26,9 @@ import type { ContentAccessMode, RootConfig } from '../config/configuration';
 import { readContentAccessMode } from '../config/content-access-mode.util';
 import { FREE_EPISODE_LIMIT } from '../entitlements/entitlement.constants';
 import { EntitlementsService } from '../entitlements/entitlements.service';
+import { RewardsWatchService } from '../rewards/rewards-watch.service';
 import { VideosService } from './videos.service';
+import type { StreamGuardInfo } from './videos.service';
 import type {
   HlsPlaybackResponseDto,
   VideoPlaybackResponseDto,
@@ -50,6 +52,7 @@ export class VideosController {
   constructor(
     private readonly videosService: VideosService,
     private readonly entitlementsService: EntitlementsService,
+    private readonly rewardsWatchService: RewardsWatchService,
     configService: ConfigService<RootConfig>,
   ) {
     this.contentAccessMode = readContentAccessMode(configService);
@@ -198,8 +201,32 @@ export class VideosController {
     @Param('id') id: string,
     @OptionalCurrentUser() user: AuthenticatedUser | undefined,
   ): Promise<VideoPlaybackResponseDto | HlsPlaybackResponseDto> {
-    await this.enforceEntitlementGate(id, user);
-    return this.videosService.getPlaybackUrl(id);
+    const guardInfo = await this.enforceEntitlementGate(id, user);
+    const playback = await this.videosService.getPlaybackUrl(id);
+
+    // Work unit "REWARDS V1 EARN AND SPEND": the ONE watch signal this
+    // backend can vouch for — it just authorised this account to play this
+    // episode and is handing over a URL to do it with.
+    //
+    // AFTER the gate and AFTER the URL is resolved, so a refused or
+    // unresolvable request credits nothing. AWAITED rather than
+    // fire-and-forget, so the write cannot outlive the request and land
+    // after the test (or the process) has moved on — it is one indexed
+    // insert, and `recordEpisodeStart` never throws (see its class doc), so
+    // awaiting it cannot fail or meaningfully delay playback.
+    //
+    // GUESTS ARE SKIPPED, not counted anonymously: a watch credit belongs to
+    // a wallet, and a signed-out viewer has none.
+    if (user) {
+      await this.rewardsWatchService.recordEpisodeStart({
+        userId: user.id,
+        videoId: id,
+        seriesId: guardInfo.seriesId,
+        episodeNumber: guardInfo.episodeNumber,
+      });
+    }
+
+    return playback;
   }
 
   @Get(':id')
@@ -243,7 +270,7 @@ export class VideosController {
   private async enforceEntitlementGate(
     id: string,
     user: AuthenticatedUser | undefined,
-  ): Promise<void> {
+  ): Promise<StreamGuardInfo> {
     const guardInfo = await this.videosService.getStreamGuardInfo(id);
 
     // The authoritative effective tier — an admin `accessTierOverride` when
@@ -262,7 +289,7 @@ export class VideosController {
       // FREE. Allowed for EVERY caller — guest or signed-in, entitled or
       // not. This single line is the whole product change: a guest is no
       // longer refused before the tier is even looked at.
-      return;
+      return guardInfo;
     }
 
     // PREMIUM from here down. A guest cannot hold an entitlement, so the
@@ -273,7 +300,7 @@ export class VideosController {
     // use this response to learn whether their token was recognized, and
     // the client needs no new error contract to handle guests.
     if (user && (await this.entitlementsService.isEntitled(user.id))) {
-      return;
+      return guardInfo;
     }
 
     throw new AppException(

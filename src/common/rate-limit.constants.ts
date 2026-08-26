@@ -377,3 +377,42 @@ export const REWARD_CHECK_IN_RATE_TTL_MS = minutes(1);
  */
 export const REWARD_REDEEM_RATE_LIMIT = 10;
 export const REWARD_REDEEM_RATE_TTL_MS = minutes(1);
+
+/**
+ * Work unit "REWARDS V1 EARN AND SPEND". `POST /rewards/missions/:id/open`
+ * and `POST /rewards/missions/:id/claim`: 20 per minute, sitting between
+ * check-in's 30 and redemption's 10 for the reason the whole block gives —
+ * lock pressure, not fraud.
+ *
+ * A claim opens the same kind of per-account write transaction a check-in
+ * does. An OPEN does not (it is a single upsert with no `FOR UPDATE`), but
+ * it shares the ceiling anyway: they are two halves of one user gesture, and
+ * two different limits on "tap the tile" and "confirm the tile" would
+ * produce a UI that fails halfway through for reasons no one can explain.
+ *
+ * 20/min is far above the real pattern — there are four social missions and
+ * two watch milestones in the whole catalog, and each pays at most once per
+ * account (or per reward day). Beyond that ceiling a caller is looping, and
+ * every one of those loops is already a no-op against the ledger key.
+ */
+export const REWARD_MISSION_RATE_LIMIT = 20;
+export const REWARD_MISSION_RATE_TTL_MS = minutes(1);
+
+/**
+ * Work unit "REWARDS V1 EARN AND SPEND". `POST /rewards/perks/:id/consume`:
+ * 60 per minute — the LOOSEST override in this domain, deliberately.
+ *
+ * This one sits on the AD PATH. It is called when an interstitial would have
+ * been shown, which is a normal, repeated part of a viewing session rather
+ * than a once-a-day gesture, and a user who bought ad skips is a user who
+ * paid to be interrupted less — throttling them into seeing the ad anyway
+ * would be the worst possible failure of this feature. It is also the
+ * cheapest write in the module: one conditional `UPDATE`, no transaction, no
+ * row lock (see `RewardsPerksService`).
+ *
+ * `GET /rewards/perks` gets NO override at all and keeps the app-wide
+ * default. It is a read the ad gate may consult before every ad break, and a
+ * dedicated limit on it would be a limit on showing the right number of ads.
+ */
+export const REWARD_PERK_CONSUME_RATE_LIMIT = 60;
+export const REWARD_PERK_CONSUME_RATE_TTL_MS = minutes(1);

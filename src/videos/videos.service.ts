@@ -169,13 +169,17 @@ export class VideosService {
    * `findPublishedRow` helper), so an unpublished/nonexistent id behaves
    * identically at this stage of the stream pipeline too.
    */
-  async getStreamGuardInfo(
-    id: string,
-  ): Promise<{ episodeNumber: number; accessTierOverride: string | null }> {
+  async getStreamGuardInfo(id: string): Promise<StreamGuardInfo> {
     const record = await this.findPublishedRow(id);
     return {
       episodeNumber: record.episodeNumber,
       accessTierOverride: record.accessTierOverride,
+      // Work unit "REWARDS V1 EARN AND SPEND": carried so the caller can
+      // record WHICH series a watch credit belongs to without a second
+      // lookup. The row is already loaded; the entitlement decision below
+      // still reads only `episodeNumber` and `accessTierOverride`, so no
+      // access rule gains a new input from this field.
+      seriesId: record.seriesId,
     };
   }
 
@@ -414,4 +418,14 @@ export class VideosService {
       this.contentAccessMode,
     );
   }
+}
+
+/**
+ * What `getStreamGuardInfo` hands the controller: everything needed to decide
+ * access, plus the identifiers a reward watch credit records.
+ */
+export interface StreamGuardInfo {
+  readonly episodeNumber: number;
+  readonly accessTierOverride: string | null;
+  readonly seriesId: string;
 }

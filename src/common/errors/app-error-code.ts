@@ -671,4 +671,76 @@ export enum AppErrorCode {
    *   There the same condition is an ordinary bad request.
    */
   REWARD_LEDGER_INVALID_DELTA = 'REWARD_LEDGER_INVALID_DELTA',
+  // Work unit "REWARDS V1 EARN AND SPEND"
+  /**
+   * Returned (404) when the mission id in the path is not in the catalog at
+   * all. Deliberately DISTINCT from `REWARD_MISSION_UNAVAILABLE`: an id this
+   * backend has never heard of is a client bug or an injection attempt,
+   * while a configured-but-inactive mission is a real tile in a deployment
+   * that has not switched it on.
+   *
+   * This is the code that answers ARBITRARY MISSION-ID INJECTION. Every
+   * reward value is resolved from the catalog by id; an id that resolves to
+   * nothing pays nothing, and there is no branch anywhere that treats an
+   * unknown id as a zero-value success.
+   */
+  REWARD_MISSION_NOT_FOUND = 'REWARD_MISSION_NOT_FOUND',
+  /**
+   * Returned (409) for a real mission this deployment cannot run — a social
+   * mission whose destination URL is not configured. The tile is never
+   * served in that state, so reaching this means a client is working from a
+   * stale snapshot; telling it the mission exists but is off is what lets it
+   * refresh rather than treat its own catalog as wrong.
+   */
+  REWARD_MISSION_UNAVAILABLE = 'REWARD_MISSION_UNAVAILABLE',
+  /**
+   * Returned (409) by `POST /rewards/missions/:id/open` for a mission that
+   * has nothing to open — a watch milestone, whose progress comes from
+   * playing episodes rather than from following a link.
+   */
+  REWARD_MISSION_NOT_OPENABLE = 'REWARD_MISSION_NOT_OPENABLE',
+  /**
+   * Returned (409) when a social mission is claimed without ever having been
+   * opened. The server hands out the destination URL and records that it did;
+   * a claim with no such record is a confirmation of something this backend
+   * never invited the user to do.
+   */
+  REWARD_MISSION_NOT_STARTED = 'REWARD_MISSION_NOT_STARTED',
+  /**
+   * Returned (409) when a social mission is claimed sooner after opening
+   * than `SOCIAL_MISSION_MIN_DWELL_SECONDS`.
+   *
+   * Honest about what it is: a shape check on the product flow, not an
+   * anti-fraud control — a script can wait. The control that actually bounds
+   * the cost is the once-per-account ledger key.
+   */
+  REWARD_MISSION_TOO_SOON = 'REWARD_MISSION_TOO_SOON',
+  /**
+   * Returned (409) when a counted mission is claimed before its target is
+   * met — fewer distinct episodes started today than the milestone requires.
+   * The count is server-side, so a client cannot argue with it.
+   */
+  REWARD_MISSION_NOT_COMPLETE = 'REWARD_MISSION_NOT_COMPLETE',
+  /**
+   * Returned (404) for a perk id that does not exist OR belongs to another
+   * account. Deliberately the same answer for both: the lookup is always
+   * scoped to the caller's own `userId`, so this can never be used to probe
+   * whether someone else holds a perk.
+   */
+  REWARD_PERK_NOT_FOUND = 'REWARD_PERK_NOT_FOUND',
+  /**
+   * Returned (409) when a client tries to consume a time-based perk. A
+   * `TEMPORARY_AD_PASS` is spent by the clock; "consuming" one could only
+   * destroy time the user paid for, so this is refused loudly rather than
+   * accepted quietly — a client doing it has a bug, and a 200 would hide it
+   * until someone noticed their two ad-free hours ending early.
+   */
+  REWARD_PERK_NOT_CONSUMABLE = 'REWARD_PERK_NOT_CONSUMABLE',
+  /**
+   * Returned (409) when the perk exists but its shelf life has run out.
+   * Distinct from an already-consumed perk (which answers 200 with
+   * `alreadyConsumed: true`), because "you used it" and "you did not use it
+   * in time" are different things to tell a user who paid points.
+   */
+  REWARD_PERK_EXPIRED = 'REWARD_PERK_EXPIRED',
 }

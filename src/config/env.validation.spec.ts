@@ -1324,3 +1324,95 @@ describe('validateEnv — CONTENT_ACCESS_MODE (V1 FREE ACCESS POLICY)', () => {
     expect(message).not.toContain('super-secret-value-that-must-not-leak');
   });
 });
+
+/**
+ * Work unit "REWARDS V1 EARN AND SPEND": the four `REWARDS_SOCIAL_*_URL`
+ * variables.
+ *
+ * The rule these assertions pin: an UNSET variable is a legitimate posture
+ * ("we do not run that mission"), while a SET-but-unusable one fails the
+ * boot. The silent outcome of the second — the tile quietly missing from
+ * every client — is exactly what goes unnoticed until someone asks why the
+ * Instagram mission never appeared.
+ */
+describe('validateEnv — REWARDS_SOCIAL_*_URL', () => {
+  it('boots with no social mission configured at all', () => {
+    expect(() => validateEnv({ ...VALID_CONFIG })).not.toThrow();
+  });
+
+  it('boots with real profile URLs for all three V1 platforms', () => {
+    expect(() =>
+      validateEnv({
+        ...VALID_CONFIG,
+        REWARDS_SOCIAL_INSTAGRAM_URL: 'https://www.instagram.com/redpanda',
+        REWARDS_SOCIAL_TIKTOK_URL: 'https://www.tiktok.com/@redpanda',
+        REWARDS_SOCIAL_YOUTUBE_URL: 'https://www.youtube.com/@redpanda',
+      }),
+    ).not.toThrow();
+  });
+
+  it('treats a blank value as unset rather than as an error', () => {
+    expect(() =>
+      validateEnv({ ...VALID_CONFIG, REWARDS_SOCIAL_TIKTOK_URL: '   ' }),
+    ).not.toThrow();
+  });
+
+  it('CRITICAL: refuses a host that is not the platform own', () => {
+    // The security case: this URL is served to every client and opened in an
+    // external browser under Red Panda branding.
+    expect(() =>
+      validateEnv({
+        ...VALID_CONFIG,
+        REWARDS_SOCIAL_INSTAGRAM_URL: 'https://instagram.evil.example/redpanda',
+      }),
+    ).toThrow(/REWARDS_SOCIAL_INSTAGRAM_URL/);
+  });
+
+  it('CRITICAL: refuses cleartext http', () => {
+    expect(() =>
+      validateEnv({
+        ...VALID_CONFIG,
+        REWARDS_SOCIAL_YOUTUBE_URL: 'http://www.youtube.com/@redpanda',
+      }),
+    ).toThrow(/must use https/);
+  });
+
+  it('refuses a localhost URL', () => {
+    expect(() =>
+      validateEnv({
+        ...VALID_CONFIG,
+        REWARDS_SOCIAL_TIKTOK_URL: 'https://localhost:3000/@redpanda',
+      }),
+    ).toThrow(/REWARDS_SOCIAL_TIKTOK_URL/);
+  });
+
+  it('refuses the platform home page — a right host is not a profile', () => {
+    expect(() =>
+      validateEnv({
+        ...VALID_CONFIG,
+        REWARDS_SOCIAL_INSTAGRAM_URL: 'https://www.instagram.com/',
+      }),
+    ).toThrow(/must point at a profile/);
+  });
+
+  it('refuses a value that is not a URL at all', () => {
+    expect(() =>
+      validateEnv({
+        ...VALID_CONFIG,
+        REWARDS_SOCIAL_FACEBOOK_URL: 'redpanda',
+      }),
+    ).toThrow(/must be an absolute URL/);
+  });
+
+  it('validates even while REWARDS_ENABLED is off', () => {
+    // A typo introduced with the feature dark must be found when it is typed,
+    // not weeks later when someone flips the flag.
+    expect(() =>
+      validateEnv({
+        ...VALID_CONFIG,
+        REWARDS_ENABLED: 'false',
+        REWARDS_SOCIAL_INSTAGRAM_URL: 'https://www.tiktok.com/@redpanda',
+      }),
+    ).toThrow(/REWARDS_SOCIAL_INSTAGRAM_URL/);
+  });
+});

@@ -54,6 +54,12 @@ const VALID_PRODUCTION_ENV: EnvRecord = {
   REWARDS_SOCIAL_INSTAGRAM_URL: 'https://www.instagram.com/redpanda',
   REWARDS_SOCIAL_TIKTOK_URL: 'https://www.tiktok.com/@redpanda',
   REWARDS_SOCIAL_YOUTUBE_URL: 'https://www.youtube.com/@redpanda',
+  // FREE CATALOG — required, for the same reason the two flags above are:
+  // V1 ships no purchase flow, so per-row entitlement enforcement would make
+  // every "premium" row permanently unplayable. Leaving this out of the
+  // fixture would make every `ok === true` assertion below certify a release
+  // whose catalog is half-locked.
+  CONTENT_ACCESS_MODE: 'free',
 };
 
 function severityOf(env: EnvRecord, check: string): string[] {
@@ -493,28 +499,49 @@ describe('runProductionPreflight', () => {
     /**
      * V1 INTEGRATION. The free-catalog policy changes nothing an operator
      * can observe from configuration — no URL moves, every route still
-     * answers 200 — while deciding whether 25 premium episodes are payable
-     * content. It must be stated, and it must never block: it is a
-     * deliberate product posture, not a misconfiguration.
+     * answers 200 — while deciding whether the premium half of the catalog
+     * is reachable at all.
+     *
+     * THE POLARITY IS THE POINT, and it is the opposite of what this file
+     * asserted before. V1 ships no purchase flow, so `entitlement` mode
+     * leaves every `accessTierOverride: "premium"` row listed and
+     * permanently unplayable — a release-breaking posture that used to be
+     * reported as a clean PASS.
      */
-    it('WARNS but does not block on CONTENT_ACCESS_MODE=free', () => {
+    it('passes CONTENT_ACCESS_MODE=free, the V1 posture', () => {
       const env = { ...VALID_PRODUCTION_ENV, CONTENT_ACCESS_MODE: 'free' };
 
-      expect(severityOf(env, 'content access mode')).toEqual(['WARNING']);
+      expect(severityOf(env, 'content access mode')).toEqual(['PASS']);
       expect(runProductionPreflight(env).ok).toBe(true);
     });
 
     it.each(['entitlement', undefined])(
-      'passes CONTENT_ACCESS_MODE=%p, where per-row tiers are enforced',
+      'BLOCKS CONTENT_ACCESS_MODE=%p, which V1 has no way to unlock',
       (mode) => {
-        expect(
-          severityOf(
-            { ...VALID_PRODUCTION_ENV, CONTENT_ACCESS_MODE: mode },
-            'content access mode',
-          ),
-        ).toEqual(['PASS']);
+        const env = { ...VALID_PRODUCTION_ENV, CONTENT_ACCESS_MODE: mode };
+
+        expect(severityOf(env, 'content access mode')).toEqual(['BLOCKER']);
+        expect(runProductionPreflight(env).ok).toBe(false);
       },
     );
+
+    /**
+     * The blocker must name the variable and the way out, so an operator
+     * reading only this line knows what to change — matching the WhatsApp
+     * and Rewards blockers, which both end with the same escape hatch.
+     */
+    it('names CONTENT_ACCESS_MODE=free as the fix, without echoing a secret', () => {
+      const detail = runProductionPreflight({
+        ...VALID_PRODUCTION_ENV,
+        CONTENT_ACCESS_MODE: 'entitlement',
+      }).findings.find(
+        (finding) => finding.check === 'content access mode',
+      )?.detail;
+
+      expect(detail).toContain('CONTENT_ACCESS_MODE=free');
+      expect(detail).toContain('ship a release that is not V1');
+      expect(detail).not.toContain('spec-fixture-token');
+    });
 
     /**
      * HLS OFF IS A VALID V1 POSTURE and must not be flagged as a problem —

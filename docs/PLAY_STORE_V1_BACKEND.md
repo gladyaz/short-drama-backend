@@ -21,6 +21,11 @@ are dormant architecture, not shipped product.
 the release owner fills in.
 
 Companion documents:
+- `docs/V1_STAGING_RUNBOOK.md` — **the procedure for the first staging
+  deployment**: the authoritative environment inventory, the local/staging/
+  production configuration matrix, the database migration procedure with its
+  stop conditions, the smoke matrix, and what is code-valid versus what is
+  still unverified against a real external service.
 - `docs/PRODUCTION_HTTPS.md` — topology, HTTPS rules, CORS, auth transport, preflight.
 - `docs/PRODUCTION_DEPLOYMENT_REQUIREMENTS.md` — runtime, database, resources.
 - `docs/R2_MEDIA_MIGRATION.md` — moving catalog media into object storage.
@@ -268,7 +273,9 @@ still the release. The integration settles it, so these are now **BLOCKERS**:
 | Any of Instagram / TikTok / YouTube URL missing | **BLOCKER**, naming which |
 | A social URL still carrying `your-handle` | **BLOCKER** |
 | `REWARDS_SOCIAL_FACEBOOK_URL` missing | not required, not counted |
-| `CONTENT_ACCESS_MODE=free`, HLS off, Google off | `WARNING` — deliberate postures |
+| `CONTENT_ACCESS_MODE` not `free` (including unset) | **BLOCKER** — V1 ships no purchase flow, so per-row enforcement leaves every `premium` row listed and permanently unplayable |
+| `CONTENT_ACCESS_MODE=free` | `PASS` — the V1 posture |
+| HLS off, Google off | `PASS` / `WARNING` — deliberate postures, neither blocks |
 
 **These are RELEASE rules, not BOOT rules.** `validateEnv` still starts a
 process with both features switched off, and development and test still run

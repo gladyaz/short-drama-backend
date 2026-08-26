@@ -586,25 +586,60 @@ function checkFeaturePosture(env: EnvRecord, add: AddFinding): void {
   }
 
   // V1 INTEGRATION: the free-catalog policy is invisible in every other
-  // signal — the API answers 200 either way and no URL changes — but it
-  // decides whether 25 premium episodes are payable content or not. An
-  // operator must see which posture they are shipping, stated, rather than
-  // infer it from a viewer's experience after release.
+  // signal — the API answers 200 either way, no URL changes, and no route
+  // 503s — while deciding whether the premium half of the catalog is
+  // reachable at all.
+  //
+  // THE POLARITY WAS BACKWARDS AND IS NOW CORRECTED. Until this change a
+  // release with `CONTENT_ACCESS_MODE=free` WARNED ("confirm this is
+  // intended") and one with `entitlement` — including the unset default, and
+  // including the value the shipped `.env.production.example` carried —
+  // PASSED. That grades the V1 posture as the questionable one and the
+  // release-breaking posture as clean, which is precisely backwards for this
+  // product:
+  //
+  //   V1 SHIPS NO PURCHASE FLOW OF ANY KIND. `PAYMENTS_ENABLED=false`, every
+  //   /payments/* route answers 503, and the reward catalog's VIP offers are
+  //   suppressed in free mode. So in `entitlement` mode an episode whose
+  //   `accessTierOverride` is "premium" is not "behind a paywall" — it is
+  //   permanently unreachable by any action available to any user, and the
+  //   catalog currently carries such rows. The app would ship with content a
+  //   viewer can see listed and can never play, and every other signal in
+  //   this report would be green.
+  //
+  // This is the same standing the WhatsApp and Rewards checks already claim,
+  // and for the same stated reason: the V1 integration decides what V1 is —
+  // free content + ads + rewards + Google + WhatsApp — and a preflight that
+  // answered "no blockers" for a build whose catalog is half-locked would be
+  // certifying a V1 that is not V1. A deployment that genuinely wants per-row
+  // enforcement is a deployment that is not this release.
+  //
+  // NOTHING WAS WEAKENED to get here: a posture that used to warn now
+  // passes, and a posture that used to pass now blocks. The mode itself is
+  // still purely a runtime policy — no database value is written by either
+  // setting, and switching back is a variable change with no migration.
   if (env.CONTENT_ACCESS_MODE === 'free') {
-    add(
-      'WARNING',
-      'content access mode',
-      'CONTENT_ACCESS_MODE=free — EVERY episode resolves free, including rows ' +
-        'whose accessTierOverride is "premium". No database value is changed ' +
-        'and the entitlement branch stays live, so this is reversible by ' +
-        'unsetting the variable. Confirm this is the intended V1 posture.',
-    );
-  } else {
     add(
       'PASS',
       'content access mode',
+      'CONTENT_ACCESS_MODE=free — every published episode resolves free, ' +
+        'including rows whose accessTierOverride is "premium". No database ' +
+        'value is changed and the entitlement branch stays live, so this is ' +
+        'reversible by changing the variable alone. This is the V1 posture.',
+    );
+  } else {
+    add(
+      'BLOCKER',
+      'content access mode',
       `CONTENT_ACCESS_MODE=${env.CONTENT_ACCESS_MODE ?? '(unset -> entitlement)'} — ` +
-        'per-row access tiers are enforced.',
+        'per-row access tiers would be ENFORCED, so every episode whose ' +
+        'accessTierOverride is "premium" requires an entitlement to play. ' +
+        'Red Panda V1 ships no purchase flow (PAYMENTS_ENABLED=false, every ' +
+        '/payments/* route answers 503) and its reward catalog suppresses the ' +
+        'VIP offers in free mode, so nothing in the shipped app can ever grant ' +
+        'one: those episodes would be listed and permanently unplayable, with ' +
+        'no error anywhere for anyone to notice. Set CONTENT_ACCESS_MODE=free, ' +
+        'or ship a release that is not V1.',
     );
   }
 

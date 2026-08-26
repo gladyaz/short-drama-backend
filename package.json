@@ -31,6 +31,7 @@
     "hls:local-proof": "ts-node --compiler-options '{\"module\":\"CommonJS\"}' scripts/hls-local-proof.ts",
     "hls:real-media-proof": "ts-node --compiler-options '{\"module\":\"CommonJS\"}' scripts/hls-real-media-proof.ts",
     "hls:wave-enqueue": "ts-node --compiler-options '{\"module\":\"CommonJS\"}' scripts/hls-wave-enqueue.ts",
+    "hls:demote": "ts-node --compiler-options '{\"module\":\"CommonJS\"}' scripts/hls-demote.ts",
     "test:redis-contract": "RUN_REDIS_QUEUE_CONTRACT=1 jest src/transcode/bullmq-jobid-redis-contract.spec.ts",
     "start:migrate:prod": "prisma migrate deploy && node dist/main"
   },

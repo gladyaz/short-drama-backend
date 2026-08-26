@@ -70,9 +70,10 @@ export interface HlsRenditionSummary {
 /**
  * Slice 11P: the closed set of machine-stable codes
  * `Video.processingErrorCode` may hold, written exclusively by
- * `TranscodeJobProcessor` (a job-level failure) or `TranscodeJanitorService`
- * (`STALE`, a stalled-run detection). Never a raw exception message/stack —
- * see that column's schema doc comment.
+ * `TranscodeJobProcessor` (a job-level failure), `TranscodeJanitorService`
+ * (`STALE`, a stalled-run detection), or `HlsDemoteService` (`DEMOTED`, the
+ * one operator-initiated member of this set). Never a raw exception
+ * message/stack — see that column's schema doc comment.
  */
 export type TranscodeErrorCode =
   | 'SOURCE_MISSING'
@@ -84,6 +85,14 @@ export type TranscodeErrorCode =
   | 'POSTER_GENERATION_FAILED'
   | 'MAX_ATTEMPTS_EXCEEDED'
   | 'STALE'
+  /**
+   * Work unit "HLS DEMOTE": an operator ran `npm run hls:demote -- --apply`
+   * against a generation that HAD promoted successfully but was later judged
+   * bad. Unlike every other member of this set, it records a deliberate human
+   * decision rather than a pipeline failure — the generation's objects are
+   * intact and were not deleted. See `HlsDemoteService`.
+   */
+  | 'DEMOTED'
   | 'UNKNOWN_ERROR';
 
 /**

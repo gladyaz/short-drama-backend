@@ -98,7 +98,9 @@ Google asserted `email_verified`.
 | POST | `/auth/change-password` | Bearer | `200` | |
 | POST | `/auth/password-reset/request` | — | `202` | Always `202`. |
 | POST | `/auth/password-reset/confirm` | — | `200` | |
-| POST | `/users/me/deletion` | Bearer | `200` | |
+| POST | `/users/me/deletion` | Bearer | `200` | Password body unchanged; now also accepts a Google or WhatsApp proof — see §3.6. |
+| GET | `/users/me/deletion/methods` | Bearer | `200` | Which deletion proofs this account can use (§3.6). |
+| POST | `/users/me/deletion/whatsapp/otp` | Bearer | `202` | Deletion code to the caller's own linked number (§3.6). |
 | GET | `/users/me/export` | Bearer | `200` | Now also lists linked identities. |
 
 **LOGIN NEVER REGISTERS.** An unknown email and a wrong password both return
@@ -276,6 +278,62 @@ reports email: null — never a synthetic address"), which asserts the field on
 the verify response, on `GET /auth/me`, and on the stored row.
 
 ---
+
+### 3.6 Account deletion (V1 provider account deletion)
+
+Full detail, including the deletion transaction and cascade, lives in
+[`docs/ACCOUNT_DELETION.md`](./ACCOUNT_DELETION.md). The contract, in short:
+
+| Method | Path | Auth | Success |
+|---|---|---|---|
+| GET | `/users/me/deletion/methods` | Bearer | `200` |
+| POST | `/users/me/deletion/whatsapp/otp` | Bearer | `202` |
+| POST | `/users/me/deletion` | Bearer | `200` |
+
+**Deletion proof is appropriate to the identity.** A password account
+re-enters its password; a Google account presents a fresh Google ID token
+bound to its own `sub`; a WhatsApp account consumes a single-use code
+delivered to its own linked number. Any ONE method an account owns suffices.
+`confirmDeletion: true` is required in addition, for every method, and is
+never a credential.
+
+```json
+GET /users/me/deletion/methods
+{ "methods": ["password", "google", "whatsapp"] }
+```
+
+Method names only — no identifier of any kind. Clients that display one read
+the masked value from `GET /auth/identities` (§3.4).
+
+```jsonc
+// POST /users/me/deletion
+{ "currentPassword": "…", "confirmDeletion": true }                       // legacy, still valid
+{ "method": "password", "currentPassword": "…", "confirmDeletion": true } // identical
+{ "method": "google",   "idToken": "…",          "confirmDeletion": true }
+{ "method": "whatsapp", "code": "123456",        "confirmDeletion": true }
+```
+
+`method` is optional and defaults to `"password"`, so **every existing client
+keeps working unchanged**.
+
+`POST /users/me/deletion/whatsapp/otp` takes an EMPTY body. There is no
+`phone` field: the number comes from the caller's own linked identity, which
+is what binds the challenge to this account and keeps the route from becoming
+a way to message arbitrary numbers. Its response mirrors
+`POST /auth/whatsapp/otp/request` (`expiresInSeconds`,
+`resendAvailableInSeconds`, and `devCode` under the same dev-only gate).
+
+**A deletion code can never sign anyone in.** Deletion challenges live in a
+separate `purpose` namespace that `POST /auth/whatsapp/otp/verify` does not
+read.
+
+New error codes: `ACCOUNT_DELETION_METHOD_UNAVAILABLE` (`409` — this account
+cannot produce the named proof; the message points at
+`GET /users/me/deletion/methods`) and `ACCOUNT_DELETION_PROOF_MISMATCH`
+(`401` — the credential verified but belongs to a different identity).
+
+**Mobile:** choose the confirmation UI from `GET /users/me/deletion/methods`,
+never by inferring it from whether `user.email` is null.
 
 ## 4. Error codes
 
@@ -559,10 +617,15 @@ Stated plainly so nothing here is mistaken for more than it is:
 - **No real Google credential has been exercised.** Verification is proven
   against generated RSA keys and controlled fixtures, not against a live
   Google token.
-- **A social-only account cannot self-delete** (`POST /users/me/deletion`
-  requires re-proving a password it does not have) and **cannot set a first
-  password** (password reset is deliberately refused for it). Both are
-  credential-adding/irreversible flows that need their own review.
+- ~~**A social-only account cannot self-delete**~~ — **FIXED** by the V1
+  provider account-deletion work unit. A Google-only or WhatsApp-only account
+  now proves deletion with the credential it actually has: a freshly verified
+  Google ID token bound to its own `sub`, or a single-use OTP delivered to its
+  own linked number. See §3.6 and `docs/ACCOUNT_DELETION.md`. The password
+  path is unchanged and the pre-existing request body still works verbatim.
+- **A social-only account still cannot set a first password** (password reset
+  is deliberately refused for it). That remains a credential-ADDING flow
+  needing its own review, and it is unrelated to deletion.
 - **Registration still does not verify email ownership**, and this backend
   ships no email delivery at all. Consequence, found by the Phase 10B
   identity security review and accepted rather than silently carried: someone
@@ -849,12 +912,10 @@ this list is mechanical.
   Password reset deliberately refuses these accounts (§8) rather than
   silently minting a first credential. Mobile must not present password
   reset as a route into a passwordless account.
-- **Self-delete for a passwordless account.** `POST /users/me/deletion`
-  requires the current password and therefore fails closed with
-  `INVALID_CREDENTIALS` for an account that has none (§8). The Data &
-  Privacy screen should not offer deletion as if it will work for such an
-  account; the honest resolution needs a verified-provider
-  reauthentication flow, which does not exist.
+- ~~**Self-delete for a passwordless account.**~~ **NOW AVAILABLE** — see
+  §3.6. The Data & Privacy screen SHOULD offer deletion to every account, and
+  should choose its confirmation UI from `GET /users/me/deletion/methods`
+  rather than from whether `user.email` is null.
 - **WhatsApp login in production.** The API contract is complete and tested,
   but no vendor delivery adapter exists and the process refuses to boot with
   WhatsApp enabled outside development/test (§7, §8). Ship the UI behind the

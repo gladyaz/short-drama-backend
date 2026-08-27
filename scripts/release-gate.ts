@@ -65,6 +65,7 @@ import {
   GateStepResult,
   summarise,
 } from '../src/common/release-gate/release-gate.types';
+import { checkV1AccountDeletionCoverage } from '../src/common/release-gate/v1-account-deletion-coverage';
 import {
   isReleaseGateMode,
   RELEASE_GATE_MODES,
@@ -694,6 +695,12 @@ function main(): void {
   record(
     inlineStep('contract', 'V1 feature contract', () =>
       checkV1FeatureContract(resolution.env, resolution.policyEnforcement),
+    ),
+  );
+
+  record(
+    inlineStep('deletion-coverage', 'V1 account-deletion coverage', () =>
+      checkV1AccountDeletionCoverage(resolution.env),
     ),
   );
 

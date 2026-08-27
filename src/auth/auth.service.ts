@@ -9,6 +9,8 @@ import { AppErrorCode } from '../common/errors/app-error-code';
 import { AppException } from '../common/errors/app.exception';
 import { PrismaService } from '../prisma/prisma.service';
 import { AccountLockoutService } from './account-lockout.service';
+import { DeletionAuthorizationService } from './deletion/deletion-authorization.service';
+import { WhatsAppOtpService } from './identity/whatsapp/whatsapp-otp.service';
 import { AuthAuditService } from './auth-audit.service';
 import { hashIp, sanitizeUserAgent } from './auth-crypto';
 import { EMAIL_AUTH_PROVIDER } from './identity/auth-identity.constants';
@@ -348,6 +350,16 @@ export class AuthService {
     private readonly configService: ConfigService<RootConfig>,
     private readonly accountLockoutService: AccountLockoutService,
     private readonly authAuditService: AuthAuditService,
+    // V1 PROVIDER ACCOUNT DELETION. Both are used by `deleteAccount` alone.
+    //
+    // NO DEPENDENCY CYCLE IS CREATED, and it was checked rather than
+    // assumed: `DeletionAuthorizationService` depends on `PrismaService`,
+    // `ConfigService`, `AuthAuditService`, `WhatsAppOtpService` and the
+    // `GOOGLE_IDENTITY_VERIFIER` port — none of which is this class. The
+    // edge that DOES exist runs the other way (`AuthIdentityService` ->
+    // `AuthService`), and is untouched.
+    private readonly deletionAuthorization: DeletionAuthorizationService,
+    private readonly whatsAppOtpService: WhatsAppOtpService,
   ) {}
 
   /**
@@ -2422,9 +2434,32 @@ export class AuthService {
   /**
    * Phase 12, work unit 12C-B1: `POST /users/me/deletion` (DECISIONS.md
    * "Phase 12 ... approved..." entry, decision 1: immediate hard deletion
-   * after an explicit irreversible confirmation plus current-password
-   * re-authentication; revoke every session and delete the `User` row
-   * inside ONE transaction; no grace period; normal-user-only).
+   * after an explicit irreversible confirmation plus re-authentication;
+   * revoke every session and delete the `User` row inside ONE transaction;
+   * no grace period; normal-user-only).
+   *
+   * V1 PROVIDER ACCOUNT DELETION — WHAT CHANGED, AND WHAT DID NOT.
+   *
+   * WHAT CHANGED: decision 1's "re-authentication" is no longer hardcoded to
+   * mean "the current password". It means whichever credential the account
+   * ACTUALLY HAS, verified fresh, and that decision now lives in
+   * `DeletionAuthorizationService` (see its file, and
+   * `deletion-authorization.types.ts`, for the full design). The defect this
+   * repairs was concrete and shipping-blocking: `passwordHash` became
+   * nullable in Phase 10B, and both of V1's REQUIRED sign-in methods
+   * (Google, WhatsApp) create accounts with none — so this method's
+   * `passwordHash === null` refusal meant the two headline ways into the
+   * product were also two ways to own an undeletable account. It answered
+   * `401 INVALID_CREDENTIALS`: telling an owner their password was wrong for
+   * an account that never had one.
+   *
+   * WHAT DID NOT CHANGE: authentication is not weakened anywhere. A valid
+   * access token is still necessary and still not sufficient. A password
+   * account still re-enters its password, verified by the same bcrypt
+   * comparison against the same hash, answered with the same generic
+   * `INVALID_CREDENTIALS`. `confirmDeletion: true` is still required and is
+   * still not a credential. The transaction below, its cascade, its audit
+   * scrub and its idempotency are untouched.
    *
    * `dto.confirmDeletion` is validated by `AccountDeletionDto` (`@IsBoolean()`
    * + `@Equals(true)`) at the global `ValidationPipe` BEFORE this method is
@@ -2433,7 +2468,13 @@ export class AuthService {
    * job starts from "the caller genuinely intends this."
    *
    * ORDER OF CHECKS (deliberate, not incidental):
-   *   1. Does the access token's `userId` still resolve to a real `User`?
+   *   1. Is the caller's DELETION PROOF valid for THIS account?
+   *      `DeletionAuthorizationService.authorize` verifies the password, the
+   *      Google ID token (bound to this account's own `sub`), or the
+   *      single-use OTP (claimed against this account's own linked number),
+   *      and throws otherwise. It runs FIRST, before anything is read or
+   *      written here, for the same reason the password check used to.
+   *   2. Does the access token's `userId` still resolve to a real `User`?
    *      A "no" here is BOTH this endpoint's idempotency story (a second
    *      call after the account was already deleted lands here) AND the
    *      existing, established "authenticated but the user no longer
@@ -2441,28 +2482,24 @@ export class AuthService {
    *      SAME `INVALID_ACCESS_TOKEN`/401 for this exact condition) — reused
    *      verbatim rather than inventing a new "already deleted" response
    *      shape, so a repeated call behaves safely and predictably (a
-   *      clean, documented 401), never an unhandled 500.
-   *   2. Is `dto.currentPassword` correct? Checked BEFORE the role check
-   *      below, deliberately: this is an authenticated endpoint (no
-   *      email-enumeration concern), but `User.role` is never surfaced by
-   *      any other endpoint this app exposes to its own owner (`GET
-   *      /auth/me` returns only `id`/`email`/`displayName` — see
-   *      `AuthUserDto`), so checking role BEFORE password would let a
-   *      caller holding a stolen-but-still-valid access token (without
-   *      knowing the password) learn "this account is privileged" for
-   *      free. Checking password first means that oracle is only
-   *      reachable by someone who ALREADY knows the password — at which
-   *      point they already have full control of the account through
-   *      every other authenticated route anyway, so nothing new leaks. A
-   *      wrong password fails with the SAME generic `INVALID_CREDENTIALS`
-   *      `login`/`changePassword` already use.
+   *      clean, documented 401), never an unhandled 500. (A concurrent
+   *      deletion that lands between step 1 and here is also caught by
+   *      `authorize`'s own account lookup, which raises the identical
+   *      error.)
    *   3. Is `user.role === 'user'`? Any other role is refused with a
    *      DISTINCT, descriptive `403 ACCOUNT_DELETION_FORBIDDEN` (not the
-   *      generic `INVALID_CREDENTIALS`) — safe to be specific here per
-   *      point 2 above (only reachable with the correct password already
-   *      verified), and per decision 1, deleting a privileged account is a
-   *      separate, not-yet-built process this phase deliberately does not
-   *      create.
+   *      generic `INVALID_CREDENTIALS`). Safe to be specific ONLY because
+   *      it sits after step 1: `User.role` is surfaced by no other endpoint
+   *      this app exposes to its own owner (`GET /auth/me` returns only
+   *      `id`/`email`/`displayName` — see `AuthUserDto`), so checking role
+   *      FIRST would let a caller holding a stolen-but-still-valid access
+   *      token learn "this account is privileged" for free. After a proof
+   *      succeeds, that caller already has full control of the account
+   *      through every other authenticated route anyway, so nothing new
+   *      leaks. This ordering property is UNCHANGED by this work unit —
+   *      only the definition of the proof in step 1 broadened. Per decision
+   *      1, deleting a privileged account remains a separate,
+   *      not-yet-built process.
    *
    * SESSION REVOCATION + USER DELETION, ONE TRANSACTION: an explicit
    * `session.updateMany({ revokedAt: ... })` runs first (the frozen
@@ -2499,13 +2536,30 @@ export class AuthService {
    *
    * CASCADES RELIED ON, NOT RE-IMPLEMENTED (verified against
    * `prisma/schema.prisma`/the generated migration SQL): `Session`,
-   * `UserVideoInteraction`, `WatchProgress`, `Entitlement`,
-   * `PasswordResetToken`, and `AccountLockout` are all `onDelete: Cascade`
-   * — every row this account owns in those tables is REMOVED outright by
-   * the single `user.deleteMany` below, with no separate cleanup code
-   * needed (and none written) here; a deleted-then-re-registered email
-   * therefore cannot inherit a stale `AccountLockout` row (it is gone, not
-   * merely orphaned). `AnalyticsEvent.userId` and `AuthAuditEvent.userId`
+   * `AuthIdentity`, `UserVideoInteraction`, `WatchProgress`, `Entitlement`,
+   * `PasswordResetToken`, `AccountLockout` and every `Reward*` table
+   * (`RewardWallet`, `RewardLedgerEntry`, `RewardCheckIn`,
+   * `RewardRedemption`, `RewardMissionClaim`, `RewardWatchCredit`,
+   * `RewardPerk`) are all `onDelete: Cascade` — every row this account owns
+   * in those tables is REMOVED outright by the single `user.deleteMany`
+   * below, with no separate cleanup code needed (and none written) here; a
+   * deleted-then-re-registered email therefore cannot inherit a stale
+   * `AccountLockout` row (it is gone, not merely orphaned).
+   *
+   * `AuthIdentity` IS IN THAT LIST, AND IT MATTERS MORE THAN THE REST (V1
+   * provider account deletion): it is the row that says "this Google `sub`
+   * / this phone number signs into this account". Because it cascades, a
+   * deleted account leaves NO orphan identity behind — presenting the same
+   * Google token or the same number afterwards resolves to nothing and
+   * takes `AuthIdentityService`'s brand-new-account path, creating a fresh,
+   * empty account rather than re-entering the deleted one. There is
+   * therefore no way back into a deleted account through any provider.
+   *
+   * ONE OWNED ARTIFACT IS NOT REACHED BY ANY CASCADE, and is handled
+   * explicitly after the commit: `PhoneOtpChallenge` has no `userId` and no
+   * foreign key at all (deliberately — an OTP is requested for a NUMBER,
+   * before the server may know whether an account exists). See the
+   * `purgeChallengesForPhone` call at the end of this method. `AnalyticsEvent.userId` and `AuthAuditEvent.userId`
    * are `onDelete: SetNull` — those rows SURVIVE. For `AnalyticsEvent` that
    * is the whole story: the model has no `ipHash`/`userAgent` column at
    * all, so `SetNull` alone (plus the existing `EVENT_PROPERTY_ALLOWLIST`
@@ -2596,6 +2650,33 @@ export class AuthService {
     dto: AccountDeletionDto,
     context: AuthRequestContext = {},
   ): Promise<void> {
+    // V1 PROVIDER ACCOUNT DELETION — the proof gate now lives in
+    // `DeletionAuthorizationService` (see that file, and
+    // `deletion-authorization.types.ts`, for the full design). It throws
+    // unless the caller re-proved control of THIS account through whichever
+    // credential the account actually has: its password, a freshly verified
+    // Google ID token bound to its own Google `sub`, or a single-use OTP
+    // claimed against its own linked number. It never returns a falsy value,
+    // so this call cannot be "checked" incorrectly.
+    const authorization = await this.deletionAuthorization.authorize(
+      userId,
+      dto,
+      context,
+    );
+
+    // Belt-and-braces against a future refactor threading the wrong id into
+    // one of the two arguments above. It is unreachable today (the
+    // authorization is built from the very `userId` passed in), and it is
+    // cheap insurance against the one bug class this whole work unit exists
+    // to make impossible: deleting an account the caller did not prove.
+    if (authorization.userId !== userId) {
+      throw new AppException(
+        AppErrorCode.ACCOUNT_DELETION_PROOF_MISMATCH,
+        'Deletion authorization does not belong to this account',
+        HttpStatus.UNAUTHORIZED,
+      );
+    }
+
     const user = await this.prisma.user.findUnique({ where: { id: userId } });
 
     if (!user) {
@@ -2606,51 +2687,20 @@ export class AuthService {
       );
     }
 
-    // PHASE 10B: `passwordHash` is nullable now. Self-service deletion is
-    // gated on re-proving the account's PASSWORD (DECISIONS.md decision 1),
-    // so an account that has never had one cannot satisfy that gate and is
-    // refused — the same generic `INVALID_CREDENTIALS` a wrong password
-    // gets, with its own audited reason.
-    //
-    // STATED PLAINLY BECAUSE IT IS A REAL, KNOWN GAP: a Google-only or
-    // WhatsApp-only account currently has no self-service deletion path.
-    // Weakening the gate — accepting a bare access token as sufficient
-    // proof for an irreversible hard delete — would be a materially
-    // different, unreviewed security decision, and inventing an alternative
-    // proof (re-verify with the provider) is a new flow, not an adjustment
-    // to this one. Failing closed and documenting it is the honest outcome
-    // for this work unit; see the final report's follow-up list.
-    const passwordMatches = await bcrypt.compare(
-      dto.currentPassword,
-      user.passwordHash ?? DUMMY_HASH_FOR_TIMING_PARITY,
-    );
-
-    if (user.passwordHash === null) {
-      await this.authAuditService.emit('account_deletion_failed', {
-        userId,
-        ip: context.ip,
-        userAgent: context.userAgent,
-        metadata: { reason: 'no_password_credential' },
-      });
-      throw invalidCredentials();
-    }
-
-    if (!passwordMatches) {
-      await this.authAuditService.emit('account_deletion_failed', {
-        userId,
-        ip: context.ip,
-        userAgent: context.userAgent,
-        metadata: { reason: 'invalid_current_password' },
-      });
-      throw invalidCredentials();
-    }
-
+    // The role check stays HERE, deliberately AFTER the proof gate above —
+    // preserving this method's original ordering property: `User.role` is
+    // surfaced by no other endpoint an owner can call, so answering the
+    // descriptive `403` before a proof was verified would let a caller
+    // holding a stolen-but-valid access token learn "this account is
+    // privileged" for free. After a successful proof, the caller already
+    // has full control of the account through every other authenticated
+    // route, so nothing new leaks.
     if (user.role !== 'user') {
       await this.authAuditService.emit('account_deletion_failed', {
         userId,
         ip: context.ip,
         userAgent: context.userAgent,
-        metadata: { reason: 'role_not_allowed' },
+        metadata: { reason: 'role_not_allowed', method: authorization.method },
       });
       throw new AppException(
         AppErrorCode.ACCOUNT_DELETION_FORBIDDEN,
@@ -2732,9 +2782,36 @@ export class AuthService {
       await tx.user.deleteMany({ where: { id: userId } });
     });
 
+    // V1 PROVIDER ACCOUNT DELETION — destroy the deleted account's remaining
+    // WhatsApp challenges, AFTER the transaction has committed.
+    //
+    // AFTER, not inside, and that is load-bearing rather than tidy:
+    // `PhoneOtpChallenge` is deliberately kept out of every multi-statement
+    // transaction in this codebase (see the CANONICAL AUTH LOCK ORDER block
+    // above this class — single-statement auto-commit writes cannot supply
+    // an edge to a deadlock cycle), and this call is a single `deleteMany`
+    // that upholds that. It is also best-effort by construction
+    // (`purgeChallengesForPhone` logs and swallows): the account is already
+    // durably gone, and a cleanup failure must not tell the caller their
+    // deletion failed when it did not.
+    //
+    // WHY IT IS NEEDED AT ALL: this table has no `userId` and no foreign key
+    // (an OTP is requested for a NUMBER, before the server may know whether
+    // an account exists), so the delete's cascade — which removes the
+    // account's `AuthIdentity`, `Session`, `PasswordResetToken`,
+    // `Entitlement`, reward and interaction rows outright — reaches nothing
+    // here. Without this line a code delivered moments before the delete
+    // would outlive the account it was issued for.
+    if (authorization.whatsappPhoneE164 !== null) {
+      await this.whatsAppOtpService.purgeChallengesForPhone(
+        authorization.whatsappPhoneE164,
+      );
+    }
+
     await this.authAuditService.emit('account_deletion_success', {
       ip: context.ip,
       userAgent: context.userAgent,
+      metadata: { method: authorization.method },
     });
   }
 

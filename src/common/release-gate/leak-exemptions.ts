@@ -230,6 +230,20 @@ export const RELEASE_GATE_LEAK_EXEMPTIONS: readonly LeakExemption[] = [
       '`validateDevToolsNodeEnv` refuses to boot in production.',
   },
   {
+    path: 'src/auth/deletion/deletion-authorization.service.ts',
+    evidence: 'devCode: issued.devCode',
+    category: 'dev-only-surface',
+    reason:
+      'V1 provider account deletion: the SAME passthrough as ' +
+      'auth-identity.service.ts above, in the second route that issues a ' +
+      'WhatsApp challenge (POST /users/me/deletion/whatsapp/otp). The value ' +
+      'comes from the same `exposeDevCode`, behind the same two gates — ' +
+      'DEV_TOOLS_ENABLED true AND NODE_ENV development/test, a combination ' +
+      '`validateDevToolsNodeEnv` refuses to boot in production — plus the ' +
+      'third gate that only `LocalFakeWhatsAppOtpProvider` can supply a ' +
+      'readable code at all, and it cannot be constructed in production.',
+  },
+  {
     path: 'src/auth/auth.service.ts',
     evidence: 'devToken: rawToken',
     category: 'dev-only-surface',

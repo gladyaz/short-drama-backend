@@ -39,13 +39,23 @@ model User {
   /// caller-supplied password against this column MUST explicitly refuse
   /// when it is `null`, BEFORE deciding the caller is authenticated —
   /// never rely on the comparison itself to fail. `AuthService.login`,
-  /// `.changePassword` and `.deleteAccount` fall back to
+  /// `.changePassword` and
+  /// `DeletionAuthorizationService.authorizeWithPassword` (which took over
+  /// `AuthService.deleteAccount`'s password check in the V1 provider
+  /// account-deletion work unit) fall back to
   /// `DUMMY_HASH_FOR_TIMING_PARITY` purely to keep response latency
   /// constant, and that dummy hash is a FIXED, committed constant: if its
   /// plaintext preimage were ever discovered, an implicit "the compare
   /// returned false" check would let it authenticate as every passwordless
   /// account in the database. Each of those three methods therefore carries
   /// an explicit `passwordHash === null` refusal.
+  ///
+  /// A NULL HASH IS NO LONGER A DEAD END FOR DELETION. It still refuses
+  /// PASSWORD-based deletion (above), but a passwordless account now proves
+  /// deletion with the credential it actually has — a fresh Google ID token
+  /// bound to its own `AuthIdentity.providerSubject`, or a single-use OTP
+  /// delivered to its own linked number. See
+  /// `src/auth/deletion/deletion-authorization.types.ts`.
   passwordHash        String?
   displayName         String?
   createdAt           DateTime               @default(now())
@@ -1047,6 +1057,30 @@ model AuthIdentity {
 model PhoneOtpChallenge {
   id           String    @id @default(cuid())
   phoneE164    String
+  /// V1 PROVIDER ACCOUNT DELETION — WHAT THIS CHALLENGE IS FOR.
+  ///
+  /// One of `OTP_PURPOSES` (`auth-identity.constants.ts`): `login` (the
+  /// original, unauthenticated sign-in/sign-up challenge) or
+  /// `account_deletion` (an AUTHENTICATED user re-proving control of the
+  /// number they already have linked, immediately before an irreversible
+  /// hard delete).
+  ///
+  /// WHY A COLUMN AND NOT A SECOND TABLE. Everything that makes this table
+  /// safe — the keyed code hash, the database-enforced attempt budget, the
+  /// single-use claim CAS, the per-number cooldown and rolling budget, the
+  /// retention prune — is purpose-independent and already reviewed. A second
+  /// challenge table would be a second copy of all of it, kept correct by
+  /// convention; that is exactly the "do not build a second, fake OTP
+  /// system" failure this column exists to avoid.
+  ///
+  /// IT IS LOAD-BEARING, NOT A LABEL. `WhatsAppOtpService.claimChallenge`
+  /// filters by it, so a code minted for deletion can NEVER be presented at
+  /// `POST /auth/whatsapp/otp/verify` to obtain a session (nor the reverse),
+  /// and `hashOtpCode` mixes a per-purpose domain tag into the HMAC so the
+  /// two hash spaces cannot overlap even if a future query forgot the
+  /// filter. Defaults to `login` so every row written before this column
+  /// existed keeps its exact original meaning.
+  purpose      String    @default("login")
   /// PHASE 10B, fix cycle 1 (Reviewer B, finding 1) — the DATABASE-ENFORCED
   /// "at most ONE live challenge per phone number" invariant.
   ///
@@ -1076,6 +1110,28 @@ model PhoneOtpChallenge {
   /// index (`P2002`), atomically, at any isolation level, and is answered
   /// `OTP_RESEND_COOLDOWN`. Exactly one live challenge per number is now a
   /// property of the schema rather than of an interleaving.
+  ///
+  /// V1 PROVIDER ACCOUNT DELETION: the live value is now
+  /// `"<purpose>:<phoneE164>"`, not the bare number, so the slot is per
+  /// (purpose, number) rather than per number.
+  ///
+  /// WHAT THAT PREVENTS, precisely: a SHARED slot makes the two flows
+  /// destroy each other's live codes. `retireSlotIfNoLongerEntitled` frees
+  /// the slot by marking whatever holds it consumed — so a user who has just
+  /// been sent a LOGIN code and then requests a DELETION code would find the
+  /// login code silently dead, and vice versa. Neither flow is a reason to
+  /// cancel the other. Namespacing the slot lets one live challenge exist
+  /// per purpose, which is what each flow actually needs.
+  ///
+  /// MESSAGE VOLUME TO THE NUMBER IS NOT LOOSENED, and that is deliberate:
+  /// `assertRequestAllowed`'s per-number cooldown and rolling budget both
+  /// still count EVERY challenge for the number regardless of purpose, so a
+  /// deletion request made seconds after a login request still waits out the
+  /// same cooldown. Those bounds exist to protect a real handset from being
+  /// bombed, and a message costs its recipient the same whatever it was for.
+  ///
+  /// The migration backfills existing live rows to `"login:" || "liveKey"`
+  /// so no in-flight challenge changes meaning.
   liveKey      String?   @unique
   codeHash     String
   expiresAt    DateTime

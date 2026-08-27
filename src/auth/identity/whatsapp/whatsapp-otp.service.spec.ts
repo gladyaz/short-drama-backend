@@ -94,7 +94,7 @@ class RecordingOtpProvider implements WhatsAppOtpProvider {
  * the type checker and trips this project's `no-unsafe-call` lint rule.
  */
 interface WhatsAppOtpServiceInternals {
-  hashOtpCode(phoneE164: string, code: string): string;
+  hashOtpCode(purpose: string, phoneE164: string, code: string): string;
 }
 
 function internals(service: WhatsAppOtpService): WhatsAppOtpServiceInternals {
@@ -151,7 +151,7 @@ describe('WhatsAppOtpService', () => {
     const row = await prisma.phoneOtpChallenge.create({
       data: {
         phoneE164,
-        liveKey: phoneE164,
+        liveKey: `login:${phoneE164}`,
         codeHash: 'a'.repeat(64),
         expiresAt: new Date(createdAt.getTime() + OTP_TTL_MS),
         createdAt,
@@ -213,7 +213,9 @@ describe('WhatsAppOtpService', () => {
       const phone = fixturePhone();
 
       const outcomes = await Promise.allSettled(
-        Array.from({ length: 8 }, () => service.issueChallenge(phone, {})),
+        Array.from({ length: 8 }, () =>
+          service.issueChallenge(phone, 'login', {}),
+        ),
       );
 
       // Exactly ONE request claims the slot, so exactly ONE message is sent —
@@ -233,19 +235,22 @@ describe('WhatsAppOtpService', () => {
         where: { phoneE164: phone, consumedAt: null },
       });
       expect(live).toHaveLength(1);
-      expect(live[0].liveKey).toBe(phone);
+      // V1 provider account deletion: the live slot is namespaced by
+      // purpose, so a login challenge and a deletion challenge for the same
+      // number cannot starve each other. See `PhoneOtpChallenge.liveKey`.
+      expect(live[0].liveKey).toBe(`login:${phone}`);
 
       // And the delivered code genuinely works: a burst must never leave a
       // number able to receive codes but unable to sign in with any of them.
       await expect(
-        service.claimChallenge(phone, provider.lastCodeFor(phone)),
+        service.claimChallenge(phone, 'login', provider.lastCodeFor(phone)),
       ).resolves.toBeUndefined();
     });
 
     it('releases the live slot the moment a challenge is consumed', async () => {
       const phone = fixturePhone();
-      await service.issueChallenge(phone, {});
-      await service.claimChallenge(phone, provider.lastCodeFor(phone));
+      await service.issueChallenge(phone, 'login', {});
+      await service.claimChallenge(phone, 'login', provider.lastCodeFor(phone));
 
       const consumed = await prisma.phoneOtpChallenge.findFirstOrThrow({
         where: { phoneE164: phone },
@@ -259,9 +264,9 @@ describe('WhatsAppOtpService', () => {
       // is about how often a message may be sent to this number, not about
       // whether the last one was used. A signed-in user asking for another
       // code one second later still waits.
-      await expect(service.issueChallenge(phone, {})).rejects.toBeInstanceOf(
-        OtpRequestThrottled,
-      );
+      await expect(
+        service.issueChallenge(phone, 'login', {}),
+      ).rejects.toBeInstanceOf(OtpRequestThrottled);
     });
 
     it('releases the live slot held by an EXPIRED challenge rather than blocking the number forever', async () => {
@@ -269,7 +274,7 @@ describe('WhatsAppOtpService', () => {
       // did not retire it first, every future request for that number would
       // lose the unique index and be reported as a cooldown — permanently.
       const phone = fixturePhone();
-      await service.issueChallenge(phone, {});
+      await service.issueChallenge(phone, 'login', {});
       await prisma.phoneOtpChallenge.updateMany({
         where: { phoneE164: phone },
         data: {
@@ -278,9 +283,11 @@ describe('WhatsAppOtpService', () => {
         },
       });
 
-      await expect(service.issueChallenge(phone, {})).resolves.toBeDefined();
       await expect(
-        service.claimChallenge(phone, provider.lastCodeFor(phone)),
+        service.issueChallenge(phone, 'login', {}),
+      ).resolves.toBeDefined();
+      await expect(
+        service.claimChallenge(phone, 'login', provider.lastCodeFor(phone)),
       ).resolves.toBeUndefined();
     });
   });
@@ -288,11 +295,11 @@ describe('WhatsAppOtpService', () => {
   describe('admission control', () => {
     it('refuses a resend inside the cooldown window and leaves no extra row', async () => {
       const phone = fixturePhone();
-      await service.issueChallenge(phone, {});
+      await service.issueChallenge(phone, 'login', {});
 
-      await expect(service.issueChallenge(phone, {})).rejects.toBeInstanceOf(
-        OtpRequestThrottled,
-      );
+      await expect(
+        service.issueChallenge(phone, 'login', {}),
+      ).rejects.toBeInstanceOf(OtpRequestThrottled);
       expect(
         await prisma.phoneOtpChallenge.count({ where: { phoneE164: phone } }),
       ).toBe(1);
@@ -300,7 +307,7 @@ describe('WhatsAppOtpService', () => {
 
     it('allows a resend once the cooldown has elapsed, and retires the previous code', async () => {
       const phone = fixturePhone();
-      await service.issueChallenge(phone, {});
+      await service.issueChallenge(phone, 'login', {});
       const firstCode = provider.lastCodeFor(phone);
 
       await prisma.phoneOtpChallenge.updateMany({
@@ -308,7 +315,7 @@ describe('WhatsAppOtpService', () => {
         data: { createdAt: new Date(Date.now() - 10 * 60 * 1000) },
       });
 
-      await service.issueChallenge(phone, {});
+      await service.issueChallenge(phone, 'login', {});
 
       // The retired code no longer works. The internal reason is
       // `otp_wrong_code` rather than `otp_not_found` because the OLD
@@ -317,10 +324,10 @@ describe('WhatsAppOtpService', () => {
       // what happened. Either way the caller sees the same generic
       // `INVALID_OTP`.
       await expect(
-        service.claimChallenge(phone, firstCode),
+        service.claimChallenge(phone, 'login', firstCode),
       ).rejects.toMatchObject({ reason: 'otp_wrong_code' });
       await expect(
-        service.claimChallenge(phone, provider.lastCodeFor(phone)),
+        service.claimChallenge(phone, 'login', provider.lastCodeFor(phone)),
       ).resolves.toBeUndefined();
     });
 
@@ -340,7 +347,7 @@ describe('WhatsAppOtpService', () => {
       const phone = fixturePhone();
 
       for (let i = 0; i < OTP_MAX_REQUESTS_PER_WINDOW; i += 1) {
-        await service.issueChallenge(phone, {});
+        await service.issueChallenge(phone, 'login', {});
         // Back-dated past the 60s cooldown but well inside the 1-hour
         // window, so the NEXT issue is never refused by the cooldown while
         // every row still counts against the budget. Without this the loop
@@ -351,16 +358,18 @@ describe('WhatsAppOtpService', () => {
         });
       }
 
-      await expect(service.issueChallenge(phone, {})).rejects.toMatchObject({
+      await expect(
+        service.issueChallenge(phone, 'login', {}),
+      ).rejects.toMatchObject({
         reason: 'window_exhausted',
       });
 
       // Same exception class the cooldown raises, so both surface to the
       // caller as one `OTP_RESEND_COOLDOWN`: the client cannot tell which
       // limiter stopped it, and must not need to.
-      await expect(service.issueChallenge(phone, {})).rejects.toBeInstanceOf(
-        OtpRequestThrottled,
-      );
+      await expect(
+        service.issueChallenge(phone, 'login', {}),
+      ).rejects.toBeInstanceOf(OtpRequestThrottled);
 
       // The budget is checked BEFORE a code is generated or handed to the
       // provider, so a refused request costs no message and writes no row.
@@ -375,14 +384,16 @@ describe('WhatsAppOtpService', () => {
       const phone = fixturePhone();
 
       await expect(
-        service.claimChallenge(phone, '000000'),
+        service.claimChallenge(phone, 'login', '000000'),
       ).rejects.toMatchObject({ reason: 'otp_not_found' });
 
-      await service.issueChallenge(phone, {});
+      await service.issueChallenge(phone, 'login', {});
       const code = provider.lastCodeFor(phone);
       const wrong = code === '000000' ? '111111' : '000000';
 
-      await expect(service.claimChallenge(phone, wrong)).rejects.toMatchObject({
+      await expect(
+        service.claimChallenge(phone, 'login', wrong),
+      ).rejects.toMatchObject({
         reason: 'otp_wrong_code',
       });
 
@@ -390,14 +401,16 @@ describe('WhatsAppOtpService', () => {
         where: { phoneE164: phone },
         data: { expiresAt: new Date(Date.now() - 1000) },
       });
-      await expect(service.claimChallenge(phone, code)).rejects.toMatchObject({
+      await expect(
+        service.claimChallenge(phone, 'login', code),
+      ).rejects.toMatchObject({
         reason: 'otp_expired',
       });
     });
 
     it('enforces the attempt budget in the database, not in application code', async () => {
       const phone = fixturePhone();
-      await service.issueChallenge(phone, {});
+      await service.issueChallenge(phone, 'login', {});
       const code = provider.lastCodeFor(phone);
       const wrong = code === '000000' ? '111111' : '000000';
 
@@ -406,7 +419,7 @@ describe('WhatsAppOtpService', () => {
       // `attemptCount` before any of them wrote.
       await Promise.allSettled(
         Array.from({ length: OTP_MAX_ATTEMPTS * 4 }, () =>
-          service.claimChallenge(phone, wrong),
+          service.claimChallenge(phone, 'login', wrong),
         ),
       );
 
@@ -415,19 +428,19 @@ describe('WhatsAppOtpService', () => {
       });
       expect(challenge.attemptCount).toBeLessThanOrEqual(OTP_MAX_ATTEMPTS);
 
-      await expect(service.claimChallenge(phone, code)).rejects.toBeInstanceOf(
-        OtpRejected,
-      );
+      await expect(
+        service.claimChallenge(phone, 'login', code),
+      ).rejects.toBeInstanceOf(OtpRejected);
     });
 
     it('consumes a challenge exactly once under concurrent correct guesses', async () => {
       const phone = fixturePhone();
-      await service.issueChallenge(phone, {});
+      await service.issueChallenge(phone, 'login', {});
       const code = provider.lastCodeFor(phone);
 
       const outcomes = await Promise.allSettled([
-        service.claimChallenge(phone, code),
-        service.claimChallenge(phone, code),
+        service.claimChallenge(phone, 'login', code),
+        service.claimChallenge(phone, 'login', code),
       ]);
 
       expect(outcomes.filter((o) => o.status === 'fulfilled')).toHaveLength(1);
@@ -437,7 +450,7 @@ describe('WhatsAppOtpService', () => {
   describe('code handling', () => {
     it('generates a fixed-length numeric code and never persists it', async () => {
       const phone = fixturePhone();
-      await service.issueChallenge(phone, {});
+      await service.issueChallenge(phone, 'login', {});
       const code = provider.lastCodeFor(phone);
 
       expect(code).toMatch(/^\d{6}$/);
@@ -453,7 +466,7 @@ describe('WhatsAppOtpService', () => {
       const phoneA = fixturePhone();
       const phoneB = fixturePhone();
       const hash = (phone: string, code: string): string =>
-        internals(service).hashOtpCode(phone, code);
+        internals(service).hashOtpCode('login', phone, code);
 
       expect(hash(phoneA, '123456')).not.toBe(hash(phoneB, '123456'));
       expect(hash(phoneA, '123456')).toBe(hash(phoneA, '123456'));
@@ -463,13 +476,15 @@ describe('WhatsAppOtpService', () => {
       const phone = fixturePhone();
 
       appConfig.devToolsEnabled = false;
-      expect((await service.issueChallenge(phone, {})).devCode).toBeUndefined();
+      expect(
+        (await service.issueChallenge(phone, 'login', {})).devCode,
+      ).toBeUndefined();
 
       await prisma.phoneOtpChallenge.deleteMany({
         where: { phoneE164: phone },
       });
       appConfig.devToolsEnabled = true;
-      expect((await service.issueChallenge(phone, {})).devCode).toBe(
+      expect((await service.issueChallenge(phone, 'login', {})).devCode).toBe(
         provider.lastCodeFor(phone),
       );
       appConfig.devToolsEnabled = false;
@@ -500,9 +515,9 @@ describe('WhatsAppOtpService', () => {
         const phone = fixturePhone();
         provider.failWith = kind;
 
-        await expect(service.issueChallenge(phone, {})).rejects.toBeInstanceOf(
-          OtpDeliveryFailed,
-        );
+        await expect(
+          service.issueChallenge(phone, 'login', {}),
+        ).rejects.toBeInstanceOf(OtpDeliveryFailed);
       },
     );
 
@@ -510,7 +525,7 @@ describe('WhatsAppOtpService', () => {
       const phone = fixturePhone();
       provider.failWith = 'provider_unavailable';
 
-      await service.issueChallenge(phone, {}).catch(() => undefined);
+      await service.issueChallenge(phone, 'login', {}).catch(() => undefined);
 
       expect(
         await prisma.phoneOtpChallenge.count({ where: { phoneE164: phone } }),
@@ -520,11 +535,13 @@ describe('WhatsAppOtpService', () => {
     it('the withdrawal clears the cooldown, so the user can retry at once', async () => {
       const phone = fixturePhone();
       provider.failWith = 'provider_unavailable';
-      await service.issueChallenge(phone, {}).catch(() => undefined);
+      await service.issueChallenge(phone, 'login', {}).catch(() => undefined);
 
       // Without the withdrawal this would throw OtpRequestThrottled.
       provider.failWith = undefined;
-      await expect(service.issueChallenge(phone, {})).resolves.toMatchObject({
+      await expect(
+        service.issueChallenge(phone, 'login', {}),
+      ).resolves.toMatchObject({
         expiresInSeconds: Math.floor(OTP_TTL_MS / 1000),
       });
     });
@@ -535,12 +552,14 @@ describe('WhatsAppOtpService', () => {
       // Exhaust the window entirely on failed deliveries.
       provider.failWith = 'provider_unavailable';
       for (let i = 0; i < OTP_MAX_REQUESTS_PER_WINDOW + 2; i += 1) {
-        await service.issueChallenge(phone, {}).catch(() => undefined);
+        await service.issueChallenge(phone, 'login', {}).catch(() => undefined);
       }
 
       // An outage must not lock a real user out of their own number.
       provider.failWith = undefined;
-      await expect(service.issueChallenge(phone, {})).resolves.toBeDefined();
+      await expect(
+        service.issueChallenge(phone, 'login', {}),
+      ).resolves.toBeDefined();
     });
 
     it('CRITICAL: a recipient_rejected failure is SWALLOWED and keeps the challenge live', async () => {
@@ -548,7 +567,9 @@ describe('WhatsAppOtpService', () => {
       provider.failWith = 'recipient_rejected';
 
       // Byte-identical to a successful send, by design.
-      await expect(service.issueChallenge(phone, {})).resolves.toMatchObject({
+      await expect(
+        service.issueChallenge(phone, 'login', {}),
+      ).resolves.toMatchObject({
         expiresInSeconds: Math.floor(OTP_TTL_MS / 1000),
       });
 
@@ -557,22 +578,25 @@ describe('WhatsAppOtpService', () => {
       });
       expect(live).toHaveLength(1);
       expect(live[0].consumedAt).toBeNull();
-      expect(live[0].liveKey).toBe(phone);
+      // V1 provider account deletion: the live slot is namespaced by
+      // purpose, so a login challenge and a deletion challenge for the same
+      // number cannot starve each other. See `PhoneOtpChallenge.liveKey`.
+      expect(live[0].liveKey).toBe(`login:${phone}`);
     });
 
     it('a withdrawal never destroys an already-CONSUMED challenge', async () => {
       const phone = fixturePhone();
 
       // A real, delivered, then consumed challenge.
-      await service.issueChallenge(phone, {});
-      await service.claimChallenge(phone, provider.lastCodeFor(phone));
+      await service.issueChallenge(phone, 'login', {});
+      await service.claimChallenge(phone, 'login', provider.lastCodeFor(phone));
       const consumedBefore = await prisma.phoneOtpChallenge.count({
         where: { phoneE164: phone, consumedAt: { not: null } },
       });
 
       // A later request whose delivery fails must withdraw only ITS OWN row.
       provider.failWith = 'provider_unavailable';
-      await service.issueChallenge(phone, {}).catch(() => undefined);
+      await service.issueChallenge(phone, 'login', {}).catch(() => undefined);
 
       expect(
         await prisma.phoneOtpChallenge.count({
@@ -592,7 +616,7 @@ describe('WhatsAppOtpService', () => {
 
       try {
         provider.failWith = 'provider_unavailable';
-        await service.issueChallenge(phone, {}).catch(() => undefined);
+        await service.issueChallenge(phone, 'login', {}).catch(() => undefined);
       } finally {
         spy.mockRestore();
       }

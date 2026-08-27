@@ -7,6 +7,7 @@ import { AccountLockoutService } from './account-lockout.service';
 import { AuthAuditService } from './auth-audit.service';
 import { AuthController } from './auth.controller';
 import { AuthService } from './auth.service';
+import { DeletionAuthorizationService } from './deletion/deletion-authorization.service';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
 import { OptionalJwtAuthGuard } from './guards/optional-jwt-auth.guard';
 import { AuthIdentityController } from './identity/auth-identity.controller';
@@ -73,6 +74,13 @@ import {
     AccountLockoutService,
     AuthAuditService,
     AuthIdentityService,
+    // V1 PROVIDER ACCOUNT DELETION: the per-identity deletion proof gate.
+    // Registered here rather than in a module of its own because it is a
+    // policy of THIS module's aggregate (it reads `User.passwordHash` and
+    // `AuthIdentity`, and consumes this module's own Google verifier port
+    // and `WhatsAppOtpService`), and because both its consumers —
+    // `AuthService` and `AccountDeletionController` — already live here.
+    DeletionAuthorizationService,
     WhatsAppOtpService,
     {
       provide: GOOGLE_IDENTITY_VERIFIER,

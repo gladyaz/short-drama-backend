@@ -148,9 +148,18 @@ export const AUTH_AUDIT_METADATA_ALLOWLIST = {
    * reference would be REJECTED outright at insert time, not merely nulled
    * (`onDelete: SetNull` only fires when the REFERENCED row is deleted, not
    * when a new row is inserted pointing at an id that never/no-longer
-   * exists). No metadata needed.
+   * exists).
+   *
+   * V1 PROVIDER ACCOUNT DELETION: `method` is now recorded — which proof
+   * (`password` | `google` | `whatsapp`) the account actually produced. It
+   * is a fixed value of the closed `DeletionProofMethod` union, identifies
+   * nothing about the person, and survives the `userId`-less shape above:
+   * an operator can now answer "are Google-only and WhatsApp-only accounts
+   * genuinely able to delete themselves in production" from the audit trail
+   * instead of from an assumption — which, given that the inability to do so
+   * is the defect this work unit fixes, is worth one enum column.
    */
-  account_deletion_success: [],
+  account_deletion_success: ['method'],
   /**
    * `POST /users/me/deletion` was refused. `reason` distinguishes
    * `invalid_current_password` (mirrors `change_password_failed`'s identical
@@ -159,8 +168,46 @@ export const AUTH_AUDIT_METADATA_ALLOWLIST = {
    * attempted self-service deletion). The account still exists in BOTH
    * cases (the request was refused before anything was touched), so
    * `userId` IS included here, unlike the success event above.
+   *
+   * V1 PROVIDER ACCOUNT DELETION adds `method` (which proof was attempted)
+   * and these `reason` values, all fixed enums:
+   *   - `method_unavailable` — the account cannot produce the named proof
+   *     (no password / no linked identity / provider disabled). REPLACES the
+   *     old `no_password_credential`, which said "this account has no
+   *     password" for a condition that is now one of several.
+   *   - `invalid_google_token` — the presented Google ID token did not
+   *     verify at all.
+   *   - `proof_identity_mismatch` — it DID verify, and belongs to a
+   *     different identity than the one linked here. Worth its own value:
+   *     a spike of these is what an attempt to delete someone else's account
+   *     with one's own valid provider credential looks like.
+   *   - the `OtpRejectionReason` values (`otp_not_found`, `otp_expired`,
+   *     `otp_wrong_code`, `otp_attempts_exhausted`, `otp_claim_lost`),
+   *     recorded verbatim so a deletion-code refusal reads the same way a
+   *     login-code refusal already does.
    */
-  account_deletion_failed: ['reason'],
+  account_deletion_failed: ['reason', 'method'],
+  /**
+   * V1 PROVIDER ACCOUNT DELETION: an AUTHENTICATED caller asked for a
+   * deletion-confirmation challenge to be delivered to the identity their
+   * own account has linked (`POST /users/me/deletion/whatsapp/otp`).
+   *
+   * DISTINCT FROM `otp_requested`, deliberately. That event covers the
+   * UNAUTHENTICATED login challenge and carries no `userId` precisely
+   * because the server does not know — and must not reveal — whether the
+   * number belongs to an account. This one is the opposite situation in
+   * every respect: the caller is authenticated, the number is read from
+   * their own linked identity rather than from the request, and the account
+   * is known. Recording it under the login event's name would blur an
+   * anonymous rate-limit signal together with a per-account trail of
+   * "somebody with this account's token started a deletion", which is the
+   * more security-relevant of the two.
+   *
+   * `method` is the `DeletionProofMethod` the challenge is for — `whatsapp`
+   * today, and the field exists so a future provider-delivered challenge is
+   * distinguishable rather than silently merged.
+   */
+  account_deletion_challenge_requested: ['method'],
   /**
    * Phase 12, work unit 12C-B2: `GET /users/me/export` succeeded — the
    * caller's own personal-data export was assembled and returned. Recorded

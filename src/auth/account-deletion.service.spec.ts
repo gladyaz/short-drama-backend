@@ -15,6 +15,12 @@ import {
   fixtureEmail,
 } from '../common/testing/fixture-namespace.helpers';
 import { AuthService } from './auth.service';
+import { DeletionAuthorizationService } from './deletion/deletion-authorization.service';
+import { DisabledGoogleIdentityVerifier } from './identity/google/google-disabled.verifier';
+import { GOOGLE_IDENTITY_VERIFIER } from './identity/google/google-identity.types';
+import { WhatsAppOtpService } from './identity/whatsapp/whatsapp-otp.service';
+import { DisabledWhatsAppOtpProvider } from './identity/whatsapp/whatsapp-disabled.provider';
+import { WHATSAPP_OTP_PROVIDER } from './identity/whatsapp/whatsapp-otp.types';
 
 const TEST_AUTH_CONFIG = {
   jwtAccessSecret: 'test-access-secret-not-a-real-secret',
@@ -101,6 +107,28 @@ describe('AuthService.deleteAccount', () => {
         PrismaService,
         AccountLockoutService,
         AuthAuditService,
+        // V1 PROVIDER ACCOUNT DELETION: `AuthService.deleteAccount` now
+        // delegates its proof check to `DeletionAuthorizationService`, so
+        // this module has to be able to construct one. Both external
+        // provider ports are bound to their INERT `Disabled*`
+        // implementations — the exact same objects `AuthModule`'s factories
+        // produce for this repository's shipped default configuration.
+        // Every test in THIS file exercises the `password` proof, so neither
+        // is ever reached; binding them to the disabled stubs (rather than
+        // to `jest.fn()` doubles) means that if one ever WERE reached, it
+        // would refuse rather than silently succeed. The three-provider
+        // proof matrix is covered in
+        // `deletion/deletion-authorization.service.spec.ts`.
+        DeletionAuthorizationService,
+        WhatsAppOtpService,
+        {
+          provide: GOOGLE_IDENTITY_VERIFIER,
+          useValue: new DisabledGoogleIdentityVerifier(),
+        },
+        {
+          provide: WHATSAPP_OTP_PROVIDER,
+          useValue: new DisabledWhatsAppOtpProvider(),
+        },
         {
           provide: ConfigService,
           useValue: { get: jest.fn().mockReturnValue(TEST_AUTH_CONFIG) },
@@ -647,6 +675,22 @@ describe('AuthService.deleteAccount', () => {
           .mockRejectedValue(new Error('simulated DB failure')),
       };
       const mockAuthAuditService = { emit };
+      // V1 PROVIDER ACCOUNT DELETION: the proof gate is its own collaborator
+      // now, so it is stubbed to SUCCEED with a `password` authorization —
+      // this test is about what happens AFTER a valid proof, when the
+      // transaction itself fails. Returning the authorization rather than a
+      // bare `true` also pins the shape `deleteAccount` consumes.
+      const authorize = jest.fn().mockResolvedValue({
+        method: 'password',
+        userId,
+        whatsappPhoneE164: null,
+      });
+      const mockDeletionAuthorization = { authorize };
+      // Never reached: `whatsappPhoneE164` is null above, so `deleteAccount`
+      // skips the post-commit purge entirely. Bound to a spy anyway so a
+      // future change that DID call it would fail loudly here rather than
+      // throwing an opaque "not a function".
+      const purgeChallengesForPhone = jest.fn().mockResolvedValue(undefined);
 
       const mockedService = new AuthService(
         mockPrisma as unknown as PrismaService,
@@ -654,6 +698,8 @@ describe('AuthService.deleteAccount', () => {
         { get: jest.fn() } as unknown as ConfigService<RootConfig>,
         {} as unknown as AccountLockoutService,
         mockAuthAuditService as unknown as AuthAuditService,
+        mockDeletionAuthorization as unknown as DeletionAuthorizationService,
+        { purgeChallengesForPhone } as unknown as WhatsAppOtpService,
       );
 
       await expect(

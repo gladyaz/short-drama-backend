@@ -418,10 +418,41 @@ Point the platform's health check at `/health` and its traffic gate at
 
 ## 5. Database: migration safety and the staging procedure
 
+### 5.0 The account-deletion migration
+
+`20260827090000_add_otp_challenge_purpose` is the newest migration, added by
+the V1 provider account-deletion work unit. It is **additive and
+metadata-only** on the `ADD COLUMN`, plus one bounded backfill:
+
+```sql
+ALTER TABLE "PhoneOtpChallenge" ADD COLUMN "purpose" TEXT NOT NULL DEFAULT 'login';
+UPDATE "PhoneOtpChallenge" SET "liveKey" = 'login:' || "liveKey" WHERE "liveKey" IS NOT NULL;
+```
+
+- **`ADD COLUMN ... DEFAULT` rewrites nothing** on Postgres 11+, so it applies
+  to a populated table instantly. Every pre-existing row reads back as
+  `login`, which is exactly what it was — `login` was the only purpose this
+  table had.
+- **The backfill touches only LIVE rows** (`liveKey IS NOT NULL`). It moves
+  outstanding challenges into the new `"<purpose>:<number>"` slot namespace so
+  a challenge issued moments before the deploy cannot hold a slot no new
+  request would collide with. Consumed/retired rows carry `NULL` and are
+  untouched. No row can already be prefixed — the prefixed form does not exist
+  before this statement runs.
+- **Blast radius if it were skipped:** WhatsApp OTP would fail outright
+  (`purpose` is queried on every claim), so this migration is not optional.
+  `PhoneOtpChallenge` holds only short-lived challenge rows (24h retention,
+  no owning `User`), so it is also the cheapest table in the schema to be
+  wrong about.
+
+Why the column exists at all, and why it is a security boundary rather than a
+label, is in [`ACCOUNT_DELETION.md`](./ACCOUNT_DELETION.md) §5.
+
 ### 5.1 What the Rewards V1 migration does
 
-`20260826140000_add_v1_reward_missions_and_perks` is the newest of **23**
-migrations and the only one added since the last deployed line.
+`20260826140000_add_v1_reward_missions_and_perks` is the newest of the
+**Rewards** migrations and was the only one added between the last deployed
+line and §5.0's.
 
 Adds three tables — `RewardMissionClaim`, `RewardWatchCredit`, `RewardPerk` —
 and one column, `RewardRedemption.perkId`.
@@ -683,6 +714,24 @@ URLs/min, 30 check-ins/min, 10 redemptions/min, 20 mission calls/min.
 | A7 | `POST /auth/whatsapp/otp/verify` | Tokens. WAITING EXTERNAL. |
 | A8 | `GET /auth/identities` | Linked providers for the account. |
 
+### ACCOUNT DELETION
+
+Every V1 sign-in method must be able to delete its own account — this is the
+check that was missing when a Google-only account could be created and never
+removed. Use **throwaway staging accounts only**; deletion is immediate, hard
+and irreversible. See [`ACCOUNT_DELETION.md`](./ACCOUNT_DELETION.md).
+
+| # | Check | Expected |
+|---|---|---|
+| D1 | `GET /users/me/deletion/methods` as a password account | `{"methods":["password"]}`. |
+| D2 | `GET /users/me/deletion/methods` as a Google account | `{"methods":["google"]}`. An **empty** list here means `GOOGLE_AUTH_ENABLED` is not `true` — a stop condition, not a curiosity. WAITING EXTERNAL until A4 passes. |
+| D3 | `GET /users/me/deletion/methods` as a WhatsApp account | `{"methods":["whatsapp"]}`. WAITING EXTERNAL until A7 passes. |
+| D4 | `POST /users/me/deletion` with `{currentPassword, confirmDeletion:true}` | 200 `{"success":true}`; the account can no longer log in or refresh. |
+| D5 | `POST /users/me/deletion` with `{method:"google", idToken, confirmDeletion:true}` | 200. WAITING EXTERNAL. |
+| D6 | `POST /users/me/deletion/whatsapp/otp`, then delete with the code | 202, then 200. WAITING EXTERNAL — **the arriving message is the only proof of delivery**, exactly as in A6. |
+| D7 | The deleted social account signs in again with the same Google/WhatsApp identity | A **new, empty** account — never the deleted one. Re-entering the old account is a stop condition. |
+| D8 | `POST /users/me/deletion` with `confirmDeletion` omitted | 400, for every method. A valid proof alone must never delete. |
+
 ### CONTENT
 
 | # | Check | Expected |
@@ -746,6 +795,8 @@ Requires a signed-in account.
 | N1 | `GET /dev/admin/*` | Not reachable. A 200 is a **privilege-escalation stop condition**. |
 | N2 | `POST /payments/*` | 503 `PAYMENTS_DISABLED`. |
 | N3 | Any error body or log line containing a secret | None. Errors name variables, never values. |
+| N4 | A WhatsApp **deletion** code presented to `POST /auth/whatsapp/otp/verify` | `401 INVALID_OTP`. A 200 would mean a "confirm deletion" message can be used as a login credential — a **stop condition**. |
+| N5 | `POST /users/me/deletion` with no `Authorization` header | `401 INVALID_ACCESS_TOKEN`. There is no unauthenticated deletion route, and there must never be one. |
 
 ---
 

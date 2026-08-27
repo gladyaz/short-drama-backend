@@ -13,10 +13,12 @@ import {
   OTP_MAX_ATTEMPTS,
   OTP_MAX_REQUESTS_PER_WINDOW,
   OTP_PRUNE_BATCH_LIMIT,
+  OTP_PURPOSE_HASH_DOMAINS,
   OTP_REQUEST_WINDOW_MS,
   OTP_RESEND_COOLDOWN_MS,
   OTP_TTL_MS,
 } from '../auth-identity.constants';
+import type { OtpPurpose } from '../auth-identity.constants';
 import { classifyUniqueViolation } from '../unique-violation';
 import { LocalFakeWhatsAppOtpProvider } from './whatsapp-local-fake.provider';
 import {
@@ -190,14 +192,24 @@ export class WhatsAppOtpService {
    */
   async issueChallenge(
     phoneE164: string,
+    purpose: OtpPurpose,
     context: AuthRequestContext,
   ): Promise<IssuedOtpChallenge> {
     const now = new Date();
 
     await this.pruneStaleChallenges(now);
+    // DELIBERATELY PURPOSE-INDEPENDENT (V1 provider account deletion). The
+    // cooldown and the rolling budget exist to protect a real handset from
+    // being bombed with messages, and a message costs the recipient the same
+    // whether its purpose was `login` or `account_deletion` — so both
+    // continue to count EVERY challenge for the number. A deletion request
+    // made seconds after a login request therefore still waits out the same
+    // cooldown, by design. Only the LIVE SLOT below is namespaced by
+    // purpose, and only so the two flows cannot CONSUME each other's live
+    // codes; see `PhoneOtpChallenge.liveKey`'s schema comment.
     await this.assertRequestAllowed(phoneE164, now);
 
-    await this.retireSlotIfNoLongerEntitled(phoneE164, now);
+    await this.retireSlotIfNoLongerEntitled(phoneE164, purpose, now);
 
     const code = generateOtpCode();
     const expiresAt = new Date(now.getTime() + OTP_TTL_MS);
@@ -207,10 +219,12 @@ export class WhatsAppOtpService {
       await this.prisma.phoneOtpChallenge.create({
         data: {
           phoneE164,
-          // Claims the number's single live slot. A concurrent request that
-          // already claimed it makes this INSERT lose the unique index.
-          liveKey: phoneE164,
-          codeHash: this.hashOtpCode(phoneE164, code),
+          purpose,
+          // Claims this (purpose, number) pair's single live slot. A
+          // concurrent request that already claimed it makes this INSERT
+          // lose the unique index.
+          liveKey: liveKeyFor(purpose, phoneE164),
+          codeHash: this.hashOtpCode(purpose, phoneE164, code),
           expiresAt,
           ipHash:
             context.ip !== undefined
@@ -229,7 +243,7 @@ export class WhatsAppOtpService {
       throw error;
     }
 
-    await this.deliverOrWithdraw(phoneE164, code, expiresAt, now);
+    await this.deliverOrWithdraw(phoneE164, purpose, code, expiresAt, now);
 
     return {
       expiresInSeconds: Math.floor(OTP_TTL_MS / 1000),
@@ -266,11 +280,16 @@ export class WhatsAppOtpService {
    */
   private async retireSlotIfNoLongerEntitled(
     phoneE164: string,
+    purpose: OtpPurpose,
     now: Date,
   ): Promise<void> {
     await this.prisma.phoneOtpChallenge.updateMany({
       where: {
         phoneE164,
+        // Scoped to the slot this request is about to claim. Retiring
+        // another purpose's live challenge here would silently cancel a code
+        // the user is holding in a different flow.
+        purpose,
         consumedAt: null,
         createdAt: { lt: new Date(now.getTime() - OTP_RESEND_COOLDOWN_MS) },
       },
@@ -300,7 +319,11 @@ export class WhatsAppOtpService {
    *      matches a row and the loser is refused, which is what makes a code
    *      genuinely single-use rather than single-use-when-nobody-is-racing.
    */
-  async claimChallenge(phoneE164: string, code: string): Promise<void> {
+  async claimChallenge(
+    phoneE164: string,
+    purpose: OtpPurpose,
+    code: string,
+  ): Promise<void> {
     const now = new Date();
 
     // At most one row can match: `PhoneOtpChallenge.liveKey`'s unique index
@@ -309,7 +332,12 @@ export class WhatsAppOtpService {
     // were ever relaxed — it must never become "whichever row the planner
     // returned first".
     const challenge = await this.prisma.phoneOtpChallenge.findFirst({
-      where: { phoneE164, consumedAt: null },
+      // `purpose` IS THE SECURITY-CRITICAL PART OF THIS FILTER, not a
+      // refinement: without it, a code sent for `account_deletion` could be
+      // presented at `POST /auth/whatsapp/otp/verify` and would mint a
+      // session (or a brand-new account) for the number — turning a
+      // "confirm you want to delete this" message into a login credential.
+      where: { phoneE164, purpose, consumedAt: null },
       orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
     });
 
@@ -345,7 +373,7 @@ export class WhatsAppOtpService {
     if (
       !constantTimeHexEquals(
         challenge.codeHash,
-        this.hashOtpCode(phoneE164, code),
+        this.hashOtpCode(purpose, phoneE164, code),
       )
     ) {
       throw new OtpRejected('otp_wrong_code');
@@ -361,6 +389,52 @@ export class WhatsAppOtpService {
 
     if (claimed === 0) {
       throw new OtpRejected('otp_claim_lost');
+    }
+  }
+
+  /**
+   * V1 PROVIDER ACCOUNT DELETION — destroys every outstanding challenge for
+   * a number, of ANY purpose, once the account that owned it has been
+   * deleted.
+   *
+   * WHY IT EXISTS. `PhoneOtpChallenge` deliberately has no `userId` and no
+   * foreign key (see the model's schema comment: an OTP is requested for a
+   * NUMBER, and at request time the server must not be able to say whether
+   * that number has an account). That is the right design, and its exact
+   * cost is that account deletion's `ON DELETE CASCADE` reaches nothing
+   * here — a live code delivered moments before the delete would otherwise
+   * outlive the account by up to `OTP_TTL_MS`. Nothing catastrophic follows
+   * from that (the person still owns the handset, and after deletion the
+   * identity row is gone so a login code could only ever create a NEW, empty
+   * account), but "every credential-shaped artifact belonging to the deleted
+   * account is destroyed with it" is a property worth actually having rather
+   * than arguing about.
+   *
+   * NOT PURPOSE-SCOPED, unlike every other query in this file: the account
+   * is gone, so no purpose's challenge for its number is still wanted.
+   *
+   * A SINGLE-STATEMENT, AUTO-COMMIT WRITE, and it MUST stay one. The
+   * CANONICAL AUTH LOCK ORDER block in `auth.service.ts` records that this
+   * table is deliberately kept out of every multi-statement transaction, so
+   * it can never supply an edge to a deadlock cycle. `AuthService`
+   * accordingly calls this AFTER its deletion transaction has committed,
+   * never inside it.
+   *
+   * Failure is logged and swallowed: the account is already, durably
+   * deleted, and turning a best-effort cleanup into a 500 would tell the
+   * caller their deletion failed when it did not.
+   */
+  async purgeChallengesForPhone(phoneE164: string): Promise<void> {
+    try {
+      await this.prisma.phoneOtpChallenge.deleteMany({ where: { phoneE164 } });
+    } catch (error) {
+      this.logger.warn(
+        redactSensitiveText(
+          `Failed to purge PhoneOtpChallenge rows for a deleted account's number ...${phoneE164.slice(-4)}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        ),
+      );
     }
   }
 
@@ -481,6 +555,7 @@ export class WhatsAppOtpService {
    */
   private async deliverOrWithdraw(
     phoneE164: string,
+    purpose: OtpPurpose,
     code: string,
     expiresAt: Date,
     now: Date,
@@ -515,7 +590,7 @@ export class WhatsAppOtpService {
         return;
       }
 
-      await this.withdrawChallenge(phoneE164);
+      await this.withdrawChallenge(phoneE164, purpose);
 
       throw new OtpDeliveryFailed(
         error instanceof WhatsAppDeliveryError ? error.httpStatus : undefined,
@@ -537,10 +612,16 @@ export class WhatsAppOtpService {
    * failed either way, and turning a cleanup problem into a different error
    * would only make the outage harder to read.
    */
-  private async withdrawChallenge(phoneE164: string): Promise<void> {
+  private async withdrawChallenge(
+    phoneE164: string,
+    purpose: OtpPurpose,
+  ): Promise<void> {
     try {
       await this.prisma.phoneOtpChallenge.deleteMany({
-        where: { phoneE164, consumedAt: null },
+        // Purpose-scoped for the same reason `retireSlotIfNoLongerEntitled`
+        // is: a failed deletion-code send must not destroy a live login code
+        // (or the reverse) that the user is still holding.
+        where: { phoneE164, purpose, consumedAt: null },
       });
     } catch (error) {
       this.logger.warn(
@@ -561,6 +642,13 @@ export class WhatsAppOtpService {
    * should cut all of them off together; a fourth long-lived auth secret
    * would add real operational cost for no security gain).
    *
+   * THE PURPOSE TAG (V1 provider account deletion) is mixed in alongside the
+   * fixed domain tag — see `OTP_PURPOSE_HASH_DOMAINS` for why `login` maps to
+   * the empty string and therefore keeps its historical hash input unchanged.
+   * It is defense in depth BEHIND `claimChallenge`'s `purpose` filter, not
+   * instead of it: even a future query that forgot the filter could not match
+   * a hash minted under a different purpose.
+   *
    * THE PHONE BINDING IS NOT DECORATION. Unlike those two 256-bit tokens, an
    * OTP has only 10^6 possible values: without binding, ONE precomputed
    * table of `HMAC(secret, code)` would cover every code this system ever
@@ -575,10 +663,15 @@ export class WhatsAppOtpService {
    * deliberately slow hash on an unauthenticated verify endpoint is a
    * CPU-exhaustion lever, not a safeguard.
    */
-  private hashOtpCode(phoneE164: string, code: string): string {
+  private hashOtpCode(
+    purpose: OtpPurpose,
+    phoneE164: string,
+    code: string,
+  ): string {
     const authConfig = this.configService.get('auth', { infer: true })!;
     return createHmac('sha256', authConfig.jwtRefreshSecret)
       .update(OTP_CODE_HASH_DOMAIN)
+      .update(OTP_PURPOSE_HASH_DOMAINS[purpose])
       .update(phoneE164)
       .update(':')
       .update(code)
@@ -628,6 +721,22 @@ function generateOtpCode(): string {
  * leading characters of a candidate hash matched. `timingSafeEqual` throws
  * on unequal lengths, hence the guard rather than a bare call.
  */
+/**
+ * V1 PROVIDER ACCOUNT DELETION — the value that claims
+ * `PhoneOtpChallenge.liveKey`'s unique index for one (purpose, number) pair.
+ *
+ * ONE FUNCTION, so the format is defined exactly once: the insert that
+ * claims a slot and the migration that backfilled the pre-existing rows must
+ * agree byte-for-byte, and a second hand-written `${purpose}:${phone}` would
+ * be one rename away from silently letting two live challenges coexist.
+ * `':'` cannot occur in either half (a purpose comes from `OTP_PURPOSES`, a
+ * number is E.164 digits after `normalizePhoneToE164`), so the concatenation
+ * is unambiguous.
+ */
+function liveKeyFor(purpose: OtpPurpose, phoneE164: string): string {
+  return `${purpose}:${phoneE164}`;
+}
+
 function constantTimeHexEquals(a: string, b: string): boolean {
   const left = Buffer.from(a, 'hex');
   const right = Buffer.from(b, 'hex');

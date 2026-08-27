@@ -201,6 +201,12 @@ export const RELEASE_GATE_STEPS: readonly ReleaseGateStepDescriptor[] = [
     what: 'Google, WhatsApp, Rewards, required social missions, free catalog, payments off.',
   },
   {
+    id: 'deletion-coverage',
+    title: 'V1 account-deletion coverage',
+    alwaysRuns: true,
+    what: 'Every supported sign-in provider maps to an implemented deletion proof, and every V1-required login provider is enabled so its proof is verifiable.',
+  },
+  {
     id: 'leak-scan',
     title: 'Release leak scan',
     alwaysRuns: true,

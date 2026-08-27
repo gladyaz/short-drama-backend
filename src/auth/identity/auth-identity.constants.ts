@@ -130,6 +130,49 @@ export const OTP_PRUNE_BATCH_LIMIT = 500;
 export const OTP_CODE_HASH_DOMAIN = 'whatsapp-otp:v1:';
 
 /**
+ * V1 PROVIDER ACCOUNT DELETION — the CLOSED set of things a WhatsApp OTP
+ * challenge can be for. Stored in `PhoneOtpChallenge.purpose`.
+ *
+ * `login` is the original, unauthenticated sign-in/sign-up challenge and is
+ * listed first because it is the default every pre-existing row reads back
+ * as. `account_deletion` is an AUTHENTICATED user re-proving control of a
+ * number ALREADY linked to their own account, immediately before an
+ * irreversible hard delete.
+ *
+ * A PURPOSE IS AN ISOLATION BOUNDARY, NOT A LABEL. `WhatsAppOtpService`
+ * filters every challenge lookup by it and mixes it into the code's HMAC
+ * domain, so the two flows can never consume each other's codes — in
+ * particular a deletion code can never be redeemed at
+ * `POST /auth/whatsapp/otp/verify` to obtain a session or create an account.
+ */
+export const OTP_PURPOSES = ['login', 'account_deletion'] as const;
+
+export type OtpPurpose = (typeof OTP_PURPOSES)[number];
+
+/** The purpose every row written before `PhoneOtpChallenge.purpose` existed had. */
+export const DEFAULT_OTP_PURPOSE: OtpPurpose = 'login';
+
+/**
+ * Per-purpose HMAC domain tags mixed into `WhatsAppOtpService.hashOtpCode`
+ * ON TOP OF `OTP_CODE_HASH_DOMAIN`, so a code hash minted for one purpose
+ * can never match a lookup for another even if a query somewhere forgot the
+ * `purpose` filter. Defense in depth behind that filter, not instead of it.
+ *
+ * `login` MAPS TO THE EMPTY STRING ON PURPOSE, and this is the same
+ * one-sided domain separation `PASSWORD_RESET_TOKEN_HASH_DOMAIN` already
+ * uses in `auth.constants.ts`: separation only requires that the inputs
+ * DIFFER, so tagging the new purpose alone achieves it while leaving the
+ * pre-existing purpose's hash input byte-identical. That matters
+ * operationally — changing `login`'s input would silently invalidate every
+ * OTP already in flight (up to `OTP_TTL_MS`) at the moment this ships, for
+ * no security gain whatsoever.
+ */
+export const OTP_PURPOSE_HASH_DOMAINS: Readonly<Record<OtpPurpose, string>> = {
+  login: '',
+  account_deletion: 'purpose:account_deletion:',
+};
+
+/**
  * The `iss` values Google is documented to issue for ID tokens. BOTH forms
  * are accepted because Google itself emits both, and a verifier that
  * accepts only one will reject legitimate tokens

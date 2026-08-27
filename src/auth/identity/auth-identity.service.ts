@@ -245,7 +245,15 @@ export class AuthIdentityService {
 
     let issued: IssuedOtpChallenge;
     try {
-      issued = await this.whatsAppOtpService.issueChallenge(phoneE164, context);
+      // `'login'` explicitly rather than by default (V1 provider account
+      // deletion): every caller of `issueChallenge`/`claimChallenge` now
+      // states which challenge namespace it means, so the sign-in flow and
+      // the account-deletion flow can never silently share one.
+      issued = await this.whatsAppOtpService.issueChallenge(
+        phoneE164,
+        'login',
+        context,
+      );
     } catch (error) {
       if (error instanceof OtpRequestThrottled) {
         await this.authAuditService.emit('otp_request_throttled', {
@@ -356,7 +364,11 @@ export class AuthIdentityService {
     const phoneE164 = normalizePhoneToE164(dto.phone);
 
     try {
-      await this.whatsAppOtpService.claimChallenge(phoneE164, dto.code);
+      await this.whatsAppOtpService.claimChallenge(
+        phoneE164,
+        'login',
+        dto.code,
+      );
       return phoneE164;
     } catch (error) {
       if (error instanceof OtpRejected) {

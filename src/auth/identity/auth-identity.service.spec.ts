@@ -20,6 +20,7 @@ import type {
 } from '../auth-audit.types';
 import type { RootConfig } from '../../config/configuration';
 import { AuthService } from '../auth.service';
+import { DeletionAuthorizationService } from '../deletion/deletion-authorization.service';
 import { AuthIdentityService } from './auth-identity.service';
 import {
   OTP_MAX_ATTEMPTS,
@@ -228,6 +229,12 @@ describe('AuthIdentityService', () => {
         AuthService,
         AuthIdentityService,
         WhatsAppOtpService,
+        // V1 PROVIDER ACCOUNT DELETION: `AuthService.deleteAccount` now
+        // delegates its proof check here. This suite already binds both
+        // provider ports (the scripted Google verifier and the fake OTP
+        // provider it uses for sign-in), so it needs nothing else —
+        // `DeletionAuthorizationService` resolves from the same container.
+        DeletionAuthorizationService,
         PrismaService,
         AccountLockoutService,
         {

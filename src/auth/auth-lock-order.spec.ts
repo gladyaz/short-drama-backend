@@ -9,6 +9,12 @@ import { PrismaService } from '../prisma/prisma.service';
 import { AccountLockoutService } from './account-lockout.service';
 import { AuthAuditService } from './auth-audit.service';
 import { AuthService } from './auth.service';
+import { DeletionAuthorizationService } from './deletion/deletion-authorization.service';
+import { DisabledGoogleIdentityVerifier } from './identity/google/google-disabled.verifier';
+import { GOOGLE_IDENTITY_VERIFIER } from './identity/google/google-identity.types';
+import { WhatsAppOtpService } from './identity/whatsapp/whatsapp-otp.service';
+import { DisabledWhatsAppOtpProvider } from './identity/whatsapp/whatsapp-disabled.provider';
+import { WHATSAPP_OTP_PROVIDER } from './identity/whatsapp/whatsapp-otp.types';
 import { bcryptTestBudgetMs } from '../common/testing/bcrypt-test-budget.helpers';
 import {
   TEST_FIXTURE_NAMESPACE,
@@ -435,6 +441,25 @@ describe('AuthService — canonical auth lock order', () => {
         PrismaService,
         AccountLockoutService,
         AuthAuditService,
+        // V1 PROVIDER ACCOUNT DELETION: `AuthService.deleteAccount` now
+        // delegates its proof check to `DeletionAuthorizationService`, so
+        // this module must be able to construct one. Both external provider
+        // ports are bound to the INERT `Disabled*` implementations —
+        // the same objects `AuthModule`'s factories produce for this
+        // repository's shipped default configuration — because no test in
+        // this file deletes an account. If one ever did, they would refuse
+        // rather than silently succeed. The proof matrix itself is covered
+        // in `deletion/deletion-authorization.service.spec.ts`.
+        DeletionAuthorizationService,
+        WhatsAppOtpService,
+        {
+          provide: GOOGLE_IDENTITY_VERIFIER,
+          useValue: new DisabledGoogleIdentityVerifier(),
+        },
+        {
+          provide: WHATSAPP_OTP_PROVIDER,
+          useValue: new DisabledWhatsAppOtpProvider(),
+        },
         {
           provide: ConfigService,
           useValue: {

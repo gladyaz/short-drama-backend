@@ -297,6 +297,14 @@ Code is not the blocker. What remains is owner/external:
 2. Three independently generated auth secrets.
 3. Google OAuth client + Play App Signing SHA-1.
 4. AdMob ids; privacy-policy and account-deletion URLs.
+4a. **The public `/delete-account` page's copy needs updating.** It currently
+   states that Google and WhatsApp accounts cannot delete themselves in-app
+   and must email support — which was true, and is not any more. Every V1
+   sign-in method now has a working in-app deletion path (the V1 provider
+   account-deletion work unit; see `docs/ACCOUNT_DELETION.md` §7 for exactly
+   what to change). The backend ships no unauthenticated web deletion API and
+   V1 deliberately does not add one; Play's requirement is met by the page
+   explaining the in-app route, which it already does for password accounts.
 4b. The three official Red Panda social profile URLs (Instagram, TikTok,
    YouTube), for `REWARDS_SOCIAL_*_URL`. **Not yet supplied.** Until they are
    set the preflight blocks the release, and the missions are not served.

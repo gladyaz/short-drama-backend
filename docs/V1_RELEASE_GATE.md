@@ -121,7 +121,38 @@ env $(grep -v '^#' .env.production | xargs) npm run release:gate -- --mode=produ
 | `prisma:status` *(opt-in)* | Read-only `prisma migrate status` against a database **you name**. |
 | `preflight` | The full `runProductionPreflight` verdict over this mode's configuration. |
 | `contract` | Google, WhatsApp, Rewards, the required social missions, free catalog, payments off. |
+| `deletion-coverage` | Every supported sign-in provider maps to an implemented deletion proof, and every V1-required login provider is enabled so its proof is verifiable. |
 | `leak-scan` | Classified scan of release-bound source and CI for dev artefacts and hardcoded credentials. |
+
+### V1 account-deletion coverage
+
+Added after a Google-only / WhatsApp-only account was found to have **no
+deletion path at all** — `POST /users/me/deletion` demanded a password those
+accounts never had. Nothing failed at the time: the build compiled, the
+deletion tests passed (they all used password accounts), and the feature
+contract confirmed both login providers were enabled — which was the problem,
+since enabling them is what created the undeletable accounts. A human reading
+the public website's privacy page found it.
+
+The `deletion-coverage` step blocks on two properties
+(`src/common/release-gate/v1-account-deletion-coverage.ts`):
+
+1. **Structural.** Every provider in `AUTH_PROVIDERS` maps to an implemented
+   `DeletionProofMethod`. The map is a total
+   `Record<AuthProvider, DeletionProofMethod>`, so adding a fourth sign-in
+   provider without deciding how its accounts delete themselves **fails to
+   compile**; the gate restates it in the report so the release record says it
+   in words rather than leaving it a property only the compiler knows.
+2. **Environmental.** Every V1-required login provider is actually enabled.
+   `GOOGLE_AUTH_ENABLED=false` is already blocked by the feature contract as a
+   dead login button; this states the second, worse consequence — a server
+   that cannot verify a Google proof leaves every Google-only account unable
+   to delete itself.
+
+It opens no connection and calls no route. Proof that each path WORKS is
+`src/auth/deletion/deletion-authorization.service.spec.ts` and
+`test/account-deletion-providers.e2e-spec.ts`; see
+[`ACCOUNT_DELETION.md`](./ACCOUNT_DELETION.md).
 
 ### The V1 feature contract
 

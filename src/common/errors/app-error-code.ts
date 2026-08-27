@@ -188,6 +188,56 @@ export enum AppErrorCode {
    * does not already hold the account's real password.
    */
   ACCOUNT_DELETION_FORBIDDEN = 'ACCOUNT_DELETION_FORBIDDEN',
+  // V1 PROVIDER ACCOUNT DELETION
+  /**
+   * `409` from `POST /users/me/deletion` (and from
+   * `POST /users/me/deletion/whatsapp/otp`) when the deletion proof the
+   * request names is not one this account can actually produce — asking to
+   * prove with `password` on an account that has no `passwordHash`, with
+   * `google`/`whatsapp` on an account with no such linked identity, or with
+   * a provider whose server-side feature flag is off (so the server has no
+   * way to verify it and would otherwise answer a misleading "invalid
+   * credential").
+   *
+   * THIS CODE IS THE WHOLE POINT OF THIS WORK UNIT. Before it, a Google-only
+   * or WhatsApp-only account — both of which are V1's REQUIRED sign-in
+   * methods — hit `AuthService.deleteAccount`'s `passwordHash === null`
+   * branch and received the generic `401 INVALID_CREDENTIALS`: a message
+   * that told the owner their password was wrong for an account that never
+   * had one, with no path forward. This is the honest, actionable answer
+   * instead, and the accompanying message names
+   * `GET /users/me/deletion/methods` so a client can recover without
+   * guessing.
+   *
+   * DELIBERATELY SPECIFIC RATHER THAN GENERIC, and that leaks nothing: it is
+   * only ever returned to a caller holding a valid access token FOR THIS
+   * ACCOUNT, and `GET /auth/identities` already tells that same caller
+   * exactly which methods their own account has (`provider` + `usable`). It
+   * is never returned to an unauthenticated caller, so it cannot be used to
+   * probe which sign-in methods a stranger's account uses.
+   */
+  ACCOUNT_DELETION_METHOD_UNAVAILABLE = 'ACCOUNT_DELETION_METHOD_UNAVAILABLE',
+  /**
+   * `401` from `POST /users/me/deletion` when the provider credential
+   * presented is genuinely VALID but belongs to a DIFFERENT identity than
+   * the one linked to the authenticated account — most concretely, a
+   * correctly-signed Google ID token whose `sub` is not this account's
+   * `AuthIdentity.providerSubject`.
+   *
+   * DISTINCT FROM `INVALID_GOOGLE_TOKEN`/`INVALID_OTP` on purpose. Those
+   * mean "this credential did not verify at all"; this one means "it
+   * verified, and it is not yours". Collapsing them would leave a user who
+   * picked the wrong account in Google's account chooser — the single most
+   * likely real-world cause — staring at "invalid credential" with nothing
+   * to act on.
+   *
+   * IT REVEALS NOTHING THE CALLER DID NOT ALREADY SUPPLY. The caller
+   * authenticated as this account, chose which Google account to present,
+   * and can already read the linked identifier back from
+   * `GET /auth/identities`. The response never says which identity IS
+   * linked, only that the presented one is not it.
+   */
+  ACCOUNT_DELETION_PROOF_MISMATCH = 'ACCOUNT_DELETION_PROOF_MISMATCH',
   // Phase 11, work unit 11L-B3 (hardened admin-upload completion)
   /**
    * Returned by `POST /admin/media/:id/complete-upload` when the uploaded

@@ -1089,27 +1089,84 @@ reset token for a deleted account is discarded along with it.
   catches it. Retention logic should not, however, assume `revokedAt` is
   precise to the hour for any row that predates this fix.
 
-## Account Deletion API (Phase 12, work unit 12C-B1)
+## Account Deletion API (Phase 12, work unit 12C-B1; V1 provider account deletion)
+
+> **EVERY V1 SIGN-IN METHOD HAS A DELETION PATH.** Password, Google and
+> WhatsApp accounts can all delete themselves. Full detail — the design, the
+> API contract, the transaction, the release gate and the public-website
+> strategy — is in **[`docs/ACCOUNT_DELETION.md`](docs/ACCOUNT_DELETION.md)**;
+> the summary below is the backend's own reference.
+>
+> Until the V1 provider account-deletion work unit, this endpoint required
+> the account's current password and refused when `User.passwordHash` was
+> `null` — so the two passwordless sign-in methods V1 makes mandatory
+> (Google, WhatsApp) could create accounts that could never be deleted. That
+> is fixed. **The password path below is unchanged, and the pre-existing
+> request body is still valid verbatim.**
+
+### `GET /users/me/deletion/methods`
+
+Requires `Authorization: Bearer <accessToken>`. Returns which proofs THIS
+account can use, ordered `password`, `google`, `whatsapp`:
+
+```json
+{ "methods": ["password"] }
+```
+
+Method names only — never an email, phone number or Google `sub`. A method
+appears only when the account owns the credential **and** this server can
+verify it (the provider's feature flag is on). Clients must choose their
+confirmation UI from this, never by inferring it from whether `user.email` is
+null.
+
+### `POST /users/me/deletion/whatsapp/otp`
+
+Requires `Authorization: Bearer <accessToken>`. **Empty body** — there is no
+`phone` field and no way to supply one. The number is read from the caller's
+own linked `AuthIdentity`, which is what binds the challenge to this account
+and keeps this route from becoming a way to message arbitrary numbers.
+Answers `202` with the same shape `POST /auth/whatsapp/otp/request` returns.
+
+The challenge is issued in the `account_deletion` purpose namespace, so **a
+deletion code can never be redeemed at `POST /auth/whatsapp/otp/verify`** to
+mint a session or create an account.
 
 ### `POST /users/me/deletion`
 
-Requires `Authorization: Bearer <accessToken>`. Body:
+Requires `Authorization: Bearer <accessToken>`. Body — one of:
 
-```json
-{
-  "currentPassword": "the caller's existing password",
-  "confirmDeletion": true
-}
+```jsonc
+{ "currentPassword": "…", "confirmDeletion": true }                       // legacy, still valid
+{ "method": "password", "currentPassword": "…", "confirmDeletion": true } // identical
+{ "method": "google",   "idToken": "…",   "confirmDeletion": true }
+{ "method": "whatsapp", "code": "123456", "confirmDeletion": true }
 ```
 
+- `method` is **optional and defaults to `"password"`**, so every existing
+  client keeps working with no change. An unrecognized value is a clean
+  `400` from the pipe. Proof fields belonging to other methods are ignored,
+  never used as proof.
 - `confirmDeletion` must be the **literal boolean `true`** — a missing
   field, `false`, or the **string** `"true"` are each rejected with a clean
   `400` by the global `ValidationPipe` (`@IsBoolean()` then `@Equals(true)`
   on `AccountDeletionDto`) before the request ever reaches `AuthService`.
   This is decision 1's "explicit irreversible confirmation payload", not
-  merely a client-side prompt.
+  merely a client-side prompt — and it is **required in addition to a real
+  proof, for every method**. It is not, and never was, authentication.
 - `currentPassword`: re-verified server-side via `bcrypt.compare` against
   the stored hash, same as `POST /auth/change-password`.
+- `idToken`: verified through the SAME `GoogleIdentityVerifier` port
+  `POST /auth/google` uses, and its `sub` must equal **this account's own**
+  `AuthIdentity.providerSubject` — never the email, never a client-claimed
+  id. A valid token for a different identity is `401
+  ACCOUNT_DELETION_PROOF_MISMATCH`.
+- `code`: claimed through the SAME `WhatsAppOtpService` the login flow uses
+  — single-use (`consumedAt` CAS), expiring (`OTP_TTL_MS`), attempt-bounded,
+  and looked up against this account's own linked number.
+- **An account with several linked methods may use ANY ONE of them.** Each is
+  already independently sufficient to sign in and take full control of the
+  account; requiring all of them would lock out anyone who lost access to
+  one. See `docs/ACCOUNT_DELETION.md` §2.
 - There is no id in the path, query, or body — the account acted on is
   always the caller's own, resolved exclusively from the verified access
   token (`JwtAuthGuard` / `@CurrentUser()`), so there is no client-supplied
@@ -1135,10 +1192,22 @@ model in `prisma/schema.prisma` falls into exactly one of two buckets, both
 enforced by real Postgres foreign-key constraints, not application code:
 
 - **Cascade-deleted (`onDelete: Cascade`), removed outright:** `Session`,
-  `UserVideoInteraction`, `WatchProgress`, `Entitlement`,
-  `PasswordResetToken`, `AccountLockout`. A deleted-then-re-registered email
-  therefore cannot inherit a stale lockout or a leftover interaction/progress
-  row — it is gone, not merely orphaned.
+  `AuthIdentity`, `UserVideoInteraction`, `WatchProgress`, `Entitlement`,
+  `PasswordResetToken`, `AccountLockout`, and every `Reward*` table. A
+  deleted-then-re-registered email therefore cannot inherit a stale lockout
+  or a leftover interaction/progress row — it is gone, not merely orphaned.
+  **`AuthIdentity` cascading is what makes deletion final for a social
+  account:** the Google `sub` and the phone number resolve to nothing
+  afterwards, so presenting either again creates a fresh, empty account
+  rather than re-entering the deleted one. There is no orphan identity left
+  that could log back in.
+- **Purged immediately after the commit (no cascade reaches it):**
+  `PhoneOtpChallenge` rows for the account's number. That table deliberately
+  has no `userId` and no foreign key — an OTP is requested for a *number*,
+  before the server may know whether an account exists — so the purge is an
+  explicit, single-statement `deleteMany` run **outside** the transaction,
+  keeping that table out of every multi-statement transaction exactly as the
+  CANONICAL AUTH LOCK ORDER block requires.
 - **Survives, `userId` set to `null` (`onDelete: SetNull`):**
   `AnalyticsEvent.userId` and `AuthAuditEvent.userId`. For `AnalyticsEvent`
   that is the whole story — the model has no `ipHash`/`userAgent`/other
@@ -1176,10 +1245,12 @@ be rejected by the foreign key outright — `SetNull` only fires when an
 *existing* referenced row is deleted, never on an insert of a dangling
 reference. Omitting `userId` still leaves a genuinely useful record (an
 accurate, timestamped count of real account deletions) without violating
-decision 2. The two `account_deletion_failed` audit events below (wrong
-password / forbidden role) are the opposite case — the account still
-exists, so `userId` **is** included, matching `change_password_failed`'s
-existing precedent.
+decision 2. The `account_deletion_failed` audit events (a refused proof of any kind, or a
+forbidden role) are the opposite case — the account still exists, so `userId`
+**is** included, matching `change_password_failed`'s existing precedent. Both
+events also carry `method`, so an operator can confirm from the audit trail
+that Google-only and WhatsApp-only accounts really are deleting themselves in
+production rather than assuming it.
 
 **Order of checks (deliberate, not incidental) — see the doc comment on
 `AuthService.deleteAccount` for the full reasoning:**
@@ -1191,29 +1262,46 @@ existing precedent.
    call with the same (still cryptographically valid, since access tokens
    are stateless) access token after the account was already deleted lands
    here, not a 500.
-2. Is `currentPassword` correct? Checked **before** the role check below.
-   No other endpoint this app exposes to its own owner surfaces `User.role`
+2. Is the **deletion proof** valid for this account?
+   `DeletionAuthorizationService.authorize` verifies whichever proof
+   `method` names, and runs **before** the role check below. No other
+   endpoint this app exposes to its own owner surfaces `User.role`
    (`GET /auth/me` returns only `id`/`email`/`displayName`), so checking
    role first would let a caller holding a stolen-but-still-valid access
-   token learn "this account is privileged" for free, without ever knowing
-   the password. Checking the password first means that information is only
-   reachable by someone who already knows it — at which point they already
-   have full control of the account through every other authenticated
-   route, so nothing new leaks. A wrong password fails with the same generic
+   token learn "this account is privileged" for free, without proving
+   anything. Checking the proof first means that information is only
+   reachable by someone who already controls the account's real sign-in
+   factor — at which point they already have full control through every
+   other authenticated route, so nothing new leaks. **This ordering property
+   is unchanged by the V1 work unit; only the definition of "proof"
+   broadened.** A wrong password still fails with the same generic
    `401 INVALID_CREDENTIALS` `POST /auth/login` uses.
 3. Is `user.role === 'user'`? Any other role (e.g. `admin`) is refused with
    a distinct `403 ACCOUNT_DELETION_FORBIDDEN` — safe to be specific here
-   precisely because it is only reachable after the correct password was
-   already verified (point 2 above). Self-service deletion of a privileged
-   account is a separate, not-yet-built process this phase deliberately
-   does not create.
+   precisely because it is only reachable after a valid proof (point 2
+   above). Self-service deletion of a privileged account is a separate,
+   not-yet-built process this phase deliberately does not create.
 
 Errors:
 
 - `400` — `confirmDeletion` missing, `false`, or a non-boolean value
-  (including the string `"true"`). The account is untouched.
+  (including the string `"true"`); an unrecognized `method`; or the proof
+  field the chosen method needs is missing. The account is untouched.
 - `401 INVALID_CREDENTIALS` — wrong `currentPassword`. The account is
   untouched.
+- `401 INVALID_GOOGLE_TOKEN` — the Google credential did not verify.
+- `401 INVALID_OTP` — the code was wrong, expired, exhausted, or already
+  used.
+- `401 ACCOUNT_DELETION_PROOF_MISMATCH` — the provider credential verified,
+  and belongs to a **different** identity than the one linked here. Distinct
+  from the two above on purpose: "not yours" and "not valid" are different
+  problems, and the commonest cause of the former is picking the wrong
+  account in Google's account chooser.
+- `409 ACCOUNT_DELETION_METHOD_UNAVAILABLE` — this account cannot produce the
+  named proof (no password, no such linked identity, or the provider is
+  disabled on this server). The message names
+  `GET /users/me/deletion/methods`. **This replaces the old, misleading
+  `401 INVALID_CREDENTIALS` a passwordless account used to receive.**
 - `401 INVALID_ACCESS_TOKEN` — missing/malformed/expired/invalid access
   token, **or** the account behind a still-valid access token has already
   been deleted (the idempotency case above — a repeated call after

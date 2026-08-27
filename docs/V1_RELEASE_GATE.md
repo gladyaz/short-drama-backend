@@ -120,7 +120,7 @@ env $(grep -v '^#' .env.production | xargs) npm run release:gate -- --mode=produ
 | `prisma:history` | Offline: every migration has non-empty SQL, timestamps increase, provider agrees. |
 | `prisma:status` *(opt-in)* | Read-only `prisma migrate status` against a database **you name**. |
 | `preflight` | The full `runProductionPreflight` verdict over this mode's configuration. |
-| `contract` | WhatsApp, Rewards, the required social missions, free catalog, payments off. |
+| `contract` | Google, WhatsApp, Rewards, the required social missions, free catalog, payments off. |
 | `leak-scan` | Classified scan of release-bound source and CI for dev artefacts and hardcoded credentials. |
 
 ### The V1 feature contract
@@ -133,7 +133,8 @@ Encoded as data in `src/common/release-gate/v1-feature-contract.ts`:
 | Rewards | `REWARDS_ENABLED` | `true` | **blocking** |
 | Free catalog | `CONTENT_ACCESS_MODE` | `free` | **blocking** |
 | No payments | `PAYMENTS_ENABLED` | `false` (unset also satisfies) | **blocking** |
-| Google login | `GOOGLE_AUTH_ENABLED` | `true` | recommended |
+| Google login | `GOOGLE_AUTH_ENABLED` | `true` | **blocking** |
+| Google client ids | `GOOGLE_OAUTH_CLIENT_IDS` | ≥1 non-empty client id | **blocking** |
 | Instagram mission | `REWARDS_SOCIAL_INSTAGRAM_URL` | a real profile URL | **blocking** |
 | TikTok mission | `REWARDS_SOCIAL_TIKTOK_URL` | a real profile URL | **blocking** |
 | YouTube mission | `REWARDS_SOCIAL_YOUTUBE_URL` | a real profile URL | **blocking** |
@@ -151,10 +152,31 @@ no purchase flow of any kind. `v1-feature-contract.spec.ts` pins that asymmetry
 so it stays deliberate — and asserts that every *other* blocking requirement is
 also refused by the preflight, so the two can never drift apart in silence.
 
-**Google is the one recommended-not-blocking item.** The preflight has always
-warned rather than blocked on it, and promoting it inside a release gate would
-refuse a release the tool operators have been running for weeks calls clean.
-Email/password and WhatsApp sign-in both still work without it.
+**Google login is a BLOCKER, and used to be the one recommended item.** It was
+recommended for a tool-agreement reason rather than a product one: the preflight
+warned, so blocking here would have made the gate the stricter of two tools that
+are supposed to agree. The confirmed V1 product contract requires **Google Login**
+and **WhatsApp Login** alike, and the **mobile release preflight has always
+treated Google as required** — so the old severity let the backend certify a
+candidate the mobile side refused. Both tools now block. `GOOGLE_OAUTH_CLIENT_IDS`
+is graded as its own requirement because the two failures differ: the flag off
+ships a dead Google button, while the flag on with an empty allowlist does not
+boot at all and would answer `401 INVALID_GOOGLE_TOKEN` to every real sign-in if
+it did.
+
+**CODE-CONFIGURED is not GOOGLE-VERIFIED.** A `PASS` on both rows means the flag
+is on and at least one client id is present — nothing more. Whether the id exists
+in a Google Cloud project, whether the OAuth consent screen is published, and
+whether the Android client carries the Play App Signing SHA-1 are facts only
+Google holds; the gate never contacts Google and never claims otherwise. Prove
+those with one real Google sign-in against the deployed origin. The report never
+echoes a client id — it prints a count. (The ids are public by design in any
+case; no Google client **secret** exists or is read anywhere in this codebase.)
+
+**This is a RELEASE rule, not a BOOT rule.** `validateEnv` still starts a process
+with `GOOGLE_AUTH_ENABLED` unset, `local` mode grades the whole feature policy as
+advisory, and development, test and CI keep running with no Google configuration
+at all.
 
 ---
 

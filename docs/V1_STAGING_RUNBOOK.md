@@ -116,8 +116,16 @@ never read).
 
 | Variable | Class | Notes |
 |---|---|---|
-| `GOOGLE_AUTH_ENABLED` | OPTIONAL (default off) | Exact string `true`. V1 ships Google login, so staging sets it. Off is a preflight **WARNING**, not a blocker — email/password is unaffected. |
-| `GOOGLE_OAUTH_CLIENT_IDS` | REQUIRED WHEN `GOOGLE_AUTH_ENABLED=true` | **Not a secret.** Comma-separated `aud` allowlist; at least one non-empty entry or boot fails. Must contain the **web** client id — that is what both Android and iOS tokens are audienced to. See `docs/auth-identity-api-contract.md` §7.1. |
+| `GOOGLE_AUTH_ENABLED` | REQUIRED FOR V1 | Exact string `true`. Off is a preflight and release-gate **BLOCKER** — V1 ships Google login as a required sign-in method alongside WhatsApp, and off means `POST /auth/google` answers 503 with the login screen's Google button dead. The repo default stays `false`, and development/test still boot with it unset. |
+| `GOOGLE_OAUTH_CLIENT_IDS` | REQUIRED FOR V1 | **Not a secret.** Comma-separated `aud` allowlist; at least one non-empty entry or boot fails. Graded as its own **BLOCKER** — an empty allowlist answers `401 INVALID_GOOGLE_TOKEN` to every real sign-in. Must contain the **web** client id — that is what both Android and iOS tokens are audienced to. See `docs/auth-identity-api-contract.md` §7.1. |
+
+**CODE-CONFIGURED is not GOOGLE-VERIFIED.** A green preflight on these two
+rows means the flag is on and at least one client id is present. It does not
+mean the id exists in a Google Cloud project, that the OAuth consent screen is
+published, or that the Android client carries the Play App Signing SHA-1 — no
+tool in this repository contacts Google, and none claims to. Prove those with
+one real Google sign-in against the deployed origin (§A4). Reports print a
+COUNT of client ids, never the ids themselves.
 
 No Google client **secret** exists anywhere in this codebase. This backend
 only verifies ID tokens against Google's public JWKS; the code exchange
@@ -212,6 +220,7 @@ authorization to write is exactly what they exist to prevent.
 | `TRANSCODE_ENABLED` | `false` | `false` for first deploy | `false` until gateway + worker are proven |
 | `HLS_GATEWAY_BASE_URL` | unset / LAN | unset until gateway deployed | https gateway origin |
 | `GOOGLE_AUTH_ENABLED` | `false` or `true` | `true` | `true` |
+| `GOOGLE_OAUTH_CLIENT_IDS` | unset or test values | **real web + platform client ids** | real web + platform client ids |
 | `WHATSAPP_AUTH_ENABLED` | `true` | `true` | `true` |
 | `WHATSAPP_OTP_PROVIDER_DRIVER` | `fake` | **`cloud-api`** | **`cloud-api`** |
 | `REWARDS_ENABLED` | `true` | `true` | `true` |
@@ -331,6 +340,12 @@ verify them, not to invite retuning:**
 | VIP redemptions (1d/3d/7d) | Present in the catalog but **suppressed entirely while `CONTENT_ACCESS_MODE=free`** — they would charge points to unlock content that is already free |
 
 ### 3.3 Google — CLIENT EXISTS IN CODE, EXTERNAL CONFIG NEEDED
+
+**Required for V1, and a release blocker until supplied.** Both
+`GOOGLE_AUTH_ENABLED=true` and a non-empty `GOOGLE_OAUTH_CLIENT_IDS` are
+BLOCKING in `npm run production:preflight` and `npm run release:gate` — the
+same standing WhatsApp login has, and the same standing the **mobile** release
+preflight has always given Google.
 
 An OAuth client for `com.spark.redpanda` plus the **Play App Signing SHA-1**.
 Put the **web** client id in `GOOGLE_OAUTH_CLIENT_IDS`; add the Android and

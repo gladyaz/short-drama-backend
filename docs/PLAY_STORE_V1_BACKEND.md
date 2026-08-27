@@ -174,7 +174,7 @@ filter, so 4 published fixtures reached ordinary viewers as episodes.
 | Flow | Status |
 |---|---|
 | Email / password | **READY IN CODE.** No flag, no external dependency. |
-| Google | **READY IN CODE, NEEDS EXTERNAL CONFIG.** Real JWKS verifier. Needs `GOOGLE_AUTH_ENABLED=true` + `GOOGLE_OAUTH_CLIENT_IDS`, an OAuth client for `com.spark.redpanda`, and the **Play App Signing SHA-1**. No client secret is required or ever read. |
+| Google | **REQUIRED FOR V1 — READY IN CODE, NEEDS EXTERNAL CONFIG.** Real JWKS verifier. Needs `GOOGLE_AUTH_ENABLED=true` + `GOOGLE_OAUTH_CLIENT_IDS` (both **release blockers**), an OAuth client for `com.spark.redpanda`, and the **Play App Signing SHA-1**. No client secret is required or ever read. |
 | WhatsApp | **READY IN CODE, NEEDS EXTERNAL CONFIG (Meta).** The production `cloud-api` driver (Meta WhatsApp Cloud API) ships and is fully tested. It cannot run until an operator obtains real Meta credentials — see "WhatsApp external requirements" below and `docs/WHATSAPP_LOGIN_SETUP.md`. The `fake` driver still exists for local/test only, and boot refuses it outside `NODE_ENV=development/test`. |
 | Payments | **OUT OF V1.** `PAYMENTS_ENABLED=false`; `/payments/*` answers 503. |
 | Ads (AdMob) | External. Owner supplies the AdMob app id and unit ids to the mobile app; the backend only serves pacing config via `GET /config/ads`. |
@@ -262,7 +262,10 @@ prints no secret, and reports every integrated posture.
 **IT ENFORCES THE V1 RELEASE POLICY, AND THAT IS NEW IN THIS MERGE.** Each
 feature branch, on its own, could only state its posture and let a human
 judge — a branch has no standing to decide whether a release without it is
-still the release. The integration settles it, so these are now **BLOCKERS**:
+still the release. The integration settles it, so these are now **BLOCKERS**.
+Google was promoted for a related but distinct reason: it always warned here
+while the **mobile** release preflight always required it, so the two halves of
+one release could disagree about whether a candidate was shippable.
 
 | Posture | Verdict |
 |---|---|
@@ -275,7 +278,10 @@ still the release. The integration settles it, so these are now **BLOCKERS**:
 | `REWARDS_SOCIAL_FACEBOOK_URL` missing | not required, not counted |
 | `CONTENT_ACCESS_MODE` not `free` (including unset) | **BLOCKER** — V1 ships no purchase flow, so per-row enforcement leaves every `premium` row listed and permanently unplayable |
 | `CONTENT_ACCESS_MODE=free` | `PASS` — the V1 posture |
-| HLS off, Google off | `PASS` / `WARNING` — deliberate postures, neither blocks |
+| `GOOGLE_AUTH_ENABLED` not `true` | **BLOCKER** — V1 ships Google login as a required sign-in method, and the mobile release preflight has always treated it as required |
+| Google enabled with empty/blank `GOOGLE_OAUTH_CLIENT_IDS` | **BLOCKER** (the boot contract also refuses it); reports a COUNT, never an id |
+| Google enabled with ≥1 client id | `PASS` — **CODE-CONFIGURED ONLY**, never Google-verified |
+| HLS off | `PASS` — a deliberate posture; HLS-ready rows fall back to their R2 source |
 
 **These are RELEASE rules, not BOOT rules.** `validateEnv` still starts a
 process with both features switched off, and development and test still run

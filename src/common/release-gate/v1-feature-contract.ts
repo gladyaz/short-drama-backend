@@ -23,6 +23,16 @@
  *      backend boots fine. A RELEASE GATE grades "is this V1", and V1 is
  *      specified with no purchase flow of any kind, so here it BLOCKS.
  *
+ * EVERY REQUIREMENT BELOW IS BLOCKING, INCLUDING GOOGLE LOGIN. Google was the
+ * single `recommended` item until the release-policy alignment that added
+ * `google-client-ids`, and it was recommended only because `preflight.ts`
+ * warned rather than blocked — a tool-agreement reason, not a product one.
+ * The confirmed V1 contract requires GOOGLE LOGIN and WHATSAPP LOGIN alike,
+ * the mobile release preflight has always treated Google as required, and a
+ * backend that certified a candidate the mobile side refuses is the defect
+ * this list exists to prevent. Both tools now block; `v1-feature-contract.spec.ts`
+ * pins that they cannot drift apart again.
+ *
  * IT DOES NOT RE-DERIVE ANY RULE IT CAN IMPORT. The required social platforms
  * come from `SOCIAL_MISSION_DEFINITIONS[].requiredForV1`; each URL's shape is
  * judged by `rejectSocialUrl`; the flag semantics mirror `configuration.ts`
@@ -67,10 +77,32 @@ export interface V1FeatureRequirement {
   readonly satisfiedBy: (raw: string | undefined) => boolean;
   /** What shipping the wrong value actually does to the app. Never generic. */
   readonly consequence: string;
+  /**
+   * How the value appears in a finding. Defaults to the value itself, which
+   * is right for every public flag here — `WHATSAPP_AUTH_ENABLED="false"` is
+   * the whole point of the sentence it appears in.
+   *
+   * `google-client-ids` overrides it. Those ids are NOT secrets (see that
+   * requirement's own note), but a release report is exactly the kind of
+   * output that gets pasted into a chat window, and a COUNT answers the only
+   * question this contract actually asks of them.
+   */
+  readonly describeValue?: (raw: string | undefined) => string;
 }
 
 /** Mirrors `configuration.ts`'s fail-closed, exact-string flag convention. */
 const isEnabled = (raw: string | undefined): boolean => raw === 'true';
+
+/**
+ * Whether a comma-separated variable carries at least one non-blank entry.
+ *
+ * Mirrors `configuration.ts`'s `parseCsvEnv` (split, trim, drop blanks) and
+ * `env.validation.ts`'s `hasNonEmptyEntry` exactly, because all three must
+ * agree on what "configured" means: a value of `",,"` parses to an EMPTY
+ * allowlist, and an empty allowlist is a verifier that accepts nothing.
+ */
+const hasNonEmptyCsvEntry = (raw: string | undefined): boolean =>
+  (raw ?? '').split(',').some((entry) => entry.trim().length > 0);
 
 export const V1_FEATURE_CONTRACT: readonly V1FeatureRequirement[] = [
   {
@@ -126,19 +158,93 @@ export const V1_FEATURE_CONTRACT: readonly V1FeatureRequirement[] = [
     feature: 'Google login',
     envKey: 'GOOGLE_AUTH_ENABLED',
     expected: 'true',
-    // RECOMMENDED, NOT BLOCKING, and deliberately the one item here that is
-    // not. `preflight.ts` has always warned on this rather than blocking, and
-    // promoting it inside a release gate would refuse a release that the
-    // preflight — the tool an operator has been running for weeks — calls
-    // clean. Email/password sign-in and WhatsApp both still work without it,
-    // so the app is degraded, not broken. Stated loudly, decided by a human.
-    strength: 'recommended',
+    // BLOCKING. This was the one `recommended` item in this list, and the
+    // reason it was recommended was never a product reason.
+    //
+    // THE OLD REASON WAS TOOL AGREEMENT: `preflight.ts` warned rather than
+    // blocked, so promoting it here would have made the gate refuse a
+    // candidate the preflight called clean. That hazard is real, and the fix
+    // for it is to move BOTH tools — which is what this change does — not to
+    // grade the product contract by whichever tool happened to be the more
+    // lenient of the two.
+    //
+    // THE PRODUCT CONTRACT HAS ONE ANSWER. Red Panda V1 ships GOOGLE LOGIN
+    // and WHATSAPP LOGIN, both REQUIRED. The MOBILE release preflight has
+    // always treated Google as required, so the previous severity let the
+    // backend certify a candidate that the other half of the same release
+    // refused — two halves of one release disagreeing about whether it is
+    // releasable, which is worse than either of them having no opinion.
+    //
+    // "EMAIL/PASSWORD STILL WORKS" IS TRUE AND IS NOT THE BAR — it is the
+    // same sentence that was true of WhatsApp before the integration settled
+    // that one. V1's login screen ships a Google button, and a build with
+    // this flag off answers 503 to every tap on it: a dead control in the
+    // shipped UI, with no error anywhere for a release owner to notice.
+    strength: 'blocking',
     satisfiedBy: isEnabled,
     consequence:
-      'POST /auth/google answers 503 GOOGLE_AUTH_DISABLED. Email/password ' +
-      'and WhatsApp sign-in are unaffected.',
+      'POST /auth/google and the Google link route answer 503 ' +
+      'GOOGLE_AUTH_DISABLED, so the app ships with the Google button on its ' +
+      'login screen dead. This is a RELEASE rule, not a boot rule: ' +
+      'development and test still start with no Google configuration at all.',
+  },
+  {
+    id: 'google-client-ids',
+    feature: 'Google client ids',
+    envKey: 'GOOGLE_OAUTH_CLIENT_IDS',
+    expected: 'at least one non-empty OAuth client id',
+    // UNCONDITIONAL HERE, CONDITIONAL AT BOOT — and that difference is
+    // exactly the difference between the two tools rather than a drift
+    // between them. `env.validation.ts` requires this only when
+    // `GOOGLE_AUTH_ENABLED=true`, because a process with Google switched off
+    // has no use for an audience allowlist. A V1 RELEASE CANDIDATE has Google
+    // switched on, by the requirement immediately above, so for a release the
+    // condition collapses and the ids are simply required.
+    //
+    // WHY IT IS A SEPARATE REQUIREMENT rather than folded into the flag: the
+    // two failures are different failures with different fixes. Flag off
+    // ships a dead button; flag on with an empty allowlist does not boot at
+    // all, and if it somehow did it would answer 401 to every legitimate
+    // sign-in. A single finding could only have named one of them.
+    //
+    // NOT A SECRET, and worth stating rather than leaving to be inferred. A
+    // Google OAuth client id ships inside the mobile app binary and is public
+    // by design; the OAuth client SECRET is never read anywhere in this
+    // codebase, because verifying an ID token needs only Google's public keys
+    // and the client id. Even so `describeValue` reports a COUNT — a release
+    // report gets pasted into chat windows, and the count is the whole of
+    // what this check actually asks.
+    strength: 'blocking',
+    satisfiedBy: hasNonEmptyCsvEntry,
+    describeValue: describeClientIds,
+    consequence:
+      'the process refuses to boot while GOOGLE_AUTH_ENABLED=true, and a ' +
+      'verifier constructed with an empty audience allowlist can accept no ' +
+      'token at all — every real sign-in would answer 401 ' +
+      'INVALID_GOOGLE_TOKEN. Set it to the OAuth client ids from the Red ' +
+      'Panda Google Cloud project, comma-separated; it MUST include the WEB ' +
+      'client id, which is what Android and iOS tokens are audienced to.',
   },
 ];
+
+/**
+ * A `GOOGLE_OAUTH_CLIENT_IDS` value rendered as a COUNT, never as a value.
+ *
+ * Reports the number of non-blank entries, which is precisely the fact
+ * `hasNonEmptyCsvEntry` graded — so a report is legible ("0 client ids"
+ * versus `(unset)` versus `",,"`) without carrying the ids themselves.
+ */
+function describeClientIds(raw: string | undefined): string {
+  if (raw === undefined) {
+    return '(unset)';
+  }
+
+  const count = raw
+    .split(',')
+    .filter((entry) => entry.trim().length > 0).length;
+
+  return `${count} non-empty client id(s)`;
+}
 
 /**
  * The social platforms V1 requires, read from the mission catalog rather than
@@ -174,12 +280,18 @@ export function checkV1FeatureContract(
 
   for (const requirement of V1_FEATURE_CONTRACT) {
     const raw = env[requirement.envKey];
+    // `describeValue` where a requirement supplies one — see its doc comment
+    // on `V1FeatureRequirement`; otherwise the value itself, which is a
+    // public flag in every remaining case.
+    const shown = requirement.describeValue
+      ? requirement.describeValue(raw)
+      : describe(raw);
 
     if (requirement.satisfiedBy(raw)) {
       findings.push({
         severity: 'PASS',
         check: `V1 contract — ${requirement.feature}`,
-        detail: `${requirement.envKey}=${describe(raw)} satisfies the V1 contract.`,
+        detail: `${requirement.envKey}=${shown} satisfies the V1 contract.`,
       });
       continue;
     }
@@ -187,7 +299,7 @@ export function checkV1FeatureContract(
     findings.push({
       severity: severityFor(requirement.strength),
       check: `V1 contract — ${requirement.feature}`,
-      detail: `${requirement.envKey}=${describe(raw)}, expected ${JSON.stringify(
+      detail: `${requirement.envKey}=${shown}, expected ${JSON.stringify(
         requirement.expected,
       )}. With the current value ${requirement.consequence}`,
     });

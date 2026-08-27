@@ -25,8 +25,12 @@ import {
  * than adding to an incomplete one — which is also why the WhatsApp cases now
  * pass `undefined` explicitly.
  *
- * GOOGLE SIGN-IN IS DELIBERATELY ABSENT: it warns rather than blocks, and one
- * of the assertions below pins exactly that.
+ * GOOGLE SIGN-IN IS NOW PART OF THE FIXTURE, and used not to be. It was
+ * absent while it merely warned; the V1 product contract requires Google
+ * login exactly as it requires WhatsApp login, so a fixture without it is no
+ * longer "complete" and every `ok === true` assertion in this file would be
+ * certifying a release whose Google button answers 503. The `Google sign-in`
+ * describe block below subtracts it back out, one way at a time.
  */
 const VALID_PRODUCTION_ENV: EnvRecord = {
   NODE_ENV: 'production',
@@ -40,6 +44,12 @@ const VALID_PRODUCTION_ENV: EnvRecord = {
   AUTH_AUDIT_IP_HASH_SECRET: 'c'.repeat(48),
   TRUST_PROXY_HOPS: '1',
   DEV_TOOLS_ENABLED: 'false',
+  // GOOGLE LOGIN V1 — required. The client id below is a fixture string, not
+  // a real OAuth client id, and nothing in this suite sends it anywhere. A
+  // Google client id is public by design in any case; no client SECRET exists
+  // anywhere in this codebase.
+  GOOGLE_AUTH_ENABLED: 'true',
+  GOOGLE_OAUTH_CLIENT_IDS: 'spec-fixture-not-real.apps.googleusercontent.com',
   // WHATSAPP LOGIN V1 — required. Fixture values only; none of these is a
   // real Meta credential and none is ever sent anywhere by this suite.
   WHATSAPP_AUTH_ENABLED: 'true',
@@ -61,6 +71,19 @@ const VALID_PRODUCTION_ENV: EnvRecord = {
   // whose catalog is half-locked.
   CONTENT_ACCESS_MODE: 'free',
 };
+
+/** The single finding for `check` — asserts there is exactly one. */
+function findingFor(
+  env: EnvRecord,
+  check: string,
+): { severity: string; check: string; detail: string } {
+  const matches = runProductionPreflight(env).findings.filter((finding) =>
+    finding.check.includes(check),
+  );
+
+  expect(matches).toHaveLength(1);
+  return matches[0];
+}
 
 function severityOf(env: EnvRecord, check: string): string[] {
   return runProductionPreflight(env)
@@ -328,9 +351,17 @@ describe('runProductionPreflight', () => {
   });
 
   /**
-   * Posture findings must never block: each is a choice an operator may
-   * legitimately have made, and a preflight that refuses a release over
-   * `GOOGLE_AUTH_ENABLED=false` is a preflight people learn to ignore.
+   * POSTURE FINDINGS SPLIT IN TWO, and the split is the whole subtlety of
+   * this section.
+   *
+   * A posture that remains a legitimate operator CHOICE — local storage, the
+   * HLS pipeline off — must never block: a preflight that refuses a release
+   * over a deliberate choice is a preflight people learn to ignore.
+   *
+   * A posture the V1 PRODUCT CONTRACT has already decided is not a choice.
+   * Google login, WhatsApp login, Rewards and the free catalog are what V1
+   * is, so "off" is not an option an operator may take and still call the
+   * result V1 — those block, and the assertions below pin which is which.
    */
   describe('feature posture', () => {
     it('WARNS but does not block on local storage in production', () => {
@@ -351,11 +382,70 @@ describe('runProductionPreflight', () => {
       ).toEqual(['PASS']);
     });
 
-    it('WARNS but does not block when Google sign-in is off', () => {
-      expect(severityOf(VALID_PRODUCTION_ENV, 'Google sign-in')).toEqual([
-        'WARNING',
-      ]);
-      expect(runProductionPreflight(VALID_PRODUCTION_ENV).ok).toBe(true);
+    /**
+     * GOOGLE LOGIN V1 — the named READY/BLOCKER verdict, promoted from the
+     * WARNING this check shipped before the release-policy alignment.
+     *
+     * The mobile release preflight has always treated Google as REQUIRED. A
+     * warning here let the backend certify a candidate the mobile side
+     * refused, so the two halves of one release could disagree about whether
+     * it was shippable. Both now block.
+     */
+    describe('Google sign-in', () => {
+      it('PASSES the complete Google posture, claiming only what it verified', () => {
+        expect(severityOf(VALID_PRODUCTION_ENV, 'Google sign-in')).toEqual([
+          'PASS',
+        ]);
+
+        const finding = findingFor(VALID_PRODUCTION_ENV, 'Google sign-in');
+        expect(finding.detail).toContain('CODE-CONFIGURED ONLY');
+      });
+
+      it.each([
+        ['false', 'false'],
+        ['unset', undefined],
+        ['a near-miss value', 'TRUE'],
+      ])('CRITICAL: BLOCKS when GOOGLE_AUTH_ENABLED is %s', (_label, value) => {
+        const env = { ...VALID_PRODUCTION_ENV, GOOGLE_AUTH_ENABLED: value };
+
+        expect(severityOf(env, 'Google sign-in')).toEqual(['BLOCKER']);
+        expect(runProductionPreflight(env).ok).toBe(false);
+      });
+
+      it.each([
+        ['unset', undefined],
+        ['blank', '   '],
+        ['comma-only', ',,'],
+      ])(
+        'CRITICAL: BLOCKS Google enabled with %s client ids',
+        (_label, value) => {
+          const env = {
+            ...VALID_PRODUCTION_ENV,
+            GOOGLE_OAUTH_CLIENT_IDS: value,
+          };
+
+          expect(severityOf(env, 'Google sign-in')).toEqual(['BLOCKER']);
+          // The boot contract refuses this too — a validator message rather
+          // than a per-feature one, which is why both are reported.
+          expect(runProductionPreflight(env).ok).toBe(false);
+          expect(findingFor(env, 'Google sign-in').detail).toContain(
+            'GOOGLE_OAUTH_CLIENT_IDS',
+          );
+        },
+      );
+
+      it('never echoes a client id, in any Google posture', () => {
+        const id = VALID_PRODUCTION_ENV.GOOGLE_OAUTH_CLIENT_IDS!;
+
+        for (const env of [
+          VALID_PRODUCTION_ENV,
+          { ...VALID_PRODUCTION_ENV, GOOGLE_AUTH_ENABLED: 'false' },
+        ]) {
+          expect(
+            JSON.stringify(runProductionPreflight(env).findings),
+          ).not.toContain(id);
+        }
+      });
     });
 
     /**

@@ -23,9 +23,12 @@
  * hostnames).
  *
  * IT DOES NOT INVENT REQUIREMENTS. The BLOCKER set is exactly "this will
- * not boot, or it will boot and be wrong". Everything an operator might
- * legitimately choose — no object storage, no Google sign-in — is a
- * WARNING, never a blocker.
+ * not boot, or it will boot and be wrong", plus the small, named set of
+ * RELEASE rules the V1 product contract settles (WhatsApp login, Google
+ * login, Rewards, the required social missions, the free catalog) — each
+ * marked as such where it is raised. Everything an operator might still
+ * legitimately choose — no object storage, no HLS pipeline — is a WARNING,
+ * never a blocker.
  */
 
 // Loopback/LAN/https rejection is deliberately NOT re-implemented here: it
@@ -537,10 +540,16 @@ function firstPlaceholderSegment(raw: string): string | null {
 }
 
 /**
- * Posture, not correctness. Each of these is a legitimate choice an
- * operator may have made deliberately, so none of them blocks — but each
- * one silently changes what the shipped app can do, and a release owner
- * should see it stated rather than discover it from a 503.
+ * Posture: the flags that silently change what the shipped app can do, and
+ * which a release owner should see stated rather than discover from a 503.
+ *
+ * MOST OF THESE ARE A CHOICE AND SO ONLY WARN — object storage, the HLS
+ * pipeline. THE V1 PRODUCT CONTRACT REMOVES THE CHOICE FROM FOUR OF THEM:
+ * Google login, WhatsApp login, Rewards (in `checkRewardsPosture`) and the
+ * free catalog are what V1 IS, so those block. Each says so in its own
+ * finding, and each is a RELEASE rule rather than a boot rule — `validateEnv`
+ * still starts a process with any of them switched off, which is what keeps
+ * development and test running with no external credentials at all.
  */
 function checkFeaturePosture(env: EnvRecord, add: AddFinding): void {
   if (env.STORAGE_DRIVER === 'r2') {
@@ -559,21 +568,7 @@ function checkFeaturePosture(env: EnvRecord, add: AddFinding): void {
     );
   }
 
-  if (env.GOOGLE_AUTH_ENABLED === 'true') {
-    add(
-      'PASS',
-      'Google sign-in',
-      'GOOGLE_AUTH_ENABLED=true with client ids configured.',
-    );
-  } else {
-    add(
-      'WARNING',
-      'Google sign-in',
-      'GOOGLE_AUTH_ENABLED is not "true" — POST /auth/google answers 503 ' +
-        'GOOGLE_AUTH_DISABLED. Email/password sign-in is unaffected.',
-    );
-  }
-
+  addGoogleFindings(env, add);
   addWhatsAppFindings(env, add);
 
   if (env.PAYMENTS_ENABLED === 'true') {
@@ -675,6 +670,103 @@ function checkFeaturePosture(env: EnvRecord, add: AddFinding): void {
         'grant routes. It must be false in production.',
     );
   }
+}
+
+/**
+ * GOOGLE LOGIN V1 — the named `Google sign-in` verdict.
+ *
+ * V1 SHIPS GOOGLE LOGIN AS A REQUIRED SIGN-IN METHOD, so "not enabled" is a
+ * BLOCKER, on exactly the reasoning `addWhatsAppFindings` below already
+ * states for the other half of the same login screen: the product is free
+ * content + ads + rewards + Google + WhatsApp, and a preflight that answered
+ * "no blockers" for a build whose Google button answers 503 would be
+ * certifying a V1 that is not V1.
+ *
+ * WHY THIS WARNED UNTIL NOW. The check predates the V1 integration, when "no
+ * Google sign-in" was genuinely one of the postures an operator might
+ * legitimately choose, and the file's own rule — everything optional WARNS —
+ * was applied to it correctly at the time. It is not a posture Red Panda V1
+ * can choose. THE MOBILE RELEASE PREFLIGHT HAS ALWAYS TREATED GOOGLE AS
+ * REQUIRED, so a WARNING here let the backend certify a candidate the other
+ * half of the same release refused — two tools disagreeing about one
+ * artefact, which is the worst state a release check can be in. Nothing was
+ * weakened to get here: a posture that used to warn now blocks, and no
+ * blocker became a warning.
+ *
+ * A RELEASE RULE, NOT A BOOT RULE, exactly like the WhatsApp case below.
+ * `validateEnv` still starts a process with `GOOGLE_AUTH_ENABLED` unset, so
+ * development, test and CI keep running with no Google configuration at all
+ * and no developer needs a Google Cloud project to work on this repository.
+ *
+ * THE SECOND FINDING IS NOT REDUNDANT WITH THE BOOT CONTRACT. `validateEnv`
+ * already refuses `GOOGLE_AUTH_ENABLED=true` with an empty
+ * `GOOGLE_OAUTH_CLIENT_IDS`, and that refusal surfaces here as a `boot
+ * contract` blocker — but as a validator message an operator has to decode.
+ * This states it against the feature it belongs to, which is the same
+ * legible-per-feature reading the WhatsApp checks give of rules the boot
+ * contract also enforces.
+ *
+ * IT CHECKS SHAPE, NEVER EXTERNAL VALIDITY, AND NEVER ECHOES A CLIENT ID.
+ * Whether an id exists in a Google Cloud project, whether the consent screen
+ * is published, and whether the Play App Signing SHA-1 matches are facts only
+ * Google holds; this function refuses to guess at them and says so. (The ids
+ * are not secrets — one ships in the mobile binary — but a count is all this
+ * check has graded, and a report gets pasted into chat windows.)
+ */
+function addGoogleFindings(env: EnvRecord, add: AddFinding): void {
+  const CHECK = 'Google sign-in';
+
+  if (env.GOOGLE_AUTH_ENABLED !== 'true') {
+    add(
+      'BLOCKER',
+      CHECK,
+      'GOOGLE_AUTH_ENABLED is not "true" — POST /auth/google and the Google ' +
+        'link route answer 503 GOOGLE_AUTH_DISABLED, so the app ships with ' +
+        'the Google button on its login screen dead. Red Panda V1 ships ' +
+        'Google login as a REQUIRED sign-in method alongside WhatsApp, and ' +
+        'the mobile release preflight already treats it as required, so this ' +
+        'is not a shippable V1 posture. Set GOOGLE_AUTH_ENABLED=true with ' +
+        'GOOGLE_OAUTH_CLIENT_IDS (docs/V1_STAGING_RUNBOOK.md §1), or ship a ' +
+        'release that is not V1. Email/password sign-in is unaffected either ' +
+        'way, which is why this is a RELEASE rule and not a boot rule.',
+    );
+    return;
+  }
+
+  // Mirrors `configuration.ts`'s `parseCsvEnv` and `env.validation.ts`'s
+  // `hasNonEmptyEntry`: a value of "," parses to an EMPTY allowlist, and an
+  // empty allowlist is a verifier that can accept nothing.
+  const clientIdCount = (env.GOOGLE_OAUTH_CLIENT_IDS ?? '')
+    .split(',')
+    .filter((entry) => entry.trim().length > 0).length;
+
+  if (clientIdCount === 0) {
+    add(
+      'BLOCKER',
+      CHECK,
+      'GOOGLE_AUTH_ENABLED=true with no usable GOOGLE_OAUTH_CLIENT_IDS. The ' +
+        'boot contract refuses this: the value is the exact-match `aud` ' +
+        'allowlist, and a verifier built with an empty one would answer 401 ' +
+        'INVALID_GOOGLE_TOKEN to every legitimate sign-in. Set it to the ' +
+        'OAuth client ids from the Red Panda Google Cloud project, ' +
+        'comma-separated — it MUST include the WEB client id, which is what ' +
+        'Android and iOS tokens are audienced to. The ids are public; no ' +
+        'client SECRET exists or is read anywhere in this codebase.',
+    );
+    return;
+  }
+
+  add(
+    'PASS',
+    CHECK,
+    `READY — GOOGLE_AUTH_ENABLED=true with ${clientIdCount} client id(s) ` +
+      'configured. CODE-CONFIGURED ONLY: this cannot verify that any id ' +
+      'exists in a Google Cloud project, that the OAuth consent screen is ' +
+      'published, or that the Android client carries the Play App Signing ' +
+      'SHA-1. Prove those with one real Google sign-in against the deployed ' +
+      'origin before release — a 401 INVALID_GOOGLE_TOKEN with everything ' +
+      'else correct almost always means the WEB client id is missing here.',
+  );
 }
 
 /**

@@ -198,7 +198,7 @@ export const RELEASE_GATE_STEPS: readonly ReleaseGateStepDescriptor[] = [
     id: 'contract',
     title: 'V1 feature contract',
     alwaysRuns: true,
-    what: 'WhatsApp, Rewards, required social missions, free catalog, payments off.',
+    what: 'Google, WhatsApp, Rewards, required social missions, free catalog, payments off.',
   },
   {
     id: 'leak-scan',

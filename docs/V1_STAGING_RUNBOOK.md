@@ -24,6 +24,7 @@ restate what these already cover:
 | Rewards wire contract, honesty limits | `docs/rewards-api-contract.md` |
 | Auth/identity wire contract, Google client ids | `docs/auth-identity-api-contract.md` |
 | Moving media into R2 | `docs/R2_MEDIA_MIGRATION.md` |
+| The one read-only command that grades a release before it ships | `docs/V1_RELEASE_GATE.md` |
 
 ---
 
@@ -849,6 +850,10 @@ WhatsApp is not V1.
 This distinction is the point of the whole document. Do not let one be read as
 the other.
 
+**`npm run release:gate` is the command that establishes this half of the
+table** — it runs every offline check listed below in one pass and prints the
+same distinction in its verdict. See `docs/V1_RELEASE_GATE.md`.
+
 ### CODE-VALID (proven offline, with no external service)
 
 - The full migration history applies from zero and lands exactly on the
@@ -861,6 +866,10 @@ the other.
   carrying `DATABASE_URL_TEST`, or running a non-free content mode — and
   reports **0 blockers** for a structurally complete one.
 - Build, lint and the unit suite are green.
+- The migration folder is internally consistent (every migration has non-empty
+  SQL, timestamps increase monotonically, the lock provider matches the
+  schema), and no loopback address, LAN address, reserved domain, template
+  placeholder or hardcoded credential is compiled into release-bound source.
 
 ### EXTERNAL SERVICE VERIFIED (**nothing** — none of this has happened)
 
@@ -876,7 +885,7 @@ the other.
 - The social profile URLs are not known, so no configured mission has ever
   pointed at a real Red Panda account.
 
-A preflight exit code of 0 means *this configuration would boot and serve over
-HTTPS*. It does not mean the token works, the template is approved, the bucket
+A release-gate or preflight exit code of 0 means *this configuration would boot
+and serve over HTTPS*. It does not mean the token works, the template is approved, the bucket
 has bytes in it, or that anything plays on a phone. Only the smoke matrix
 against a deployed origin, and one real OTP, can say that.

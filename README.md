@@ -2904,6 +2904,51 @@ You can also open a `playbackUrl` from `GET /videos/feed` directly in a
 browser to confirm the real company video plays and that seeking (which
 relies on Range requests) works.
 
+## Release gate (Red Panda V1)
+
+```bash
+npm run release:gate                          # CI / structural (the default)
+npm run release:gate -- --mode=local          # grade your working copy + .env
+npm run release:gate -- --mode=production     # grade a real candidate config
+npm run release:gate -- --list                # print the check list, run nothing
+```
+
+One deterministic, **read-only** command run before a staging or production
+deployment. It orchestrates the build, the lint, the database-free
+production-config and HLS contract suites, `prisma validate`, an offline
+migration-history check, the full `production:preflight` verdict, the V1
+feature contract (WhatsApp / Rewards / the three required social missions /
+`CONTENT_ACCESS_MODE=free` / `PAYMENTS_ENABLED=false`), and a classified leak
+scan of release-bound source.
+
+It **never** deploys, pushes, migrates, seeds, enqueues a job, writes to R2 or
+Redis, sends a WhatsApp message, or prints a secret. It connects to a database
+only when one is named explicitly in `RELEASE_GATE_DATABASE_URL`, and even then
+only to *read* `prisma migrate status`.
+
+A check that could not run reports **SKIPPED** — never a pass:
+
+```bash
+# opt in to the unit suites that need Postgres (refused in --mode=production,
+# and never defaulted — the gate will not pick a database for you)
+npm run release:gate -- --mode=local --with-db-tests
+
+# opt in to a read-only migration-status check against a database you name
+RELEASE_GATE_DATABASE_URL='postgresql://…/short_drama_staging' \
+  npm run release:gate -- --mode=production
+```
+
+Exit code `0` means no blockers; `1` means at least one. **That is not the
+same as "it works":**
+
+| Level | What it means | Proven by |
+|---|---|---|
+| ENGINEERING READY | the code and rules hold together | `npm run release:gate` |
+| EXTERNAL CONFIG READY | a real candidate configuration is complete and well-shaped | `release:gate --mode=production` |
+| DEPLOYED / VERIFIED | a real origin serves, a real OTP arrives, an episode plays | `npm run smoke:production` + the staging smoke matrix |
+
+Full documentation: [`docs/V1_RELEASE_GATE.md`](docs/V1_RELEASE_GATE.md).
+
 ## Database (Phase 8 / Phase 8P)
 
 The backend uses Prisma with **PostgreSQL** as its only database provider

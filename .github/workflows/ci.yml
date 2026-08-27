@@ -156,3 +156,69 @@ jobs:
           path: ci-logs/
           if-no-files-found: ignore
           retention-days: 5
+
+  release-gate:
+    name: V1 release gate (structural)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # DELIBERATELY NO `services:` BLOCK, NO DATABASE, AND NO SECRETS.
+    #
+    # That absence is the point of this job. `npm run release:gate -- --mode=ci`
+    # grades a SYNTHETIC configuration built in
+    # src/common/release-gate/release-mode.ts and ignores the ambient
+    # environment entirely, so its verdict is a fact about the COMMIT rather
+    # than about whatever this runner happens to export. Giving it a database
+    # or a secret would not make it stricter — it would make the result depend
+    # on the runner, which is exactly what it is designed not to do.
+    #
+    # It is a SEPARATE JOB from quality-gate, not an extra step in it, for two
+    # reasons: it needs none of that job's Postgres/seed/fixture setup, and a
+    # release-policy failure should be legible on its own rather than buried in
+    # a job whose name says "tests".
+    #
+    # NOTHING HERE DEPLOYS. No external Meta, Google, AdMob, R2 or Redis
+    # service is contacted; no migration is applied; no message is sent. The
+    # gate refuses to connect to a database at all unless one is named in
+    # RELEASE_GATE_DATABASE_URL, which is deliberately never set here.
+    #
+    # The database-backed unit and e2e suites are NOT duplicated here — the
+    # quality-gate job above already runs them against its own throwaway
+    # Postgres. This job runs the database-free half plus the policy checks.
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # `prisma.config.ts` reads DATABASE_URL through `env('DATABASE_URL')` and
+      # throws when it is absent, so `prisma generate` needs the variable to
+      # exist. The value below is the same non-resolvable `.invalid` host the
+      # gate itself uses (RFC 6761), so nothing can connect to it by accident.
+      - name: Generate Prisma client
+        env:
+          DATABASE_URL: postgresql://release_gate_structural:release_gate_structural@release-gate.invalid:5432/release_gate_structural_only
+        run: npx prisma generate
+
+      - name: Release gate (structural)
+        run: |
+          set -o pipefail
+          mkdir -p ci-logs
+          npm run release:gate 2>&1 | tee ci-logs/release-gate.log
+
+      - name: Upload release gate log on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-gate-log-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-logs/
+          if-no-files-found: ignore
+          retention-days: 5

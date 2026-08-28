@@ -27,6 +27,7 @@ import { UpdateMediaMetadataDto } from './dto/update-media-metadata.dto';
 import {
   AdminMediaDto,
   AdminMediaListResponseDto,
+  AdminMediaStatusDto,
   CreateMediaUploadResponseDto,
   MediaAssetUploadResponseDto,
 } from './media.types';
@@ -89,6 +90,23 @@ export class AdminMediaController {
   }
 
   /**
+   * Work unit "ADMIN MEDIA INGESTION": the narrow ingestion-status payload a
+   * dashboard polls while a row uploads/transcodes. A distinct, more
+   * specific path than the bare `@Get(':id')` above (path-shape based
+   * matching means `:id/status` never collides with it), mirroring the
+   * existing two-segment `:id/complete-upload`, `:id/publish`,
+   * `:id/unpublish` convention.
+   *
+   * Read-only and object-storage-free: it issues no presigned URL and makes
+   * no R2 call, so polling it is cheap and can never hand out upload or
+   * download authorization.
+   */
+  @Get(':id/status')
+  getStatus(@Param('id') id: string): Promise<AdminMediaStatusDto> {
+    return this.adminMediaService.getStatus(id);
+  }
+
+  /**
    * Work unit 11E-2: a partial metadata edit. Body validation (per-field
    * constraints, "at least one field", the global whitelist rejecting
    * unknown/immutable fields) all happen before `AdminMediaService` is ever
@@ -140,6 +158,30 @@ export class AdminMediaController {
   @Post(':id/unpublish')
   unpublish(@Param('id') id: string): Promise<AdminMediaDto> {
     return this.adminMediaService.unpublish(id);
+  }
+
+  /**
+   * Work unit "ADMIN MEDIA INGESTION": re-queues a FAILED transcode against
+   * the source already in R2 — see `AdminMediaService.retryTranscode` for
+   * the full guard order and the compare-and-swap that makes a
+   * double-clicked retry enqueue exactly once.
+   *
+   * Deliberately issues NO presigned URL: a retry re-processes bytes that
+   * are already stored and verified, so it needs no new upload
+   * authorization. An operator whose source is genuinely gone is told to
+   * start a new upload (a `createUpload` call) rather than being handed a
+   * PUT URL from a retry route.
+   *
+   * `200`, not `202`: the durable state change (`failed -> queued`) has
+   * committed by the time this responds. Only the queue handoff is
+   * best-effort, and a lost handoff is recovered by
+   * `TranscodeReconcilerService`, so the caller is never left uncertain
+   * about whether the retry was accepted.
+   */
+  @HttpCode(HttpStatus.OK)
+  @Post(':id/retry-transcode')
+  retryTranscode(@Param('id') id: string): Promise<AdminMediaDto> {
+    return this.adminMediaService.retryTranscode(id);
   }
 
   @Post(':id/cover')

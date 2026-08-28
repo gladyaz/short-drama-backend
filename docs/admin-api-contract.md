@@ -29,6 +29,30 @@ exactly what is implemented on `short-drama-backend` as of commit `7d58b8b`
 status codes, and error codes that actually exist in this repository today —
 nothing here is aspirational.
 
+**Re-freeze, 2026-08-28 (work unit "ADMIN MEDIA INGESTION"):** documents the
+admin media INGESTION surface — the direct-to-R2 upload → finalize → enqueue →
+status → retry workflow. Three changes, all **additive**; no existing route,
+field, shape, or status code was removed or repurposed.
+
+1. **New:** `GET /admin/media/:id/status` — the narrow, poll-friendly
+   ingestion status payload (`AdminMediaStatusDto`).
+2. **New:** `POST /admin/media/:id/retry-transcode` — re-queues a FAILED
+   transcode against the source already in R2, without requiring a re-upload.
+3. **New field:** `AdminMediaDto.processing` (`AdminMediaProcessingDto`) —
+   the same status block, embedded on every admin media response, so a list
+   view can badge every row without an extra request per row.
+4. **Tightened:** `POST /admin/media/:id/complete-upload` now also rejects a
+   present-but-EMPTY (0-byte) object (`409 UPLOAD_OBJECT_EMPTY`) and a row
+   whose `objectStorageKey` is not its own derived source key
+   (`409 MEDIA_SOURCE_KEY_MISMATCH`). Both are new REFUSALS of requests that
+   previously could succeed; no previously-refused request now succeeds, and
+   **no previously-returned error code changed**. In particular a 0-byte
+   object on a row that HAS a recorded `expectedSizeBytes` still answers
+   `409 UPLOAD_SIZE_MISMATCH` exactly as before — the emptiness check is
+   ordered after the size check specifically to preserve that, so
+   `UPLOAD_OBJECT_EMPTY` is reachable only on a legacy row where the size
+   comparison is skipped.
+
 **Consumers of this freeze:**
 - **11F-6** (`short-drama-admin` repo) — wires the admin dashboard's badged
   surfaces to the real endpoints described below. Real R2 byte upload stays
@@ -367,7 +391,22 @@ values, none required.
   in tests) reports no object at that key.
 - `400 INVALID_MEDIA_LIFECYCLE_TRANSITION` if the row is not currently in a
   state that can transition to `ready` (only `draft → ready` is a valid
-  edge — see the lifecycle table below).
+  edge — see the lifecycle table below). This is what makes a DUPLICATE
+  finalize safe: the second call is refused here, before any processing
+  intent is recorded, so it can never enqueue a second transcode.
+- `409 UPLOAD_OBJECT_EMPTY` (2026-08-28 re-freeze) if an object IS present at
+  the key but is 0 bytes. Checked AFTER the size/content-type expectation
+  checks above, deliberately: a row with a recorded `expectedSizeBytes` keeps
+  answering the more informative `UPLOAD_SIZE_MISMATCH` for an empty object,
+  unchanged. This code is therefore reachable only on a LEGACY row
+  (`expectedSizeBytes` null, pre-11L-B2) — the one case where the size
+  comparison is skipped and an empty upload could otherwise have been
+  promoted to `ready` and queued.
+- `409 MEDIA_SOURCE_KEY_MISMATCH` (2026-08-28 re-freeze) if the row's stored
+  `objectStorageKey` is not the deterministic key its own id derives
+  (`admin-media/<id>/source`). Unreachable through this API (the key is
+  always minted server-side); enforced as a standing guarantee that one
+  media record can never finalize against another record's object.
 - `404 VIDEO_NOT_FOUND` for an unknown `id`.
 
 Returns `200 AdminMediaDto` (`@HttpCode(200)` — overrides Nest's default
@@ -393,6 +432,66 @@ Lifecycle transitions via `MediaLifecycleService.assertTransition`, both
 - Unknown `id` → `404 VIDEO_NOT_FOUND`.
 
 Both return `200 AdminMediaDto` (updated).
+
+### `GET /admin/media/:id/status` (NEW, 2026-08-28 re-freeze)
+
+The narrow ingestion-status payload, intended for POLLING while a row uploads
+or transcodes. Returns `200 AdminMediaStatusDto`, or `404 VIDEO_NOT_FOUND`.
+
+```
+{ id: string,
+  lifecycleState: string,
+  processing: AdminMediaProcessingDto }
+```
+
+Read-only and object-storage-free: it makes NO R2 call, issues NO presigned
+URL, and exposes no bucket, endpoint, or credential — so polling it is cheap
+and can never become a way to obtain upload or download authorization.
+
+The identical `processing` block is embedded on every `AdminMediaDto`, so a
+dashboard that already holds the full row (e.g. from `GET /admin/media`) does
+not need this route to badge it.
+
+### `POST /admin/media/:id/retry-transcode` (NEW, 2026-08-28 re-freeze)
+
+Re-queues a FAILED transcode against the source object **already in R2** — a
+retry never requires the operator to upload the file again, and this route
+deliberately returns NO presigned upload URL. No request body.
+
+Accepted only when ALL of the following hold (the same predicate reported as
+`processing.canRetry`, so the dashboard's Retry affordance and the server
+agree):
+
+- transcoding is enabled on this deployment,
+- `processingState === "failed"` (the PIPELINE failed),
+- `lifecycleState` is neither `draft` (upload never finalized) nor `failed`
+  (terminal editorially),
+- the source object still exists in R2 and is non-empty.
+
+Refusals:
+
+- `409 MEDIA_TRANSCODE_NOT_ENABLED` — `TRANSCODE_ENABLED` is off, so there is
+  no queue to place work on. Checked FIRST, so an operator gets the real
+  reason rather than a misleading "not retryable".
+- `409 MEDIA_TRANSCODE_NOT_RETRYABLE` — the row is not in a retryable state:
+  already `ready`, currently `running`, already `queued`, never processed, or
+  its upload was never finalized. **The same code is returned when a
+  concurrent retry won the race** — that is what makes a double-clicked
+  Retry enqueue exactly once (a compare-and-swap on
+  `(processingVersion, processingState="failed")`; the loser matches zero
+  rows and is refused here).
+- `409 MEDIA_FILE_NOT_FOUND` — the source object has since been deleted from
+  R2. Start a new upload instead of retrying.
+- `409 UPLOAD_OBJECT_EMPTY` — the stored source object is 0 bytes.
+- `409 MEDIA_SOURCE_KEY_MISMATCH` — as for `complete-upload` above.
+- `404 VIDEO_NOT_FOUND` for an unknown `id`.
+
+On success returns `200 AdminMediaDto` (`@HttpCode(200)`), with
+`processing.status === "queued"` and `processing.version` incremented by one.
+The durable `failed → queued` state change has COMMITTED by the time this
+responds; only the queue handoff is best-effort, and a lost handoff is
+recovered by `TranscodeReconcilerService` on a later sweep — so a
+Redis outage never fails an otherwise valid retry.
 
 ### `POST /admin/media/:id/cover` / `POST /admin/media/:id/thumbnail`
 
@@ -436,10 +535,62 @@ never does (`lifecycleState`, object-storage keys, `accessTierOverride`).
 | `height` | number \| null |
 | `accessTierOverride` | `"free"` \| `"premium"` \| null |
 | `accessTier` | `"free"` \| `"premium"` | ADDITIVE (work unit "Episode Access-Tier + Category Contract Hardening") — the resolved/effective tier, computed via the same `resolveAccessTier` function the public `VideoResponseDto.accessTier` field uses; always in agreement with it for the same episode |
+| `processing` | `AdminMediaProcessingDto` | ADDITIVE (2026-08-28 re-freeze, work unit "ADMIN MEDIA INGESTION") — the ingestion/transcoding status block; see its own table below |
 
 Note: `sortOrder`, `storageKey`, and `likeCount` are `Video` columns that
 exist in the database but are **not** part of `AdminMediaDto` and are not
 writable via any route in this section.
+
+## `AdminMediaProcessingDto` (`src/media/media.types.ts`, 2026-08-28 re-freeze)
+
+The ingestion/transcoding status block. Returned on its own by
+`GET /admin/media/:id/status` and embedded on every `AdminMediaDto`.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `status` | `AdminMediaIngestionStatus` | The DERIVED dashboard-facing status — the one field a badge should switch on. See the table below |
+| `state` | string \| null | The RAW `Video.processingState` column, verbatim (`null` = no pipeline was ever requested) |
+| `version` | number | `Video.processingVersion` — the generation counter every worker compare-and-swap is guarded on |
+| `step` | string \| null | Display-only progress within a `running` generation (`"probing"`, a rung name, `"packaging"`, `"uploading"`, `"verifying"`, `"poster"`); `null` outside a run |
+| `attempts` | number | Attempts made against the CURRENT generation |
+| `maxAttempts` | number \| null | `TRANSCODE_MAX_ATTEMPTS`, so a UI can render "attempt 2/3"; `null` when transcoding is disabled |
+| `errorCode` | string \| null | Bounded, machine-stable `TranscodeErrorCode` — never a raw exception or stack trace |
+| `errorMessage` | string \| null | Short, secret-free companion to `errorCode` |
+| `startedAt` | ISO-8601 string \| null | |
+| `completedAt` | ISO-8601 string \| null | |
+| `hlsReady` | boolean | `processingState === "ready"` AND `hlsMasterKey` set — exactly the condition publishing is gated on, so a UI can explain a disabled Publish button instead of surfacing a 409 |
+| `hlsMasterKey` | string \| null | Object key of the current promoted generation's master playlist |
+| `renditions` | `{name,width,height,bandwidth}[]` \| null | The renditions ACTUALLY produced for the current `hlsMasterKey` generation |
+| `profileVersion` | string \| null | Which rendition-ladder profile produced the current generation |
+| `canRetry` | boolean | Whether `POST /admin/media/:id/retry-transcode` would accept this row (see that route). Excludes the "does the source still exist in R2?" condition, which needs a network round trip — so an enabled button means "the server will consider this", not "this will certainly succeed" |
+
+**No credential material.** Every field above is a derived status, a bounded
+code, a counter, a timestamp, or an object KEY. This block never carries a
+bucket name, an endpoint, a presigned URL, or an access key.
+
+### Ingestion status (`AdminMediaIngestionStatus`)
+
+`status` is a **derived projection** of the two state columns that already
+exist — `Video.lifecycleState` (editorial) and `Video.processingState`
+(pipeline). It is NOT a third stored column, deliberately: a stored copy
+could silently disagree with the two columns that actually drive behavior.
+Four of its seven values reuse the underlying column values verbatim.
+
+| `status` | Derived from | Suggested dashboard label |
+|---|---|---|
+| `draft` | `lifecycleState = "draft"`, no `objectStorageKey` | Uploading |
+| `awaiting_upload` | `lifecycleState = "draft"`, upload key issued, bytes not yet verified | Uploading |
+| `uploaded` | upload finalized, `processingState = null` (no pipeline — legacy row, or `TRANSCODE_ENABLED` off) | Queued |
+| `queued` | `processingState = "queued"` | Queued |
+| `running` | `processingState = "running"` | Processing |
+| `ready` | `processingState = "ready"` | Ready |
+| `failed` | `processingState = "failed"`, OR `lifecycleState = "failed"` | Failed |
+
+Precedence: `lifecycleState = "failed"` wins outright (it is terminal);
+otherwise `lifecycleState = "draft"` wins (the bytes are not verified yet, so
+the row is still "uploading" whatever the pipeline column says); otherwise
+the pipeline column decides. An unrecognised `processingState` degrades to
+`uploaded` rather than throwing — the raw value is still reported in `state`.
 
 ## Admin series (`src/series/series.controller.ts`, `@Controller('admin/series')`)
 
@@ -873,6 +1024,10 @@ caught by the filter's dedicated exposed-client-error branch and returned as
 | `SERIES_COVER_KEY_INVALID` | 400 | `POST /admin/series/:id/cover/complete`: `key` does not belong to this series' cover prefix (2026-08-14 re-freeze) |
 | `SERIES_COVER_CONTENT_TYPE_NOT_ALLOWED` | 409 | `POST /admin/series/:id/cover/complete`: the object's real `Content-Type` is not an allowed cover MIME type (2026-08-14 re-freeze) |
 | `SERIES_COVER_SIZE_OUT_OF_BOUND` | 409 | `POST /admin/series/:id/cover/complete`: the object's real size is outside `1`–`10485760` bytes (2026-08-14 re-freeze) |
+| `UPLOAD_OBJECT_EMPTY` | 409 | `complete-upload` (legacy rows only — see that route) / `retry-transcode`: an object IS present at the key but is 0 bytes (2026-08-28 re-freeze) |
+| `MEDIA_SOURCE_KEY_MISMATCH` | 409 | `complete-upload`/`retry-transcode`: the row's `objectStorageKey` is not the source key its own id derives (2026-08-28 re-freeze) |
+| `MEDIA_TRANSCODE_NOT_ENABLED` | 409 | `retry-transcode`: `TRANSCODE_ENABLED` is off, so there is no queue to retry on (2026-08-28 re-freeze) |
+| `MEDIA_TRANSCODE_NOT_RETRYABLE` | 409 | `retry-transcode`: the row is not in a retryable state, or a concurrent retry won the compare-and-swap (2026-08-28 re-freeze) |
 | `SERIES_COVER_KEY_SUPERSEDED` | 409 | `POST /admin/series/:id/cover/complete`: `key` is well-formed for this series but matches neither its current `pendingCoverImageKey` nor its current `coverImageKey` — a superseded/stale/replayed key (2026-08-15, fix cycle 1). Also returned when a completion LOSES the final atomic compare-and-set, i.e. the intent was removed or replaced while this completion was verifying the object in storage (2026-08-18 hardening) — deliberately the same code for the same semantic state |
 
 ## Explicitly still GATED (do NOT wire as real in 11F-6)

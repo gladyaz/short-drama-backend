@@ -821,4 +821,64 @@ export enum AppErrorCode {
    * in time" are different things to tell a user who paid points.
    */
   REWARD_PERK_EXPIRED = 'REWARD_PERK_EXPIRED',
+  /**
+   * Work unit "ADMIN MEDIA INGESTION": returned (409) by
+   * `POST /admin/media/:id/complete-upload` when the object DOES exist at
+   * the expected key but is ZERO bytes.
+   *
+   * Distinct from `MEDIA_FILE_NOT_FOUND` (nothing is there at all) and from
+   * `UPLOAD_SIZE_MISMATCH` (an object whose size disagrees with the recorded
+   * expectation).
+   *
+   * REACHABLE ONLY ON A LEGACY ROW from `completeUpload`. A row created since
+   * work unit 11L-B2 always has an `expectedSizeBytes`, so a 0-byte object
+   * there fails the SIZE comparison first and still answers
+   * `UPLOAD_SIZE_MISMATCH` — the more informative message, and the answer
+   * that route's existing tests have always asserted. A row created BEFORE
+   * 11L-B2 has `expectedSizeBytes = null`: the size comparison is skipped
+   * entirely, and an empty object would otherwise have satisfied the
+   * existence-only fallback and been promoted to `ready` and queued, where it
+   * can only fail much later inside a worker. This code closes exactly that
+   * hole, without reclassifying any case the size check already covered.
+   *
+   * `retryTranscode` also raises it, where there is no expectation to compare
+   * against at all — a stored source that is now empty is never re-queued.
+   */
+  UPLOAD_OBJECT_EMPTY = 'UPLOAD_OBJECT_EMPTY',
+  /**
+   * Work unit "ADMIN MEDIA INGESTION": returned (409) when a media row's
+   * stored `objectStorageKey` is not the deterministic source key that row's
+   * OWN id derives (`buildSourceObjectKey(id)`).
+   *
+   * A defense-in-depth ownership assertion, not a reachable state today:
+   * the key is minted server-side from a freshly generated id at
+   * `createUpload` time and never accepted from a client, and the R2
+   * migration tool writes the identical `admin-media/<id>/source` convention.
+   * It is enforced anyway so that neither a future write path nor a
+   * hand-edited row can ever cause one media record's completion or retry to
+   * read — or enqueue a transcode against — ANOTHER record's source object.
+   */
+  MEDIA_SOURCE_KEY_MISMATCH = 'MEDIA_SOURCE_KEY_MISMATCH',
+  /**
+   * Work unit "ADMIN MEDIA INGESTION": returned (409) by
+   * `POST /admin/media/:id/retry-transcode` when this deployment has
+   * `TRANSCODE_ENABLED` off. There is no queue to place work on, so the
+   * request is refused loudly rather than answered with a success that
+   * would leave the row `"queued"` forever with nothing able to claim it.
+   */
+  MEDIA_TRANSCODE_NOT_ENABLED = 'MEDIA_TRANSCODE_NOT_ENABLED',
+  /**
+   * Work unit "ADMIN MEDIA INGESTION": returned (409) by
+   * `POST /admin/media/:id/retry-transcode` for a row that is not in a
+   * retryable state — the upload was never finalized, no pipeline was ever
+   * requested, or the current generation is already `queued`, `running`, or
+   * `ready`. Deliberately ONE code for all of those: the message states the
+   * actual current state, and the caller's remedy is the same in every case
+   * (wait, or look at the row) rather than being per-case.
+   *
+   * This is what makes the retry route idempotent under a double click: the
+   * FIRST call moves the row `failed -> queued`, so the second sees
+   * `queued` and is refused here instead of enqueuing a second generation.
+   */
+  MEDIA_TRANSCODE_NOT_RETRYABLE = 'MEDIA_TRANSCODE_NOT_RETRYABLE',
 }

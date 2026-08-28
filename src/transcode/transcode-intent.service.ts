@@ -121,6 +121,77 @@ export class TranscodeIntentService {
   }
 
   /**
+   * Work unit "ADMIN MEDIA INGESTION": the guarded re-queue that backs
+   * `POST /admin/media/:id/retry-transcode` — the ONLY way a row leaves the
+   * terminal `processingState = "failed"`.
+   *
+   * WHY NOT JUST CALL `recordIntent`. `recordIntent` is a plain `update` by
+   * id: it bumps the version unconditionally, because its caller
+   * (`completeUpload`) has already been serialised by the editorial state
+   * machine — `assertTransition` guarantees only ONE `draft -> ready`
+   * transition can ever run for a row, so no second concurrent caller can
+   * exist there. A RETRY has no such upstream guard: it is a button an
+   * operator can double-click, and two dashboards can hold the same failed
+   * row open at once. Reusing `recordIntent` there would let both calls
+   * succeed and produce two consecutive generations — the older of which
+   * every worker CAS would then correctly refuse, but only after a worker
+   * had already claimed and begun it. Wasted machine time, and a confusing
+   * row history.
+   *
+   * So this is a compare-and-swap instead: a single `updateMany` guarded on
+   * BOTH the expected `processingVersion` AND `processingState: "failed"`.
+   * Concurrent retries therefore resolve the same way every other
+   * transition in this service does — the first to land matches the row and
+   * increments; every other one matches ZERO rows, returns `null`, and is
+   * reported to its caller as "not retryable" rather than silently
+   * enqueueing a duplicate. Exactly-once enqueue per retry, enforced by the
+   * database rather than by application-level checking.
+   *
+   * Returns the NEW `processingVersion` on success. That value is derived as
+   * `expectedVersion + 1` rather than read back, which is exact and not an
+   * assumption: the CAS only matched because the row WAS at
+   * `expectedVersion`, and the same statement incremented it by exactly one.
+   *
+   * Resets the same "fresh generation" fields `recordIntent` does, PLUS
+   * `processingStartedAt`/`processingCompletedAt`. That addition is
+   * meaningful only here: `recordIntent` runs on a row completing its
+   * upload for the first time, where both timestamps are always already
+   * `null`, whereas a retried row is by definition one a previous
+   * generation started AND completed (in failure). Leaving those stamps
+   * behind would make a freshly queued row report a completion time older
+   * than its own queueing — visible directly in
+   * `AdminMediaProcessingDto.startedAt`/`completedAt`.
+   */
+  async retryFailedGeneration(
+    videoId: string,
+    expectedVersion: number,
+  ): Promise<number | null> {
+    const result = await this.prisma.video.updateMany({
+      where: {
+        id: videoId,
+        processingVersion: expectedVersion,
+        processingState: 'failed' satisfies ProcessingState,
+      },
+      data: {
+        processingVersion: { increment: 1 },
+        processingState: 'queued' satisfies ProcessingState,
+        processingStep: null,
+        processingAttempts: 0,
+        processingErrorCode: null,
+        processingErrorMessage: null,
+        processingStartedAt: null,
+        processingCompletedAt: null,
+      },
+    });
+
+    if (result.count === 0) {
+      return null;
+    }
+
+    return expectedVersion + 1;
+  }
+
+  /**
    * Slice 11P: the best-effort enqueue half of `requestProcessing`,
    * extracted so `AdminMediaService.completeUpload` can call it AFTER its
    * transaction commits (proposal §8 / 2026-08-10 approval: "Enqueue stays

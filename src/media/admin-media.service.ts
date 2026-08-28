@@ -31,12 +31,16 @@ import {
   buildThumbnailObjectKey,
 } from './media-storage-key.util';
 import { MediaLifecycleState } from './media-lifecycle.types';
+import { canRetryTranscode, deriveIngestionStatus } from './admin-media-status';
 import {
   AdminMediaDto,
   AdminMediaListResponseDto,
+  AdminMediaProcessingDto,
+  AdminMediaStatusDto,
   CreateMediaUploadResponseDto,
   MediaAssetUploadResponseDto,
 } from './media.types';
+import { HlsRenditionSummary } from '../transcode/transcode.types';
 
 const MEDIA_ID_PREFIX = 'media';
 /** Free-form label for the one rendition this slice ever creates. */
@@ -108,6 +112,22 @@ type VideoRow = {
    */
   processingState: string | null;
   hlsMasterKey: string | null;
+  /**
+   * Work unit "ADMIN MEDIA INGESTION": the remaining pipeline columns, read
+   * (never written) by this service purely to build
+   * `AdminMediaProcessingDto` — the admin status contract. Every write to
+   * any of them stays exclusively in `TranscodeIntentService`'s CAS methods,
+   * unchanged by this work unit.
+   */
+  processingVersion: number;
+  processingStep: string | null;
+  processingAttempts: number;
+  processingErrorCode: string | null;
+  processingErrorMessage: string | null;
+  processingStartedAt: Date | null;
+  processingCompletedAt: Date | null;
+  hlsRenditions: unknown;
+  transcodeProfileVersion: string | null;
 };
 
 /**
@@ -159,6 +179,24 @@ export class AdminMediaService {
    */
   private readonly contentAccessMode: ContentAccessMode;
 
+  /**
+   * Work unit "ADMIN MEDIA INGESTION": whether this deployment can actually
+   * queue transcoding — `TRANSCODE_ENABLED=true` AND the `@Optional()`
+   * `transcodeIntentService` actually injected. Resolved once here because
+   * `completeUpload` already derived exactly this condition inline, and
+   * `retryTranscode` needs the identical answer; computing it in two places
+   * risked the two paths disagreeing about whether the pipeline exists.
+   */
+  private readonly isTranscodeEnabled: boolean;
+
+  /**
+   * `TRANSCODE_MAX_ATTEMPTS`, surfaced on `AdminMediaProcessingDto` so a
+   * dashboard can render "attempt 2/3" without hardcoding the cap. `null`
+   * whenever transcoding is disabled — there is no cap to report because no
+   * attempt can be made.
+   */
+  private readonly transcodeMaxAttempts: number | null;
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly storageService: StorageService,
@@ -168,6 +206,33 @@ export class AdminMediaService {
     private readonly transcodeIntentService?: TranscodeIntentService,
   ) {
     this.contentAccessMode = readContentAccessMode(this.configService);
+
+    const transcodeConfig = this.configService?.get('transcode', {
+      infer: true,
+    });
+
+    this.isTranscodeEnabled =
+      transcodeConfig?.enabled === true &&
+      this.transcodeIntentService !== undefined;
+    this.transcodeMaxAttempts = this.isTranscodeEnabled
+      ? (transcodeConfig?.maxAttempts ?? null)
+      : null;
+  }
+
+  /**
+   * Work unit "ADMIN MEDIA INGESTION": builds every `AdminMediaDto` this
+   * service returns, supplying the two deployment-level values the pure
+   * module-level mapper cannot know on its own. Introduced so the ingestion
+   * status block is added in ONE place rather than at each of the mapper's
+   * eight call sites — a call site that forgot it would silently return a
+   * DTO missing `processing`.
+   */
+  private toDto(record: VideoRow): AdminMediaDto {
+    return toAdminMediaDto(
+      record,
+      this.contentAccessMode,
+      this.transcodeMaxAttempts,
+    );
   }
 
   async createUpload(
@@ -234,7 +299,7 @@ export class AdminMediaService {
     });
 
     return {
-      media: toAdminMediaDto(created, this.contentAccessMode),
+      media: this.toDto(created),
       upload: toPresignedUploadDto(presigned),
     };
   }
@@ -284,6 +349,12 @@ export class AdminMediaService {
       );
     }
 
+    // Work unit "ADMIN MEDIA INGESTION": assert the row's stored source key
+    // is the one this row's OWN id derives, BEFORE any HEAD is issued. See
+    // `assertOwnSourceKey` for why this is enforced even though no current
+    // write path can violate it.
+    this.assertOwnSourceKey(media);
+
     const metadata = await this.storageService.headObject(
       media.objectStorageKey,
     );
@@ -321,6 +392,32 @@ export class AdminMediaService {
       );
     }
 
+    // Work unit "ADMIN MEDIA INGESTION": the LAST of the object checks — a
+    // present-but-EMPTY (0-byte) object.
+    //
+    // ORDER MATTERS, and this one is deliberately LAST. A row that HAS a
+    // recorded `expectedSizeBytes` (every row created since 11L-B2) already
+    // rejects a 0-byte object through the size comparison above, as
+    // `UPLOAD_SIZE_MISMATCH` — the more informative answer there, since it
+    // names both the expected and the actual size. Running this check first
+    // would have silently reclassified that long-standing, tested behavior.
+    //
+    // What this check adds is the case the size comparison CANNOT cover: a
+    // LEGACY row (`expectedSizeBytes === null`, pre-11L-B2), where the size
+    // comparison is skipped entirely and an empty object would otherwise
+    // satisfy the existence-only fallback — getting promoted to `ready` and
+    // queued, only for a worker to download zero bytes and fail much later
+    // with `SOURCE_MISSING`. Placed here, it closes that hole for every row
+    // while changing the answer for none.
+    if (metadata.contentLength <= 0) {
+      throw new AppException(
+        AppErrorCode.UPLOAD_OBJECT_EMPTY,
+        'The uploaded object is empty (0 bytes). Re-upload the source file ' +
+          'and complete the upload again.',
+        HttpStatus.CONFLICT,
+      );
+    }
+
     const nextState = this.mediaLifecycleService.assertTransition(
       asLifecycleState(media.lifecycleState),
       MediaLifecycleState.READY,
@@ -343,8 +440,13 @@ export class AdminMediaService {
     // "flag off ⇒ byte-identical existing behavior" requirement), which is
     // what every pre-existing complete-upload unit/e2e test still asserts,
     // completely unmodified by this slice.
-    const isTranscodeEnabled =
-      this.configService?.get('transcode', { infer: true })?.enabled === true;
+    // Work unit "ADMIN MEDIA INGESTION": now read from the field resolved
+    // once in the constructor rather than re-derived here, so this path and
+    // `retryTranscode` can never disagree about whether a queue exists. The
+    // field folds in the `this.transcodeIntentService !== undefined` check
+    // the `if` below used to make separately — the resulting condition is
+    // identical, so this branch's behavior is unchanged.
+    const isTranscodeEnabled = this.isTranscodeEnabled;
 
     let updated: VideoRow;
     let processingVersion: number | undefined;
@@ -433,7 +535,7 @@ export class AdminMediaService {
       );
     }
 
-    return toAdminMediaDto(updated, this.contentAccessMode);
+    return this.toDto(updated);
   }
 
   async publish(id: string): Promise<AdminMediaDto> {
@@ -463,10 +565,7 @@ export class AdminMediaService {
   }
 
   async findById(id: string): Promise<AdminMediaDto> {
-    return toAdminMediaDto(
-      await this.findMediaOrThrow(id),
-      this.contentAccessMode,
-    );
+    return this.toDto(await this.findMediaOrThrow(id));
   }
 
   /**
@@ -518,7 +617,7 @@ export class AdminMediaService {
       data,
     });
 
-    return toAdminMediaDto(updated, this.contentAccessMode);
+    return this.toDto(updated);
   }
 
   /**
@@ -542,7 +641,7 @@ export class AdminMediaService {
       data: { accessTierOverride: dto.tier },
     });
 
-    return toAdminMediaDto(updated, this.contentAccessMode);
+    return this.toDto(updated);
   }
 
   /**
@@ -599,7 +698,7 @@ export class AdminMediaService {
     ]);
 
     return {
-      items: rows.map((row) => toAdminMediaDto(row, this.contentAccessMode)),
+      items: rows.map((row) => this.toDto(row)),
       total,
       page,
       pageSize,
@@ -625,7 +724,7 @@ export class AdminMediaService {
       data: { lifecycleState: nextState },
     });
 
-    return toAdminMediaDto(updated, this.contentAccessMode);
+    return this.toDto(updated);
   }
 
   /**
@@ -676,7 +775,7 @@ export class AdminMediaService {
     });
 
     return {
-      media: toAdminMediaDto(updated, this.contentAccessMode),
+      media: this.toDto(updated),
       upload: toPresignedUploadDto(presigned),
     };
   }
@@ -709,6 +808,204 @@ export class AdminMediaService {
       throw new AppException(
         AppErrorCode.DUPLICATE_EPISODE_NUMBER,
         `Episode number ${episodeNumber} already exists in series "${seriesId}"`,
+        HttpStatus.CONFLICT,
+      );
+    }
+  }
+
+  /**
+   * Work unit "ADMIN MEDIA INGESTION": the narrow status payload behind
+   * `GET /admin/media/:id/status`. A plain read — it makes no object-storage
+   * call, so a dashboard may poll it while a row transcodes without
+   * generating R2 traffic per tick.
+   */
+  async getStatus(id: string): Promise<AdminMediaStatusDto> {
+    const media = await this.findMediaOrThrow(id);
+
+    return {
+      id: media.id,
+      lifecycleState: media.lifecycleState,
+      processing: toAdminMediaProcessingDto(media, this.transcodeMaxAttempts),
+    };
+  }
+
+  /**
+   * Work unit "ADMIN MEDIA INGESTION": re-queues a FAILED transcode without
+   * requiring the operator to upload the source again.
+   *
+   * The source object is the expensive part of an ingestion, and a failed
+   * transcode does not consume or damage it — `TranscodeJobProcessor` only
+   * ever READS `admin-media/<id>/source`, writing its output under a
+   * separate per-generation `hls/` prefix. So when a generation fails for a
+   * reason unrelated to the bytes (a worker crash, a transient R2 error, an
+   * exhausted attempt budget), the correct recovery is to start a NEW
+   * generation against the SAME source, which is what this does.
+   *
+   * ORDER OF CHECKS, and why each is where it is:
+   *
+   * 1. **404** for an unknown id (`findMediaOrThrow`), before anything else.
+   * 2. **Queue availability.** Refused when this deployment has no queue
+   *    (`TRANSCODE_ENABLED` off). Checked BEFORE the state checks so an
+   *    operator on a transcode-disabled deployment gets the real reason
+   *    rather than a misleading "not retryable".
+   * 3. **State.** Only a row whose PIPELINE failed is retryable — see
+   *    `canRetryTranscode`, the exact same predicate reported to the
+   *    dashboard as `processing.canRetry`, so the button and the server
+   *    agree. This is what rejects `already READY`, `currently
+   *    TRANSCODING` (`running`), `already QUEUED`, a never-processed row,
+   *    and a row whose upload was never finalized.
+   * 4. **Source key ownership**, then **the source object itself.** The key
+   *    is re-derived and asserted (`assertOwnSourceKey`), then HEADed: a
+   *    retry must never enqueue work against a source that has since been
+   *    deleted, or that is empty — the worker would only rediscover that
+   *    minutes later as a `SOURCE_MISSING` failure. Verified here, the
+   *    operator is told immediately, and the row is left untouched in
+   *    `failed` so a re-upload path stays available.
+   * 5. **The CAS.** `TranscodeIntentService.retryFailedGeneration` performs
+   *    the state change under a compare-and-swap guarded on the version AND
+   *    on `failed`. Everything above is a read, so two concurrent retries
+   *    can both reach this point — only one can win the CAS, and the loser
+   *    is reported as not-retryable rather than enqueuing a second
+   *    generation. That is what makes "enqueue exactly once" hold under a
+   *    double-clicked button.
+   *
+   * Enqueue stays POST-COMMIT and best-effort, exactly as in
+   * `completeUpload`: the durable `queued` intent is already written, so a
+   * Redis outage here cannot lose it — `TranscodeReconcilerService.reconcile`
+   * re-enqueues it on a later sweep.
+   */
+  async retryTranscode(id: string): Promise<AdminMediaDto> {
+    const media = await this.findMediaOrThrow(id);
+
+    if (!this.isTranscodeEnabled || !this.transcodeIntentService) {
+      throw new AppException(
+        AppErrorCode.MEDIA_TRANSCODE_NOT_ENABLED,
+        'Transcoding is not enabled on this deployment, so there is no ' +
+          'queue to retry this media on.',
+        HttpStatus.CONFLICT,
+      );
+    }
+
+    if (!canRetryTranscode(media)) {
+      throw new AppException(
+        AppErrorCode.MEDIA_TRANSCODE_NOT_RETRYABLE,
+        `Media "${id}" is not in a retryable state ` +
+          `(lifecycleState=${JSON.stringify(media.lifecycleState)}, ` +
+          `processingState=${JSON.stringify(media.processingState)}). ` +
+          'Only a completed upload whose transcode failed can be retried.',
+        HttpStatus.CONFLICT,
+      );
+    }
+
+    this.assertOwnSourceKey(media);
+    await this.assertSourceStillUsable(media);
+
+    const nextVersion = await this.transcodeIntentService.retryFailedGeneration(
+      id,
+      media.processingVersion,
+    );
+
+    if (nextVersion === null) {
+      // The CAS matched zero rows: between this method's read and its write,
+      // something else moved the row off `failed` — almost always a
+      // concurrent retry that won the race. Reported with the SAME code a
+      // non-retryable row gets, because the caller's situation is identical:
+      // this call did not queue anything, and the row is already moving.
+      throw new AppException(
+        AppErrorCode.MEDIA_TRANSCODE_NOT_RETRYABLE,
+        `Media "${id}" was no longer in a retryable state when the retry ` +
+          'was applied — another retry or processing update won the race. ' +
+          'Re-read the media status before retrying again.',
+        HttpStatus.CONFLICT,
+      );
+    }
+
+    await this.transcodeIntentService.enqueueBestEffort(id, nextVersion);
+
+    this.logger.log(
+      redactSensitiveText(
+        `Re-queued a failed transcode for media "${id}" as generation ` +
+          `${nextVersion} (previous generation ${media.processingVersion} ` +
+          `failed with ${media.processingErrorCode ?? 'an unrecorded error'}).`,
+      ),
+    );
+
+    return this.toDto(await this.findMediaOrThrow(id));
+  }
+
+  /**
+   * Work unit "ADMIN MEDIA INGESTION" (PHASE 7 — "no overwrite of unrelated
+   * source"): asserts a row's stored `objectStorageKey` is EXACTLY the
+   * deterministic source key its own id derives.
+   *
+   * Unreachable through any current write path, and deliberately enforced
+   * anyway. `createUpload` mints the key server-side from a freshly
+   * generated `media-<uuid>` id and never accepts one from a client;
+   * `CompleteMediaUploadDto` has no key field at all; and the R2 migration
+   * tool writes the identical `admin-media/<id>/source` convention
+   * (`buildMigrationObjectKey`). This check is the standing guarantee that
+   * NONE of that may quietly change: if some future write path — or a
+   * hand-edited row — ever pointed one media record at another record's
+   * object, this refuses rather than letting that record's completion HEAD,
+   * or its retry enqueue a transcode against, a source that is not its own.
+   *
+   * A row with NO key at all is not this method's concern (the callers
+   * handle that case with their own, more specific errors).
+   */
+  private assertOwnSourceKey(media: VideoRow): void {
+    const expectedKey = buildSourceObjectKey(media.id);
+
+    if (
+      media.objectStorageKey !== null &&
+      media.objectStorageKey !== expectedKey
+    ) {
+      throw new AppException(
+        AppErrorCode.MEDIA_SOURCE_KEY_MISMATCH,
+        `Media "${media.id}" does not own the source object it points at.`,
+        HttpStatus.CONFLICT,
+      );
+    }
+  }
+
+  /**
+   * Work unit "ADMIN MEDIA INGESTION": confirms the source object a retry
+   * would re-process still exists in object storage and is non-empty, using
+   * the same `HeadObject` + emptiness rules `completeUpload` applies.
+   *
+   * Deliberately does NOT re-check `expectedSizeBytes`/`expectedContentType`.
+   * Those record what the ORIGINAL upload declared, and `completeUpload`
+   * already verified R2's real object against them before this row was ever
+   * allowed to reach a processing state at all — re-running that comparison
+   * here would add nothing except a new way for a retry of a legitimately
+   * completed upload to be refused.
+   */
+  private async assertSourceStillUsable(media: VideoRow): Promise<void> {
+    if (!media.objectStorageKey) {
+      throw new AppException(
+        AppErrorCode.MEDIA_FILE_NOT_FOUND,
+        'This media has no recorded source object to retry.',
+        HttpStatus.CONFLICT,
+      );
+    }
+
+    const metadata = await this.storageService.headObject(
+      media.objectStorageKey,
+    );
+
+    if (metadata === null) {
+      throw new AppException(
+        AppErrorCode.MEDIA_FILE_NOT_FOUND,
+        'The source object for this media no longer exists in object ' +
+          'storage. Start a new upload for this episode instead of retrying.',
+        HttpStatus.CONFLICT,
+      );
+    }
+
+    if (metadata.contentLength <= 0) {
+      throw new AppException(
+        AppErrorCode.UPLOAD_OBJECT_EMPTY,
+        'The source object for this media is empty (0 bytes). Re-upload the ' +
+          'source file instead of retrying.',
         HttpStatus.CONFLICT,
       );
     }
@@ -760,6 +1057,7 @@ function buildMetadataUpdateData(
 function toAdminMediaDto(
   record: VideoRow,
   accessMode: ContentAccessMode = DEFAULT_CONTENT_ACCESS_MODE,
+  transcodeMaxAttempts: number | null = null,
 ): AdminMediaDto {
   return {
     id: record.id,
@@ -788,6 +1086,46 @@ function toAdminMediaDto(
       FREE_EPISODE_LIMIT,
       accessMode,
     ),
+    processing: toAdminMediaProcessingDto(record, transcodeMaxAttempts),
+  };
+}
+
+/**
+ * Work unit "ADMIN MEDIA INGESTION": builds the admin status block from a
+ * row this service has ALREADY loaded. Deliberately pure and synchronous —
+ * it makes no database query and, critically, no object-storage call, so
+ * embedding it in `AdminMediaDto` cannot turn a list of 50 rows into 50
+ * `HeadObject` round trips.
+ *
+ * `hlsRenditions` is a Prisma `Json?` column, so it arrives typed as
+ * `unknown`. It is narrowed by shape (an array) rather than cast blindly:
+ * the ONLY writer is `TranscodeIntentService.promoteIfCurrent`, which always
+ * writes an `HlsRenditionSummary[]`, but a `Json` column cannot prove that
+ * to the type system and a malformed value must not crash a status poll.
+ */
+function toAdminMediaProcessingDto(
+  record: VideoRow,
+  transcodeMaxAttempts: number | null,
+): AdminMediaProcessingDto {
+  return {
+    status: deriveIngestionStatus(record),
+    state: record.processingState,
+    version: record.processingVersion,
+    step: record.processingStep,
+    attempts: record.processingAttempts,
+    maxAttempts: transcodeMaxAttempts,
+    errorCode: record.processingErrorCode,
+    errorMessage: record.processingErrorMessage,
+    startedAt: record.processingStartedAt?.toISOString() ?? null,
+    completedAt: record.processingCompletedAt?.toISOString() ?? null,
+    hlsReady:
+      record.processingState === 'ready' && record.hlsMasterKey !== null,
+    hlsMasterKey: record.hlsMasterKey,
+    renditions: Array.isArray(record.hlsRenditions)
+      ? (record.hlsRenditions as HlsRenditionSummary[])
+      : null,
+    profileVersion: record.transcodeProfileVersion,
+    canRetry: canRetryTranscode(record),
   };
 }
 

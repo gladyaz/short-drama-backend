@@ -346,6 +346,7 @@ a second clean run is the real signal. Do not point two worktrees at the same
 
 ## See also
 
+- [DEVELOPER_HANDOVER.md](DEVELOPER_HANDOVER.md) — start here if you are new
 - [README.md](../README.md) — API reference and architecture
 - [PLAY_STORE_V1_BACKEND.md](PLAY_STORE_V1_BACKEND.md) — V1 scope and catalog state
 - [PRODUCTION_DEPLOYMENT_REQUIREMENTS.md](PRODUCTION_DEPLOYMENT_REQUIREMENTS.md)

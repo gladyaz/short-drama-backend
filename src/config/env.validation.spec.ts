@@ -464,6 +464,75 @@ describe('validateEnv — TRANSCODE_ENABLED / REDIS_URL (Slice 11N)', () => {
 });
 
 /**
+ * VPS DEPLOYMENT (work unit "TRANSCODE WORKER VPS DEPLOYMENT") — the worker
+ * runtime tunables, validated on exactly the same conditional-shape terms as
+ * the Slice 11P three below: optional even when the flag is on, but a
+ * PRESENT-but-invalid value fails boot loudly and names the variable.
+ *
+ * Catching TRANSCODE_WORKER_CONCURRENCY here matters more than for the
+ * others. `parsePositiveIntEnv` would otherwise silently fall back to 1, so
+ * an operator who sized a big box and typed `TRANSCODE_WORKER_CONCURRENCY=4x`
+ * would get a quietly single-threaded worker with no signal anywhere that
+ * their intended change never took effect.
+ */
+describe('validateEnv — TRANSCODE_WORKER_CONCURRENCY / TRANSCODE_TEMP_SWEEP_MIN_AGE_MINUTES / TRANSCODE_TEMP_DIR (VPS deployment)', () => {
+  const ENABLED_BASE: Record<string, unknown> = {
+    ...VALID_CONFIG,
+    TRANSCODE_ENABLED: 'true',
+    REDIS_URL: 'redis://localhost:6379',
+    HLS_TOKEN_SECRET: 'test-hls-token-secret',
+    HLS_GATEWAY_BASE_URL: 'https://hls-gateway.example.test',
+  };
+
+  it('boots with TRANSCODE_ENABLED=true and none of them set', () => {
+    expect(() => validateEnv({ ...ENABLED_BASE })).not.toThrow();
+  });
+
+  it.each([
+    'TRANSCODE_WORKER_CONCURRENCY',
+    'TRANSCODE_TEMP_SWEEP_MIN_AGE_MINUTES',
+  ])('boots when %s is a valid positive integer', (key) => {
+    expect(() => validateEnv({ ...ENABLED_BASE, [key]: '4' })).not.toThrow();
+  });
+
+  it.each([
+    ['TRANSCODE_WORKER_CONCURRENCY', '0'],
+    ['TRANSCODE_WORKER_CONCURRENCY', '-2'],
+    ['TRANSCODE_WORKER_CONCURRENCY', '2x'],
+    ['TRANSCODE_WORKER_CONCURRENCY', '1.5'],
+    ['TRANSCODE_TEMP_SWEEP_MIN_AGE_MINUTES', '0'],
+    ['TRANSCODE_TEMP_SWEEP_MIN_AGE_MINUTES', 'soon'],
+  ])('rejects %s=%s, naming the variable', (key, value) => {
+    expect(() => validateEnv({ ...ENABLED_BASE, [key]: value })).toThrow(
+      new RegExp(`Invalid ${key}: must be a positive integer`),
+    );
+  });
+
+  it('ignores both entirely when TRANSCODE_ENABLED is not "true", even if malformed', () => {
+    expect(() =>
+      validateEnv({
+        ...VALID_CONFIG,
+        TRANSCODE_WORKER_CONCURRENCY: 'not-a-number',
+        TRANSCODE_TEMP_SWEEP_MIN_AGE_MINUTES: '-5',
+      }),
+    ).not.toThrow();
+  });
+
+  // TRANSCODE_TEMP_DIR is a path on the DEPLOYMENT box, which this process
+  // cannot meaningfully validate without a filesystem probe — and no
+  // validator in this file performs a live check. An unusable path surfaces
+  // at the first `mkdtemp` with the OS's own error instead.
+  it('accepts any non-empty TRANSCODE_TEMP_DIR without probing the filesystem', () => {
+    expect(() =>
+      validateEnv({
+        ...ENABLED_BASE,
+        TRANSCODE_TEMP_DIR: '/mnt/definitely-does-not-exist-on-this-machine',
+      }),
+    ).not.toThrow();
+  });
+});
+
+/**
  * Slice 11P — the three optional numeric tunables
  * (TRANSCODE_MAX_ATTEMPTS/TRANSCODE_STALLED_AFTER_MINUTES/
  * TRANSCODE_CLEANUP_GRACE_MINUTES), validated only when TRANSCODE_ENABLED is

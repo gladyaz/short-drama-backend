@@ -17,6 +17,9 @@ async function buildService(
     maxAttempts: 3,
     stalledAfterMinutes: 30,
     cleanupGraceMinutes: 120,
+    workerConcurrency: 1,
+    tempDir: undefined,
+    tempSweepMinAgeMinutes: 120,
     ...transcodeConfig,
   };
 

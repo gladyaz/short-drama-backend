@@ -1,0 +1,49 @@
+# Build context exclusions for Dockerfile.worker.
+#
+# THE FIRST BLOCK IS A SECURITY CONTROL, not an optimization: anything
+# reachable in the build context can be COPYd into a layer, and a layer is
+# readable by anyone who can pull the image. Real credentials live in `.env`
+# files on the developer's machine and on the VPS, so those never enter the
+# build context at all. Only the committed, placeholder-only examples do.
+.env
+.env.*
+!.env.example
+!.env.production.example
+
+# Never rebuild from a host-built tree — the image builds from source, and a
+# macOS-built node_modules would be the wrong platform anyway.
+node_modules
+dist
+build
+coverage
+.nyc_output
+
+# Local media, storage roots and databases. Large, private, never needed.
+company-video-storage/
+VideoDracin/
+storage/
+.ci-storage/
+ci-logs/
+*.mp4
+*.mov
+*.mkv
+*.db
+*.db-journal
+prisma/backups/
+
+# The Cloudflare HLS delivery gateway is its own independently deployed
+# package with its own lockfile — it has no role in this image.
+workers/
+
+# Repository and tooling metadata with no role in the image. `test` and
+# `scripts` are excluded because the runtime stage ships neither: the health
+# command is compiled into `dist/` precisely so it needs no `ts-node`.
+.git
+.github
+.vscode
+.idea
+docs
+test
+scripts
+*.log
+.DS_Store

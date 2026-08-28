@@ -874,6 +874,25 @@ function validateTranscodeConfig(config: Record<string, unknown>): void {
   assertPositiveIntEnvIfPresent(config, 'TRANSCODE_MAX_ATTEMPTS');
   assertPositiveIntEnvIfPresent(config, 'TRANSCODE_STALLED_AFTER_MINUTES');
   assertPositiveIntEnvIfPresent(config, 'TRANSCODE_CLEANUP_GRACE_MINUTES');
+
+  // VPS DEPLOYMENT: the two worker-runtime tunables follow exactly the same
+  // OPTIONAL-but-must-parse rule as the three above. Catching a typo'd
+  // TRANSCODE_WORKER_CONCURRENCY at boot matters more than for the others:
+  // `parsePositiveIntEnv` would otherwise silently fall back to 1, so an
+  // operator who set `TRANSCODE_WORKER_CONCURRENCY=2x` on a big box would
+  // get a quietly-single-threaded worker and no signal at all that their
+  // intended change never took effect.
+  assertPositiveIntEnvIfPresent(config, 'TRANSCODE_WORKER_CONCURRENCY');
+  assertPositiveIntEnvIfPresent(config, 'TRANSCODE_TEMP_SWEEP_MIN_AGE_MINUTES');
+
+  // TRANSCODE_TEMP_DIR is deliberately NOT shape-checked beyond
+  // "not whitespace-only" (`normalizeOptionalEnv` in configuration.ts). It
+  // is an absolute path on the DEPLOYMENT box, which this process cannot
+  // meaningfully validate at boot without a filesystem probe — and a
+  // filesystem probe is exactly what every validator in this file avoids
+  // (shape only, never a live check; see `validateStorageDriver`). An
+  // unusable path surfaces immediately and loudly at the first `mkdtemp`
+  // instead, with the OS's own error.
 }
 
 /** Shape check only — never resolves DNS or opens a connection. */

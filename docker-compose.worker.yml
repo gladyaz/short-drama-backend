@@ -1,0 +1,107 @@
+# =============================================================================
+# Red Panda HLS transcoding worker — VPS deployment example.
+#
+# Work unit "TRANSCODE WORKER VPS DEPLOYMENT". Deliberately a SEPARATE file
+# from `docker-compose.yml` (the local-development Postgres stack): this one
+# runs on a VPS, and merging them would make `docker compose up` on a laptop
+# start a transcoding worker nobody asked for.
+#
+#   docker compose -f docker-compose.worker.yml up -d --build
+#
+# Every operational procedure — first deploy, upgrade, rollback, scaling to a
+# second worker — is in docs/TRANSCODE_WORKER_VPS.md. This file is the
+# reference topology those procedures drive.
+#
+# NEITHER REDIS NOR POSTGRES IS DEFINED HERE, ON PURPOSE. R2 holds the media,
+# Redis holds the queue, Postgres holds the catalog, and the VPS contributes
+# FFmpeg compute and nothing else. Making the worker's own compose file bring
+# up a Redis would quietly create a SECOND, empty queue that the API never
+# writes to — a worker that looks perfectly healthy and never receives a job.
+# =============================================================================
+
+services:
+  transcode-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    image: red-panda-transcode-worker:latest
+
+    # PHASE 7 — restart policy. `unless-stopped` restarts the worker after a
+    # crash and after a host reboot, but honours a deliberate `docker compose
+    # stop` (unlike `always`, which resurrects a container an operator stopped
+    # on purpose to take the box out of rotation).
+    restart: unless-stopped
+
+    # Reaps FFmpeg child processes. Without an init, PID 1 is Node, which does
+    # not reap orphans — a long-running worker would accumulate zombie ffmpeg
+    # entries in the process table.
+    init: true
+
+    # THE MOST IMPORTANT LINE IN THIS FILE. Docker's default stop grace is 10
+    # SECONDS, after which it sends SIGKILL. The worker's SIGTERM handler
+    # stops taking new jobs and then waits for the in-flight encode to reach a
+    # safe boundary (see src/worker/worker-shutdown.ts) — with the default
+    # grace, every `docker compose down` during an encode would kill it
+    # mid-upload. Set this ABOVE the longest encode this box realistically
+    # runs; raise it after measuring (see the runbook's sizing section).
+    stop_grace_period: 30m
+
+    # Secrets arrive ONLY at runtime, never in the image. Create this file on
+    # the VPS from `.env.production.example`; it is git-ignored and excluded
+    # from the build context.
+    env_file:
+      - .env.worker
+
+    # Non-secret runtime posture, kept visible here rather than buried in the
+    # env file so the deployed shape is readable at a glance. Anything set
+    # here overrides `.env.worker`.
+    environment:
+      NODE_ENV: production
+      # The worker only consumes jobs when this is the exact string "true".
+      TRANSCODE_ENABLED: "true"
+      # Scratch space, matching the volume mounted below.
+      TRANSCODE_TEMP_DIR: /app/tmp
+      # PHASE 3 — start at 1 and raise ONLY after measuring this box. See
+      # docs/TRANSCODE_WORKER_VPS.md ("Concurrency sizing"): each concurrent
+      # job costs CPU, RAM and disk simultaneously, so the first limit reached
+      # on a small VPS is memory or disk, not cores.
+      TRANSCODE_WORKER_CONCURRENCY: "1"
+
+    volumes:
+      # PHASE 4 — per-job scratch on a real volume rather than the container's
+      # writable layer. One job holds a full downloaded source AND a complete
+      # HLS package here at the same time, so this needs headroom of several
+      # times the largest source file, multiplied by the concurrency above.
+      - transcode_tmp:/app/tmp
+
+    # PHASE 5 — proves valid config, both FFmpeg binaries, and a real Redis
+    # round-trip. Also declared in the image; repeated here so an operator
+    # editing this file can see and tune it.
+    healthcheck:
+      test: ["CMD", "node", "dist/worker/health-main"]
+      interval: 60s
+      timeout: 15s
+      start_period: 30s
+      retries: 3
+
+    # PHASE 4/8 — logs are the other unbounded disk consumer on a box that
+    # runs unattended for months. Without rotation the JSON log file grows
+    # until the disk fills, which then fails every job for a reason that looks
+    # nothing like a logging problem.
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+    # Sizing guardrails. Uncomment and set against the box's real capacity —
+    # an explicit memory ceiling turns "the host OOM-killer picked a victim"
+    # into "this container was restarted", which is far easier to diagnose.
+    # deploy:
+    #   resources:
+    #     limits:
+    #       cpus: "3.5"
+    #       memory: 6g
+
+volumes:
+  transcode_tmp:

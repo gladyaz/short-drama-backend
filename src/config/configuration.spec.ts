@@ -153,6 +153,87 @@ describe('configuration — transcode.maxAttempts / stalledAfterMinutes / cleanu
 });
 
 /**
+ * VPS DEPLOYMENT (work unit "TRANSCODE WORKER VPS DEPLOYMENT") — the worker
+ * runtime tunables. Entirely in-memory, mirroring the spec above.
+ *
+ * The load-bearing assertion is the FIRST one: the shipped default
+ * concurrency must stay `1` and must never be derived from the machine
+ * running the tests. A regression to `os.cpus().length` would pass every
+ * other test in this repository and only surface as an OOM-killed worker on
+ * the operator's box.
+ */
+describe('configuration — transcode worker runtime tunables (VPS deployment)', () => {
+  const KEYS = [
+    'TRANSCODE_WORKER_CONCURRENCY',
+    'TRANSCODE_TEMP_DIR',
+    'TRANSCODE_TEMP_SWEEP_MIN_AGE_MINUTES',
+  ] as const;
+  const originalValues = KEYS.map((key) => process.env[key]);
+
+  afterEach(() => {
+    KEYS.forEach((key, index) => {
+      const original = originalValues[index];
+      if (original === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = original;
+      }
+    });
+  });
+
+  it('defaults to a concurrency of exactly 1, never a CPU-derived value', () => {
+    KEYS.forEach((key) => delete process.env[key]);
+
+    expect(configuration().transcode.workerConcurrency).toBe(1);
+  });
+
+  it('defaults tempDir to undefined (meaning os.tmpdir()) and the sweep age to 120 minutes', () => {
+    KEYS.forEach((key) => delete process.env[key]);
+
+    const transcode = configuration().transcode;
+    expect(transcode.tempDir).toBeUndefined();
+    expect(transcode.tempSweepMinAgeMinutes).toBe(120);
+  });
+
+  it('reflects an explicit operator override for each field', () => {
+    process.env.TRANSCODE_WORKER_CONCURRENCY = '3';
+    process.env.TRANSCODE_TEMP_DIR = '/data/transcode-tmp';
+    process.env.TRANSCODE_TEMP_SWEEP_MIN_AGE_MINUTES = '360';
+
+    const transcode = configuration().transcode;
+    expect(transcode.workerConcurrency).toBe(3);
+    expect(transcode.tempDir).toBe('/data/transcode-tmp');
+    expect(transcode.tempSweepMinAgeMinutes).toBe(360);
+  });
+
+  it.each(['0', '-1', 'garbage', '2.5', ''])(
+    'falls back to concurrency 1 for an invalid value (%s) rather than throwing',
+    (value) => {
+      process.env.TRANSCODE_WORKER_CONCURRENCY = value;
+
+      expect(configuration().transcode.workerConcurrency).toBe(1);
+    },
+  );
+
+  // An `''` path would silently resolve to the process working directory
+  // rather than the documented `os.tmpdir()` fallback.
+  it.each(['', '   '])(
+    'treats a whitespace-only TRANSCODE_TEMP_DIR (%p) as unset, never as an empty path',
+    (value) => {
+      process.env.TRANSCODE_TEMP_DIR = value;
+
+      expect(configuration().transcode.tempDir).toBeUndefined();
+    },
+  );
+
+  it('trims surrounding whitespace from a configured temp directory', () => {
+    process.env.TRANSCODE_TEMP_DIR = '  /data/transcode-tmp  ';
+
+    expect(configuration().transcode.tempDir).toBe('/data/transcode-tmp');
+  });
+});
+
+/**
  * PRODUCTION HTTPS READINESS: `app.trustProxyHops` resolution. Mirrors the
  * `STORAGE_DRIVER` spec above — sets/restores one env var, entirely
  * in-memory, no network call and no real credential.

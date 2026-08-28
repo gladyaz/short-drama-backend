@@ -1,4 +1,5 @@
-import { mkdir, writeFile } from 'fs/promises';
+import { mkdir, mkdtemp, readdir, writeFile } from 'fs/promises';
+import { tmpdir } from 'os';
 import { join } from 'path';
 import { ConfigService } from '@nestjs/config';
 import { RootConfig, TranscodeConfig } from '../config/configuration';
@@ -15,6 +16,8 @@ import { HlsPackageValidator } from './hls/hls-package-validator.service';
 import { HlsTranscodeService } from './hls/hls-transcode.service';
 import { MasterPlaylistService } from './hls/master-playlist.service';
 import { TranscodeIntentService } from './transcode-intent.service';
+import { TRANSCODE_JOB_LOG_TAG } from './transcode-job-log';
+import { buildTranscodeJobId } from './transcode.constants';
 import { TranscodeJobProcessor } from './transcode-job-processor.service';
 import { HlsRenditionSummary } from './transcode.types';
 import type {
@@ -205,6 +208,9 @@ describe('TranscodeJobProcessor', () => {
       maxAttempts: 3,
       stalledAfterMinutes: 30,
       cleanupGraceMinutes: 120,
+      workerConcurrency: 1,
+      tempDir: undefined,
+      tempSweepMinAgeMinutes: 120,
       ...overrides,
     };
   }
@@ -817,6 +823,194 @@ describe('TranscodeJobProcessor', () => {
       expect(row.processingErrorCode).toBe('SOURCE_MISSING');
       expect(row.processingErrorMessage).not.toContain(sentinel);
       expect(row.processingErrorMessage).toContain('[REDACTED]');
+    });
+  });
+
+  /**
+   * VPS DEPLOYMENT (work unit "TRANSCODE WORKER VPS DEPLOYMENT") — the temp
+   * lifecycle and the structured event stream, both of which an unattended
+   * box depends on and neither of which any existing test covered.
+   */
+  describe('temp working directory and structured job events (VPS deployment)', () => {
+    function captureEvents(processor: TranscodeJobProcessor): string[] {
+      const lines: string[] = [];
+      jest
+        .spyOn(
+          (
+            processor as unknown as {
+              logger: { log: (...a: unknown[]) => void };
+            }
+          ).logger,
+          'log',
+        )
+        .mockImplementation((...args: unknown[]) => {
+          lines.push(String(args[0]));
+        });
+      return lines;
+    }
+
+    function jobEvents(lines: string[]): Record<string, unknown>[] {
+      return lines
+        .filter((line) => line.startsWith(`${TRANSCODE_JOB_LOG_TAG} `))
+        .map(
+          (line) =>
+            JSON.parse(line.slice(TRANSCODE_JOB_LOG_TAG.length + 1)) as Record<
+              string,
+              unknown
+            >,
+        );
+    }
+
+    // Every job gets its OWN mkdtemp directory, and it is gone afterwards.
+    // Without this, a box running an unattended wave accumulates a full
+    // source plus a full HLS package per job until the disk fills.
+    it('creates the job temp directory under the configured root and removes it after a SUCCESSFUL job', async () => {
+      const id = `${testIdPrefix}-temp-success`;
+      await createFixtureVideo(id, {
+        processingState: 'queued',
+        processingVersion: 1,
+      });
+      const tempRoot = await mkdtemp(join(tmpdir(), 'processor-temp-root-'));
+      const storageService = fakeStorageService();
+      const processor = buildProcessor({
+        storageService,
+        transcodeConfig: buildTranscodeConfig({ tempDir: tempRoot }),
+      });
+
+      const outcome = await processor.process({
+        videoId: id,
+        processingVersion: 1,
+      });
+
+      expect(outcome.outcome).toBe('promoted');
+      await expect(readdir(tempRoot)).resolves.toEqual([]);
+    });
+
+    it('removes the job temp directory after a FAILED job too', async () => {
+      const id = `${testIdPrefix}-temp-failure`;
+      await createFixtureVideo(id, {
+        processingState: 'queued',
+        processingVersion: 1,
+      });
+      const tempRoot = await mkdtemp(join(tmpdir(), 'processor-temp-root-'));
+      const storageService = fakeStorageService({
+        downloadObjectToFile: jest
+          .fn()
+          .mockRejectedValue(new Error('source is gone')),
+      });
+      const processor = buildProcessor({
+        storageService,
+        transcodeConfig: buildTranscodeConfig({ tempDir: tempRoot }),
+      });
+
+      const outcome = await processor.process({
+        videoId: id,
+        processingVersion: 1,
+      });
+
+      expect(outcome).toMatchObject({
+        outcome: 'failed',
+        errorCode: 'SOURCE_MISSING',
+      });
+      await expect(readdir(tempRoot)).resolves.toEqual([]);
+    });
+
+    // THE DIAGNOSTICS-BEFORE-CLEANUP ORDERING. Removing the temp directory
+    // is unconditional, so the failure's diagnostic state must already be
+    // durable when it happens — otherwise a failed job on an unattended box
+    // leaves nothing at all to debug.
+    it('captures the failure diagnostics (durable row + structured event) BEFORE the temp directory is cleaned up', async () => {
+      const id = `${testIdPrefix}-temp-diagnostics`;
+      await createFixtureVideo(id, {
+        processingState: 'queued',
+        processingVersion: 1,
+      });
+      const tempRoot = await mkdtemp(join(tmpdir(), 'processor-temp-root-'));
+      const storageService = fakeStorageService({
+        downloadObjectToFile: jest
+          .fn()
+          .mockRejectedValue(new Error('source is gone')),
+      });
+      const processor = buildProcessor({
+        storageService,
+        transcodeConfig: buildTranscodeConfig({ tempDir: tempRoot }),
+      });
+      const lines = captureEvents(processor);
+
+      await processor.process({ videoId: id, processingVersion: 1 });
+
+      // The event exists...
+      const failure = jobEvents(lines).find((e) => e.outcome === 'failed');
+      expect(failure).toMatchObject({
+        videoId: id,
+        stage: 'download',
+        failureCategory: 'SOURCE_MISSING',
+      });
+      // ...the durable row carries the same category...
+      const row = await prisma.video.findUniqueOrThrow({ where: { id } });
+      expect(row.processingErrorCode).toBe('SOURCE_MISSING');
+      // ...and only then is the scratch gone.
+      await expect(readdir(tempRoot)).resolves.toEqual([]);
+    });
+
+    it('emits an accepted event and a promoted event carrying job id, generation, stage and duration', async () => {
+      const id = `${testIdPrefix}-events-success`;
+      await createFixtureVideo(id, {
+        processingState: 'queued',
+        processingVersion: 1,
+      });
+      const storageService = fakeStorageService();
+      const processor = buildProcessor({ storageService });
+      const lines = captureEvents(processor);
+
+      await processor.process({ videoId: id, processingVersion: 1 });
+
+      const events = jobEvents(lines);
+      const accepted = events.find((e) => e.outcome === 'accepted');
+      const promoted = events.find((e) => e.outcome === 'promoted');
+
+      expect(accepted).toMatchObject({
+        videoId: id,
+        jobId: buildTranscodeJobId(id, 1),
+        stage: 'claim',
+        attempt: 1,
+      });
+      expect(promoted).toMatchObject({
+        videoId: id,
+        jobId: buildTranscodeJobId(id, 1),
+        stage: 'promote',
+      });
+      expect(typeof promoted?.durationMs).toBe('number');
+
+      // The generation NAMED in the event must be the R2 directory the row
+      // now points at — otherwise an operator chasing a job into the bucket
+      // looks in the wrong place.
+      const row = await prisma.video.findUniqueOrThrow({ where: { id } });
+      expect(row.hlsMasterKey).toContain(String(promoted?.generation));
+    });
+
+    it('emits a claim-stage superseded event, with a null generation, when the row was already claimed', async () => {
+      const id = `${testIdPrefix}-events-superseded`;
+      await createFixtureVideo(id, {
+        processingState: 'running',
+        processingVersion: 1,
+      });
+      const processor = buildProcessor({
+        storageService: fakeStorageService(),
+      });
+      const lines = captureEvents(processor);
+
+      await processor.process({ videoId: id, processingVersion: 1 });
+
+      expect(jobEvents(lines)).toEqual([
+        expect.objectContaining({
+          videoId: id,
+          generation: null,
+          stage: 'claim',
+          outcome: 'superseded',
+          failureCategory: 'NOT_QUEUED',
+        }),
+      ]);
     });
   });
 });

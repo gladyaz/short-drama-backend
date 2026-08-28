@@ -5,8 +5,13 @@ import { redactSensitiveText } from '../common/logging/redact';
 import { RootConfig } from '../config/configuration';
 import { TranscodeJanitorService } from '../transcode/transcode-janitor.service';
 import { TranscodeJobProcessor } from '../transcode/transcode-job-processor.service';
+import {
+  resolveWorkerTempRoot,
+  sweepStaleWorkerTempDirs,
+} from '../transcode/transcode-temp';
 import { TRANSCODE_JANITOR_INTERVAL_MS } from '../transcode/transcode.constants';
 import { startTranscodeWorker } from './transcode-worker';
+import { createGracefulShutdown } from './worker-shutdown';
 import { WorkerModule } from './worker.module';
 import { WorkerReadinessService } from './worker-readiness.service';
 
@@ -73,11 +78,34 @@ export async function bootstrapWorker(): Promise<void> {
 
   const configService = app.get<ConfigService<RootConfig>>(ConfigService);
   const transcodeConfig = configService.get('transcode', { infer: true })!;
+
+  // VPS DEPLOYMENT: reclaim scratch left behind by a PREVIOUS run that was
+  // killed mid-job (SIGKILL/OOM/power loss skips the processor's own
+  // `finally` cleanup). Runs BEFORE the worker starts taking jobs, so a
+  // worker restarting into a nearly-full disk gets its headroom back first
+  // rather than failing its next job for a reason unrelated to that job.
+  // Age-bounded so it can never delete a directory a concurrently-running
+  // worker still owns — see `sweepStaleWorkerTempDirs`.
+  const tempRoot = await resolveWorkerTempRoot(transcodeConfig.tempDir);
+  const tempSweepMinAgeMs = transcodeConfig.tempSweepMinAgeMinutes * 60_000;
+  const startupSweep = await sweepStaleWorkerTempDirs({
+    root: tempRoot,
+    minAgeMs: tempSweepMinAgeMs,
+    onError: (message) => logger.warn(redactSensitiveText(message)),
+  });
+  logger.log(
+    `Startup temp sweep — ${JSON.stringify(startupSweep)} (root exists, age threshold ${transcodeConfig.tempSweepMinAgeMinutes}m).`,
+  );
+
   const processor = app.get(TranscodeJobProcessor);
-  const worker = startTranscodeWorker(transcodeConfig.redisUrl!, processor);
+  const worker = startTranscodeWorker(
+    transcodeConfig.redisUrl!,
+    processor,
+    transcodeConfig.workerConcurrency,
+  );
 
   logger.log(
-    'Transcode worker started — persistent mode (TRANSCODE_ENABLED=true).',
+    `Transcode worker started — persistent mode (TRANSCODE_ENABLED=true), concurrency ${transcodeConfig.workerConcurrency}.`,
   );
 
   // Slice 11P: periodic janitor sweeps — `TranscodeJanitorService`'s own
@@ -108,17 +136,31 @@ export async function bootstrapWorker(): Promise<void> {
           ),
         ),
       );
+    // The startup sweep alone would leave a worker that stays up for weeks
+    // accumulating scratch from every crash in between. `sweepStaleWorkerTempDirs`
+    // never throws, so this needs no `.catch` of its own.
+    void sweepStaleWorkerTempDirs({
+      root: tempRoot,
+      minAgeMs: tempSweepMinAgeMs,
+      onError: (message) => logger.warn(redactSensitiveText(message)),
+    });
   }, TRANSCODE_JANITOR_INTERVAL_MS);
 
   await new Promise<void>((resolve) => {
-    const shutdown = (signal: string): void => {
-      logger.log(`Received ${signal} — shutting down transcode worker...`);
-      clearInterval(janitorInterval);
-      void worker
-        .close()
-        .then(() => app.close())
-        .then(() => resolve());
-    };
+    const shutdown = createGracefulShutdown(
+      {
+        // NO `force` — BullMQ stops fetching new jobs and then waits for the
+        // in-flight one to finish. See `worker-shutdown.ts` for the full
+        // ordering rationale and for why the deployment must grant a stop
+        // grace period long enough to let this complete.
+        closeWorker: () => worker.close(),
+        closeApp: () => app.close(),
+        stopJanitor: () => clearInterval(janitorInterval),
+        log: (message) => logger.log(message),
+        logError: (message) => logger.error(redactSensitiveText(message)),
+      },
+      resolve,
+    );
 
     process.on('SIGTERM', () => shutdown('SIGTERM'));
     process.on('SIGINT', () => shutdown('SIGINT'));

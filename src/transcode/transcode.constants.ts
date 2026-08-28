@@ -73,14 +73,6 @@ export const TRANSCODE_WORKER_TEMP_DIR_PREFIX = '11p-transcode-worker-';
 export const TRANSCODE_BACKOFF_BASE_DELAY_MS = 60_000;
 
 /**
- * Slice 11P: BullMQ `Worker` concurrency for the transcode worker
- * (`src/worker/transcode-worker.ts`) — proposal §1/§13: "Concurrency 1 ...
- * so transcoding never starves the API" (this repo's prod v1 topology runs
- * API/Redis/worker as separate processes on one machine).
- */
-export const TRANSCODE_WORKER_CONCURRENCY = 1;
-
-/**
  * Slice 11P: how often (ms) BullMQ itself checks for stalled jobs
  * (`Worker`'s own `stalledInterval` option) — a complementary,
  * queue-level mechanism to `TranscodeJanitorService.sweepStaleRunning`'s

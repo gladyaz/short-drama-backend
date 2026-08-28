@@ -60,8 +60,11 @@ scripts/hls-wave-enqueue.ts          node dist/worker/main
                     ─▶ poster (if none) ─▶ promoteIfCurrent()  ← the only flip
 ```
 
-`TRANSCODE_WORKER_CONCURRENCY` is `1`, so a five-episode wave transcodes
+Worker concurrency **defaults to `1`**, so a five-episode wave transcodes
 **serially**, never in parallel — by design, so ffmpeg never starves the API.
+It is now an operator-set value (`TRANSCODE_WORKER_CONCURRENCY`) rather than a
+compile-time constant; on a dedicated VPS it may be raised deliberately after
+measurement. See `docs/TRANSCODE_WORKER_VPS.md` ("Concurrency sizing").
 
 ### Trigger
 

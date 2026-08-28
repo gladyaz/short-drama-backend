@@ -50,6 +50,21 @@ export function buildHlsStagingPrefix(
   return `${buildHlsHomePrefix(mediaId)}v${processingVersion}-a${attempt}-${uuid}/`;
 }
 
+/**
+ * The generation NAME (`v<version>-a<attempt>-<uuid>`) — the last path
+ * segment of a staging prefix built by `buildHlsStagingPrefix`.
+ *
+ * Exists so callers that need to NAME a generation (structured worker logs,
+ * `docs/TRANSCODE_WORKER_VPS.md`'s queue-inspection recipes) read it back
+ * off the prefix instead of re-deriving it from `(mediaId, version, attempt,
+ * uuid)`. Re-deriving would put a second copy of the naming formula in the
+ * codebase, free to drift from the one that actually names the R2 directory.
+ */
+export function deriveGenerationName(stagingPrefix: string): string {
+  const segments = stagingPrefix.split('/').filter((s) => s.length > 0);
+  return segments[segments.length - 1] ?? '';
+}
+
 export function buildHlsMasterPlaylistKey(stagingPrefix: string): string {
   return `${stagingPrefix}master.m3u8`;
 }

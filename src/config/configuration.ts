@@ -159,6 +159,35 @@ export interface TranscodeConfig {
    * under it, even though this slice never issues such a token itself.
    */
   cleanupGraceMinutes: number;
+  /**
+   * VPS DEPLOYMENT: how many transcode jobs one worker process runs at
+   * once (BullMQ `Worker`'s `concurrency`). Optional even when the flag is
+   * on — defaults to `DEFAULT_TRANSCODE_WORKER_CONCURRENCY` (1), and is
+   * NEVER derived from the machine's CPU count; see that constant's doc
+   * comment for why, and `docs/TRANSCODE_WORKER_VPS.md` for sizing.
+   */
+  workerConcurrency: number;
+  /**
+   * VPS DEPLOYMENT: the parent directory each job's own isolated
+   * `fs.mkdtemp` working directory is created under. `undefined` (the
+   * default) means `os.tmpdir()`, preserving the pre-existing behavior
+   * exactly.
+   *
+   * Exists so a container can point transcoding scratch space at a mounted
+   * volume with real headroom instead of an image's small default `/tmp` —
+   * a single job holds the downloaded source AND the full HLS package on
+   * this filesystem simultaneously. Never a secret (it is a path, and
+   * `redactSensitiveText` maps `STORAGE_ROOT` specifically, not this).
+   */
+  tempDir: string | undefined;
+  /**
+   * VPS DEPLOYMENT: how long a leftover per-job temp directory must sit
+   * untouched before `sweepStaleWorkerTempDirs` removes it. Optional, with
+   * `DEFAULT_TRANSCODE_TEMP_SWEEP_MIN_AGE_MINUTES` as the documented
+   * default — see that constant for why it is deliberately longer than the
+   * stalled-row threshold.
+   */
+  tempSweepMinAgeMinutes: number;
 }
 
 /**
@@ -187,6 +216,38 @@ export const DEFAULT_TRANSCODE_STALLED_AFTER_MINUTES = 30;
  * ships.
  */
 export const DEFAULT_TRANSCODE_CLEANUP_GRACE_MINUTES = 120;
+
+/**
+ * VPS DEPLOYMENT default for `TranscodeConfig.workerConcurrency` — how many
+ * transcode jobs ONE worker process runs at once (BullMQ `Worker`'s
+ * `concurrency`, threaded in by `src/worker/main.ts`).
+ *
+ * Stays `1`, and is NEVER derived from `os.cpus().length`. An FFmpeg rung
+ * encode is both CPU- and memory-hungry, and every concurrent job
+ * additionally holds a full downloaded source PLUS a complete HLS package on
+ * local disk at the same time (see `TRANSCODE_WORKER_TEMP_DIR_PREFIX`) — so
+ * "one job per core" would exhaust RAM and disk on a small VPS long before
+ * it exhausted CPU, and would also starve the API if the two ever shared a
+ * box (proposal §1/§13). Raising it is an explicit operator decision made
+ * against a measured machine; `docs/TRANSCODE_WORKER_VPS.md`
+ * ("Concurrency sizing") carries the per-size guidance.
+ */
+export const DEFAULT_TRANSCODE_WORKER_CONCURRENCY = 1;
+
+/**
+ * VPS DEPLOYMENT default for `TranscodeConfig.tempSweepMinAgeMinutes` — how
+ * long a leftover per-job temp directory must sit untouched before
+ * `sweepStaleWorkerTempDirs` (`../transcode/transcode-temp.ts`) deletes it.
+ *
+ * Deliberately LONGER than `DEFAULT_TRANSCODE_STALLED_AFTER_MINUTES` (30).
+ * The sweep runs at worker startup and on the janitor interval, and on a box
+ * running more than one worker it can see a directory belonging to another
+ * process's still-running job. Anchoring the threshold above the point at
+ * which the DB-level janitor would ALREADY have declared such a row stalled
+ * means anything old enough for this sweep to delete is, by construction, no
+ * longer owned by a live job.
+ */
+export const DEFAULT_TRANSCODE_TEMP_SWEEP_MIN_AGE_MINUTES = 120;
 
 /**
  * Slice 11Q — Private HLS Delivery Gateway (control workspace DECISIONS.md
@@ -489,6 +550,15 @@ export default (): RootConfig => ({
       process.env.TRANSCODE_CLEANUP_GRACE_MINUTES,
       DEFAULT_TRANSCODE_CLEANUP_GRACE_MINUTES,
     ),
+    workerConcurrency: parsePositiveIntEnv(
+      process.env.TRANSCODE_WORKER_CONCURRENCY,
+      DEFAULT_TRANSCODE_WORKER_CONCURRENCY,
+    ),
+    tempDir: normalizeOptionalEnv(process.env.TRANSCODE_TEMP_DIR),
+    tempSweepMinAgeMinutes: parsePositiveIntEnv(
+      process.env.TRANSCODE_TEMP_SWEEP_MIN_AGE_MINUTES,
+      DEFAULT_TRANSCODE_TEMP_SWEEP_MIN_AGE_MINUTES,
+    ),
   },
   hlsGateway: {
     baseUrl: process.env.HLS_GATEWAY_BASE_URL,
@@ -581,6 +651,24 @@ function parsePositiveIntEnv(
  * every other parser in this file follows — `env.validation.ts` has already
  * failed the boot for a malformed value by the time this runs.
  */
+/**
+ * Normalizes an OPTIONAL free-form env value: an unset OR
+ * whitespace-only variable both resolve to `undefined`, never `''`.
+ *
+ * Mirrors `StorageConfig.publicBaseUrl`/`HlsGatewayConfig.baseUrl`'s existing
+ * "never default a genuinely absent value to an empty string" rule — an `''`
+ * path would silently become the process's working directory rather than
+ * falling back to the documented default.
+ */
+function normalizeOptionalEnv(value: string | undefined): string | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  const trimmed = value.trim();
+  return trimmed.length === 0 ? undefined : trimmed;
+}
+
 function parseNonNegativeIntEnv(
   value: string | undefined,
   fallback: number,

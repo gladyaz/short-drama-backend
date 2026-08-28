@@ -1,5 +1,24 @@
-import { shouldRethrowForBullMqRetry } from './transcode-worker';
+import { Worker } from 'bullmq';
+import {
+  shouldRethrowForBullMqRetry,
+  startTranscodeWorker,
+} from './transcode-worker';
+import { TranscodeJobProcessor } from '../transcode/transcode-job-processor.service';
+import { TRANSCODE_QUEUE_NAME } from '../transcode/transcode.constants';
 import { TranscodeJobOutcome } from '../transcode/transcode.types';
+
+// Both are mocked wholesale so this file NEVER opens a real Redis
+// connection — the reason `startTranscodeWorker` was previously left
+// entirely untested (see its own doc comment). Mocking the two transports
+// lets the one operator-facing property below be proven without relaxing
+// that constraint at all.
+jest.mock('bullmq', () => ({
+  Worker: jest.fn().mockImplementation(() => ({ on: jest.fn() })),
+}));
+jest.mock('ioredis', () => ({
+  __esModule: true,
+  default: jest.fn().mockImplementation(() => ({})),
+}));
 
 /**
  * Slice 11P — `transcode-worker.ts`'s own doc comment explains why
@@ -49,5 +68,57 @@ describe('shouldRethrowForBullMqRetry', () => {
     const outcome: TranscodeJobOutcome = { outcome: 'superseded', reason };
 
     expect(shouldRethrowForBullMqRetry(outcome)).toBe(false);
+  });
+});
+
+/**
+ * VPS DEPLOYMENT (work unit "TRANSCODE WORKER VPS DEPLOYMENT") — concurrency
+ * is now an operator-set value rather than a compile-time constant, so the
+ * one thing worth proving is that the number actually REACHES BullMQ.
+ *
+ * A break here is invisible in every other test and in the worker's own
+ * startup log (which reports the config value, not what BullMQ received): an
+ * operator would size a box, set the variable, watch the log confirm it, and
+ * still get a single-threaded worker.
+ */
+describe('startTranscodeWorker — concurrency wiring', () => {
+  const WorkerMock = Worker as unknown as jest.Mock;
+
+  /** The BullMQ `Worker` constructor signature, as this file asserts against it. */
+  type WorkerCall = [string, unknown, Record<string, unknown>];
+
+  beforeEach(() => {
+    WorkerMock.mockClear();
+  });
+
+  function firstWorkerCall(): WorkerCall {
+    return (WorkerMock.mock.calls as WorkerCall[])[0];
+  }
+
+  function optionsForConcurrency(concurrency: number): Record<string, unknown> {
+    startTranscodeWorker(
+      'redis://localhost:6379',
+      {} as unknown as TranscodeJobProcessor,
+      concurrency,
+    );
+
+    return firstWorkerCall()[2];
+  }
+
+  it.each([1, 2, 4])(
+    'passes the caller-supplied concurrency (%i) straight through to the BullMQ Worker',
+    (concurrency) => {
+      expect(optionsForConcurrency(concurrency)).toMatchObject({ concurrency });
+    },
+  );
+
+  it('binds the worker to the single canonical transcode queue', () => {
+    startTranscodeWorker(
+      'redis://localhost:6379',
+      {} as unknown as TranscodeJobProcessor,
+      1,
+    );
+
+    expect(firstWorkerCall()[0]).toBe(TRANSCODE_QUEUE_NAME);
   });
 });

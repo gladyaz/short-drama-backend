@@ -5,7 +5,6 @@ import { redactSensitiveText } from '../common/logging/redact';
 import { TranscodeJobProcessor } from '../transcode/transcode-job-processor.service';
 import {
   TRANSCODE_QUEUE_NAME,
-  TRANSCODE_WORKER_CONCURRENCY,
   TRANSCODE_WORKER_STALLED_INTERVAL_MS,
 } from '../transcode/transcode.constants';
 import {
@@ -71,8 +70,17 @@ export function shouldRethrowForBullMqRetry(
  *   (`TranscodeIntentService.requeueForRetry`), so the next delivery's
  *   `claimRunning` call succeeds normally.
  *
- * `concurrency: 1` (proposal §1/§13: "so transcoding never starves the
- * API"); `stalledInterval` is BullMQ's OWN complementary stalled-job
+ * `concurrency` is now an explicit PARAMETER rather than a module
+ * constant (VPS DEPLOYMENT, work unit "TRANSCODE WORKER VPS DEPLOYMENT").
+ * `src/worker/main.ts` passes `TranscodeConfig.workerConcurrency`, whose
+ * default is still `1` (proposal §1/§13: "so transcoding never starves the
+ * API") and is never derived from the machine's CPU count — see
+ * `DEFAULT_TRANSCODE_WORKER_CONCURRENCY` for why, and
+ * `docs/TRANSCODE_WORKER_VPS.md` for per-VPS-size sizing guidance. Passing
+ * it in rather than reading config here keeps this function a pure piece of
+ * BullMQ wiring with no configuration dependency of its own.
+ *
+ * `stalledInterval` is BullMQ's OWN complementary stalled-job
  * detection, distinct from — and not a replacement for —
  * `TranscodeJanitorService.sweepStaleRunning`'s DB-level detection (that one
  * is the backstop for a scenario BullMQ's own mechanism cannot cover: total
@@ -82,6 +90,7 @@ export function shouldRethrowForBullMqRetry(
 export function startTranscodeWorker(
   redisUrl: string,
   processor: TranscodeJobProcessor,
+  concurrency: number,
 ): Worker<TranscodeJobPayload> {
   const connection = new IORedis(redisUrl, {
     maxRetriesPerRequest: null,
@@ -113,7 +122,7 @@ export function startTranscodeWorker(
     },
     {
       connection,
-      concurrency: TRANSCODE_WORKER_CONCURRENCY,
+      concurrency,
       stalledInterval: TRANSCODE_WORKER_STALLED_INTERVAL_MS,
     },
   );

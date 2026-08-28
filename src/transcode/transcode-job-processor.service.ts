@@ -1,6 +1,5 @@
 import { randomUUID } from 'crypto';
 import { mkdtemp, readFile, readdir, rm } from 'fs/promises';
-import { tmpdir } from 'os';
 import { join } from 'path';
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
@@ -42,15 +41,54 @@ import { computeRenditionLadder } from './hls/rendition-ladder';
 import {
   buildHlsMasterPlaylistKey,
   buildHlsStagingPrefix,
+  deriveGenerationName,
 } from './hls-staging-key.util';
 import { TranscodeIntentService } from './transcode-intent.service';
-import { TRANSCODE_WORKER_TEMP_DIR_PREFIX } from './transcode.constants';
+import {
+  formatTranscodeJobEvent,
+  stageForErrorCode,
+  TranscodeJobLogEvent,
+  TranscodeJobStage,
+  TranscodeSupersededReason,
+} from './transcode-job-log';
+import { resolveWorkerTempRoot } from './transcode-temp';
+import {
+  buildTranscodeJobId,
+  TRANSCODE_WORKER_TEMP_DIR_PREFIX,
+} from './transcode.constants';
 import {
   HlsRenditionSummary,
   TranscodeErrorCode,
   TranscodeJobOutcome,
   TranscodeJobPayload,
 } from './transcode.types';
+
+/**
+ * Everything ONE delivery of ONE job needs, assembled once in `process`
+ * after the claim succeeds and passed down by value.
+ *
+ * Deliberately a parameter object rather than instance state on the
+ * `@Injectable()` singleton: with `TRANSCODE_WORKER_CONCURRENCY > 1` (VPS
+ * DEPLOYMENT) the SAME processor instance runs several jobs at once, so any
+ * per-job field stored on `this` would be silently shared between them —
+ * the kind of bug that only appears on the operator's bigger box.
+ */
+interface TranscodeRunContext {
+  videoId: string;
+  processingVersion: number;
+  /** Deterministic BullMQ job id — see `TranscodeJobLogEvent.jobId`. */
+  jobId: string;
+  /** The `v<version>-a<attempt>-<uuid>` segment of `stagingPrefix`. */
+  generation: string;
+  tempDir: string;
+  stagingPrefix: string;
+  uploadedKeys: string[];
+  hadExistingPoster: boolean;
+  isFinalAttempt: boolean;
+  attempt: number;
+  maxAttempts: number;
+  startedAtMs: number;
+}
 
 /** Local source file name inside this job's own temp directory. */
 const SOURCE_TEMP_FILENAME = 'source.mp4';
@@ -161,6 +199,22 @@ export class TranscodeJobProcessor {
 
   async process(payload: TranscodeJobPayload): Promise<TranscodeJobOutcome> {
     const { videoId, processingVersion } = payload;
+    const startedAtMs = Date.now();
+    const jobId = buildTranscodeJobId(videoId, processingVersion);
+
+    // Every pre-claim exit shares the same shape: no attempt was started, so
+    // there is no generation and no stage beyond `claim`.
+    const claimBoundaryEvent = (
+      failureCategory: TranscodeSupersededReason,
+    ): TranscodeJobLogEvent => ({
+      videoId,
+      jobId,
+      generation: null,
+      stage: 'claim',
+      outcome: 'superseded',
+      durationMs: Date.now() - startedAtMs,
+      failureCategory,
+    });
 
     const row = await this.prisma.video.findUnique({
       where: { id: videoId },
@@ -173,12 +227,15 @@ export class TranscodeJobProcessor {
     });
 
     if (!row) {
+      this.emit(claimBoundaryEvent('ROW_NOT_FOUND'));
       return { outcome: 'superseded', reason: 'ROW_NOT_FOUND' };
     }
     if (row.processingVersion !== processingVersion) {
+      this.emit(claimBoundaryEvent('VERSION_MISMATCH'));
       return { outcome: 'superseded', reason: 'VERSION_MISMATCH' };
     }
     if (row.processingState !== 'queued') {
+      this.emit(claimBoundaryEvent('NOT_QUEUED'));
       return { outcome: 'superseded', reason: 'NOT_QUEUED' };
     }
 
@@ -187,13 +244,15 @@ export class TranscodeJobProcessor {
       processingVersion,
     );
     if (claimed === 0) {
+      this.emit(claimBoundaryEvent('CLAIM_RACE_LOST'));
       return { outcome: 'superseded', reason: 'CLAIM_RACE_LOST' };
     }
 
     const attempt = row.processingAttempts + 1;
-    const maxAttempts = this.configService.get('transcode', {
+    const transcodeConfig = this.configService.get('transcode', {
       infer: true,
-    })!.maxAttempts;
+    })!;
+    const maxAttempts = transcodeConfig.maxAttempts;
 
     if (attempt > maxAttempts) {
       await this.intentService.failWithError(
@@ -202,6 +261,18 @@ export class TranscodeJobProcessor {
         'MAX_ATTEMPTS_EXCEEDED',
         `Exceeded the maximum of ${maxAttempts} processing attempt(s).`,
       );
+      this.emit({
+        videoId,
+        jobId,
+        generation: null,
+        stage: 'claim',
+        outcome: 'failed',
+        durationMs: Date.now() - startedAtMs,
+        failureCategory: 'MAX_ATTEMPTS_EXCEEDED',
+        terminal: true,
+        attempt,
+        maxAttempts,
+      });
       return {
         outcome: 'failed',
         errorCode: 'MAX_ATTEMPTS_EXCEEDED',
@@ -209,8 +280,15 @@ export class TranscodeJobProcessor {
       };
     }
 
+    // VPS DEPLOYMENT: the parent directory is operator-configurable
+    // (`TRANSCODE_TEMP_DIR`) so a container can put multi-GB transcoding
+    // scratch on a volume with real headroom instead of a small image
+    // `/tmp`. `undefined` keeps the historical `os.tmpdir()` behavior
+    // exactly. The per-job directory itself is still a fresh `mkdtemp`, so
+    // concurrent jobs can never collide regardless of where the root is.
+    const tempRoot = await resolveWorkerTempRoot(transcodeConfig.tempDir);
     const tempDir = await mkdtemp(
-      join(tmpdir(), TRANSCODE_WORKER_TEMP_DIR_PREFIX),
+      join(tempRoot, TRANSCODE_WORKER_TEMP_DIR_PREFIX),
     );
     const stagingPrefix = buildHlsStagingPrefix(
       videoId,
@@ -218,6 +296,12 @@ export class TranscodeJobProcessor {
       attempt,
       randomUUID(),
     );
+    // The generation NAME is the last path segment of the staging prefix
+    // (`v<version>-a<attempt>-<uuid>`) — derived from the prefix rather than
+    // rebuilt from the same three inputs, so `buildHlsStagingPrefix` stays
+    // the only place that formula exists and a log line can never disagree
+    // with the R2 directory it claims to describe.
+    const generation = deriveGenerationName(stagingPrefix);
     const uploadedKeys: string[] = [];
     const hadExistingPoster = row.thumbnailImageKey !== null;
     // This attempt is the LAST one the cap allows — a real pipeline failure
@@ -227,39 +311,62 @@ export class TranscodeJobProcessor {
     // with the less useful `MAX_ATTEMPTS_EXCEEDED` on a wasted extra cycle.
     const isFinalAttempt = attempt >= maxAttempts;
 
+    const ctx: TranscodeRunContext = {
+      videoId,
+      processingVersion,
+      jobId,
+      generation,
+      tempDir,
+      stagingPrefix,
+      uploadedKeys,
+      hadExistingPoster,
+      isFinalAttempt,
+      attempt,
+      maxAttempts,
+      startedAtMs,
+    };
+
     this.logger.log(
       redactSensitiveText(
         `Transcode job accepted: media "${videoId}" version ${processingVersion} attempt ${attempt}/${maxAttempts}.`,
       ),
     );
-    const startedAtMs = Date.now();
+    this.emit({
+      videoId,
+      jobId,
+      generation,
+      stage: 'claim',
+      outcome: 'accepted',
+      durationMs: Date.now() - startedAtMs,
+      attempt,
+      maxAttempts,
+    });
 
     try {
-      return await this.runPipeline({
-        videoId,
-        processingVersion,
-        tempDir,
-        stagingPrefix,
-        uploadedKeys,
-        hadExistingPoster,
-        isFinalAttempt,
-        startedAtMs,
-      });
+      return await this.runPipeline(ctx);
     } finally {
+      // TEMP CLEANUP IS UNCONDITIONAL AND RUNS LAST. Every path that leaves
+      // `runPipeline` — promoted, failed, superseded, or an unexpected throw
+      // — has ALREADY captured this attempt's diagnostic state before
+      // reaching here: `fail` writes the durable `processingErrorCode`/
+      // `processingErrorMessage` to the row and emits the structured failure
+      // event (stage, failure category, duration) first. Nothing
+      // diagnostically useful lives only inside this directory by the time
+      // it is removed, which is what makes an unconditional delete safe
+      // rather than destructive — and what keeps a crash-looping job from
+      // filling the disk with multi-GB scratch nobody will ever read.
       await rm(tempDir, { recursive: true, force: true });
     }
   }
 
-  private async runPipeline(ctx: {
-    videoId: string;
-    processingVersion: number;
-    tempDir: string;
-    stagingPrefix: string;
-    uploadedKeys: string[];
-    hadExistingPoster: boolean;
-    isFinalAttempt: boolean;
-    startedAtMs: number;
-  }): Promise<TranscodeJobOutcome> {
+  /** Writes one structured lifecycle event (see `./transcode-job-log.ts`). */
+  private emit(event: TranscodeJobLogEvent): void {
+    this.logger.log(formatTranscodeJobEvent(event));
+  }
+
+  private async runPipeline(
+    ctx: TranscodeRunContext,
+  ): Promise<TranscodeJobOutcome> {
     const { videoId, processingVersion, tempDir, stagingPrefix, uploadedKeys } =
       ctx;
     const sourcePath = join(tempDir, SOURCE_TEMP_FILENAME);
@@ -271,12 +378,9 @@ export class TranscodeJobProcessor {
       );
     } catch (error) {
       return this.fail(
-        videoId,
-        processingVersion,
+        ctx,
         'SOURCE_MISSING',
         `Failed to download source object: ${briefMessage(error)}`,
-        uploadedKeys,
-        ctx.isFinalAttempt,
       );
     }
 
@@ -285,12 +389,9 @@ export class TranscodeJobProcessor {
       probe = await this.probeClient.probe(sourcePath);
     } catch (error) {
       return this.fail(
-        videoId,
-        processingVersion,
+        ctx,
         'PROBE_FAILED',
         `ffprobe failed: ${briefMessage(error)}`,
-        uploadedKeys,
-        ctx.isFinalAttempt,
       );
     }
 
@@ -300,7 +401,7 @@ export class TranscodeJobProcessor {
       probe,
     );
     if (probeRecorded === 0) {
-      return this.abortSuperseded(uploadedKeys);
+      return this.abortSuperseded(ctx);
     }
 
     const ladder = computeRenditionLadder(probe);
@@ -325,15 +426,12 @@ export class TranscodeJobProcessor {
       );
     } catch (error) {
       if (error instanceof SupersededMidRunSignal) {
-        return this.abortSuperseded(uploadedKeys);
+        return this.abortSuperseded(ctx);
       }
       return this.fail(
-        videoId,
-        processingVersion,
+        ctx,
         'TRANSCODE_FAILED',
         `HLS transcode failed: ${briefMessage(error)}`,
-        uploadedKeys,
-        ctx.isFinalAttempt,
       );
     }
 
@@ -343,7 +441,7 @@ export class TranscodeJobProcessor {
       'packaging',
     );
     if (!packagingStepOk) {
-      return this.abortSuperseded(uploadedKeys);
+      return this.abortSuperseded(ctx);
     }
 
     const masterBuild = this.masterPlaylistService.build(
@@ -360,7 +458,7 @@ export class TranscodeJobProcessor {
       'uploading',
     );
     if (!uploadingStepOk) {
-      return this.abortSuperseded(uploadedKeys);
+      return this.abortSuperseded(ctx);
     }
 
     try {
@@ -373,12 +471,9 @@ export class TranscodeJobProcessor {
       );
     } catch (error) {
       return this.fail(
-        videoId,
-        processingVersion,
+        ctx,
         'UPLOAD_FAILED',
         `Uploading HLS artifacts failed: ${briefMessage(error)}`,
-        uploadedKeys,
-        ctx.isFinalAttempt,
       );
     }
 
@@ -388,7 +483,7 @@ export class TranscodeJobProcessor {
       'verifying',
     );
     if (!verifyingStepOk) {
-      return this.abortSuperseded(uploadedKeys);
+      return this.abortSuperseded(ctx);
     }
 
     const validation = await this.validator.validate(
@@ -400,24 +495,18 @@ export class TranscodeJobProcessor {
     );
     if (!validation.valid) {
       return this.fail(
-        videoId,
-        processingVersion,
+        ctx,
         'HLS_PACKAGE_VALIDATION_FAILED',
         `Local package validation failed: ${validation.issues.map((i) => i.code).join(', ')}`,
-        uploadedKeys,
-        ctx.isFinalAttempt,
       );
     }
 
     const verified = await this.verifyUploadedKeys(uploadedKeys);
     if (!verified) {
       return this.fail(
-        videoId,
-        processingVersion,
+        ctx,
         'UPLOAD_VERIFICATION_FAILED',
         'One or more uploaded HLS artifacts failed remote verification.',
-        uploadedKeys,
-        ctx.isFinalAttempt,
       );
     }
 
@@ -428,7 +517,7 @@ export class TranscodeJobProcessor {
         'poster',
       );
       if (!posterStepOk) {
-        return this.abortSuperseded(uploadedKeys);
+        return this.abortSuperseded(ctx);
       }
 
       let posterKey: string;
@@ -440,12 +529,9 @@ export class TranscodeJobProcessor {
         );
       } catch (error) {
         return this.fail(
-          videoId,
-          processingVersion,
+          ctx,
           'POSTER_GENERATION_FAILED',
           `Poster generation failed: ${briefMessage(error)}`,
-          uploadedKeys,
-          ctx.isFinalAttempt,
         );
       }
 
@@ -455,7 +541,7 @@ export class TranscodeJobProcessor {
         posterKey,
       );
       if (posterRecorded === 0) {
-        return this.abortSuperseded(uploadedKeys);
+        return this.abortSuperseded(ctx);
       }
     }
 
@@ -476,7 +562,7 @@ export class TranscodeJobProcessor {
     );
 
     if (promoted === 0) {
-      return this.abortSuperseded(uploadedKeys, 'PROMOTION_RACE_LOST');
+      return this.abortSuperseded(ctx, 'PROMOTION_RACE_LOST');
     }
 
     this.logger.log(
@@ -485,6 +571,16 @@ export class TranscodeJobProcessor {
           `— ${artifacts.length} rendition(s), ${(Date.now() - ctx.startedAtMs) / 1000}s wall-clock.`,
       ),
     );
+    this.emit({
+      videoId,
+      jobId: ctx.jobId,
+      generation: ctx.generation,
+      stage: 'promote',
+      outcome: 'promoted',
+      durationMs: Date.now() - ctx.startedAtMs,
+      attempt: ctx.attempt,
+      maxAttempts: ctx.maxAttempts,
+    });
 
     return { outcome: 'promoted', hlsMasterKey };
   }
@@ -574,14 +670,13 @@ export class TranscodeJobProcessor {
    * (the BullMQ wrapper) is expected to use this distinction.
    */
   private async fail(
-    videoId: string,
-    expectedVersion: number,
+    ctx: TranscodeRunContext,
     errorCode: TranscodeErrorCode,
     errorMessage: string,
-    uploadedKeys: string[],
-    isFinalAttempt: boolean,
   ): Promise<TranscodeJobOutcome> {
-    await this.cleanupKeys(uploadedKeys);
+    const { videoId, processingVersion: expectedVersion, isFinalAttempt } = ctx;
+
+    await this.cleanupKeys(ctx.uploadedKeys);
 
     this.logger.warn(
       redactSensitiveText(
@@ -589,6 +684,24 @@ export class TranscodeJobProcessor {
           `media "${videoId}" version ${expectedVersion} — ${errorCode}: ${errorMessage}`,
       ),
     );
+    // Emitted HERE, before the CAS write and long before `process`'s
+    // `finally` removes the temp directory — the diagnostic state for this
+    // attempt (which stage, which category, how long it ran) is durable in
+    // the log stream no matter what the CAS below reports or how the
+    // process ends afterwards.
+    this.emit({
+      videoId,
+      jobId: ctx.jobId,
+      generation: ctx.generation,
+      stage: stageForErrorCode(errorCode),
+      outcome: 'failed',
+      durationMs: Date.now() - ctx.startedAtMs,
+      failureCategory: errorCode,
+      terminal: isFinalAttempt,
+      attempt: ctx.attempt,
+      maxAttempts: ctx.maxAttempts,
+      errorDetail: errorMessage,
+    });
 
     const affected = isFinalAttempt
       ? await this.intentService.failWithError(
@@ -615,10 +728,24 @@ export class TranscodeJobProcessor {
 
   /** Cleans up this job's own staging (no DB write) and returns a `superseded` outcome. */
   private async abortSuperseded(
-    uploadedKeys: string[],
+    ctx: TranscodeRunContext,
     reason: 'SUPERSEDED_MID_RUN' | 'PROMOTION_RACE_LOST' = 'SUPERSEDED_MID_RUN',
+    stage: TranscodeJobStage = 'promote',
   ): Promise<TranscodeJobOutcome> {
-    await this.cleanupKeys(uploadedKeys);
+    await this.cleanupKeys(ctx.uploadedKeys);
+
+    this.emit({
+      videoId: ctx.videoId,
+      jobId: ctx.jobId,
+      generation: ctx.generation,
+      stage,
+      outcome: 'superseded',
+      durationMs: Date.now() - ctx.startedAtMs,
+      failureCategory: reason,
+      attempt: ctx.attempt,
+      maxAttempts: ctx.maxAttempts,
+    });
+
     return { outcome: 'superseded', reason };
   }
 

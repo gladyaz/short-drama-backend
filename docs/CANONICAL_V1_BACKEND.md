@@ -8,6 +8,7 @@
 | Branch | `integration/red-panda-v1-final` |
 | Established at | commit `fd3c86c` (2026-08-28) |
 | Base | `fix/v1-provider-account-deletion` |
+| Last consolidation | 2026-08-28 — admin media ingestion + VPS transcode worker (§1) |
 | Deployment status | **Never deployed. No staging, no production.** |
 
 Every other `short-drama-backend-*` worktree on this machine is a historical
@@ -52,9 +53,40 @@ for b in $(git for-each-ref --format='%(refname:short)' refs/heads/); do
 done
 ```
 
+### Lines consolidated by cherry-pick
+
+Two completed V1 lines were folded in on 2026-08-28 by `git cherry-pick -x`
+rather than by merge, because each was a single cohesive commit sitting on the
+same base (`fd3c86c`) as this branch, and the three touched **no file in
+common**:
+
+| Line | Source commit | Commit here | Files |
+|---|---|---|---|
+| `feat/admin-media-ingestion` | `9526b4f` | `e6559f3` | 10 |
+| `feat/transcode-worker-deployment` | `344739f` | `7b812cc` | 34 |
+
+**Read this before running the `--is-ancestor` loop above.** Because these were
+cherry-picked, the two *branch tips* are **not** ancestors of HEAD and the loop
+prints `MISS` for both. That is a statement about git topology, not about
+content. All 44 files are byte-identical to their source commits, and each
+commit here carries a `(cherry picked from commit …)` trailer. Verify content
+rather than topology:
+
+```bash
+for c in 9526b4f 344739f; do
+  for f in $(git show --name-only --format= $c); do
+    [ "$(git rev-parse $c:"$f")" = "$(git rev-parse HEAD:"$f")" ] \
+      || echo "DIFFERS $c $f"
+  done
+done
+```
+
+Both tips are now **stale** — the content is here. Do not merge them.
+
 ### Branches deliberately NOT in this line
 
-Nine commits in the repository are not reachable from HEAD. None of them is
+Nine further commits are not reachable from HEAD — separately from the two
+cherry-picked tips above, which ARE fully represented. None of these nine is
 V1 backend scope, and none is lost work:
 
 - **Superseded by reconciliation.** `feat/auth-lock-order-hardening`,
@@ -91,6 +123,9 @@ V1 backend scope, and none is lost work:
 | Playback authorization / HLS gateway tokens | `src/transcode/hls/hls-playback-token.util.ts`, `src/videos/` | [playback-api-contract.md](playback-api-contract.md) |
 | R2 media storage + migration | `src/storage/`, `src/media/r2-migration/` | [R2_MEDIA_MIGRATION.md](R2_MEDIA_MIGRATION.md), [r2-readiness.md](r2-readiness.md) |
 | Queue (BullMQ + out-of-process worker) | `src/transcode/bullmq-transcode-queue.client.ts`, `src/worker/` | [HLS_TRANSCODE_WAVE.md](HLS_TRANSCODE_WAVE.md) |
+| Admin media ingestion (presigned direct-to-R2 PUT, HEAD-verified finalize) | `src/media/admin-media.controller.ts`, `src/media/admin-media.service.ts` | [admin-api-contract.md](admin-api-contract.md) |
+| Admin processing status + transcode retry | `src/media/admin-media-status.ts`, `src/transcode/transcode-intent.service.ts` | [admin-api-contract.md](admin-api-contract.md) |
+| Transcode worker VPS deployment package | `Dockerfile.worker`, `docker-compose.worker.yml`, `.dockerignore` | [TRANSCODE_WORKER_VPS.md](TRANSCODE_WORKER_VPS.md) |
 | Production HTTPS hardening | `src/config/env.validation.ts` | [PRODUCTION_HTTPS.md](PRODUCTION_HTTPS.md) |
 | Health / readiness | `src/health/` | `GET /health`, `/health/ready`, `/health/details` |
 | `CONTENT_ACCESS_MODE=free` | `src/config/content-access-mode.util.ts` | [PLAY_STORE_V1_BACKEND.md](PLAY_STORE_V1_BACKEND.md#5-content_access_mode) |
@@ -104,6 +139,24 @@ HTTP request path:
 
 - `src/main.ts` — the API (`AppModule`)
 - `src/worker/main.ts` — the transcode worker (`WorkerModule`)
+- `src/worker/health-main.ts` — the worker's one-shot health probe, used as the
+  container `HEALTHCHECK` (`npm run worker:health`)
+
+The worker ships a deployment package for an unattended VPS: `Dockerfile.worker`,
+`.dockerignore`, `docker-compose.worker.yml`, configurable BullMQ concurrency
+(`TRANSCODE_WORKER_CONCURRENCY`, default 1), a startup and periodic stale-temp
+sweep, structured per-job logs, and a re-entrant graceful `SIGTERM`/`SIGINT`
+shutdown that finishes in-flight work before exiting.
+
+> **The image has never been built or run.** Docker is not installed on this
+> machine, so `Dockerfile.worker` and `docker-compose.worker.yml` are reasoned
+> and reviewed, not executed. That is the one unproven part of the media path.
+
+> **Never start the worker against the default local Redis.**
+> `redis://127.0.0.1:6379` db 0 currently holds **27 real waiting jobs** in
+> `bull:media-transcode:wait`. Starting a worker there WILL transcode real
+> catalog media. For any live worker experiment use an isolated database index
+> you have verified empty (e.g. `redis://127.0.0.1:6379/15`).
 
 ---
 
@@ -159,6 +212,8 @@ are never committed.
 | `npm run media:r2-migrate` | R2 media migration (dry-run first) |
 | `npm run hls:wave-enqueue` | Enqueue a transcode wave |
 | `npm run hls:demote` | Demote a bad HLS generation (dry-run first) |
+| `npm run worker:transcode` | Start the out-of-process transcode worker — **reads the queue** |
+| `npm run worker:health` | One-shot worker health probe; the container `HEALTHCHECK` |
 | `npm run retention` | Retention job (dry-run by default) |
 | `npm run maintenance:series-cover-orphans` | Cover orphan cleanup (dry-run first) |
 
@@ -215,30 +270,41 @@ runbook's §3 for exactly what is outstanding.
 
 ---
 
-## 7. Verification baseline at establishment
+## 7. Verification baseline
 
-Recorded when this branch was made canonical, on commit `fd3c86c`, Node 22,
-against a local sandbox Postgres already migrated to the full 24-migration
-history. Reproduce with the commands in §4.
+Recorded on the consolidated HEAD (2026-08-28), Node 22, against a local
+sandbox Postgres migrated to the full 24-migration history **and seeded**, with
+local media fixtures generated. Reproduce with the commands in §4.
 
 | Check | Result |
 |---|---|
 | `npx prisma validate` | schema valid (Prisma 6.19.3) |
 | `npx prisma generate` | client generated |
-| Migrations | 24, monotonic, provider `postgresql` |
+| Migrations | 24, monotonic, provider `postgresql` — **unchanged by this consolidation** |
 | `npm run build` | pass |
 | `npm run lint:ci` | pass — 0 errors, 1 pre-existing warning |
-| `npm test -- --runInBand` | **139 passed / 1 skipped** of 140 suites; **2637 passed / 7 skipped** of 2644 tests |
-| `npm run test:e2e` | **32 passed** of 32 suites; **548 passed** of 548 tests |
-| `npm run release:gate` | **0 blockers**, 34 checks pass, 1 warning |
+| `npm test -- --runInBand` | **145 passed / 1 skipped** of 146 suites; **2762 passed / 7 skipped** of 2769 tests |
+| `npm run test:e2e` | **33 passed** of 33 suites; **563 passed** of 563 tests |
+| `npm run release:gate` | exit `0` — **0 blockers**, 34 pass, 1 warning, 2 skipped |
 | `release:gate` migration status vs a real database | pass (read-only, via `RELEASE_GATE_DATABASE_URL`) |
+
+Movement from the establishment baseline at `fd3c86c` (140 unit suites / 2644
+tests; 32 e2e suites / 548 tests): **+6 unit suites, +125 unit tests, +1 e2e
+suite, +15 e2e tests, 0 new blockers, 0 new failures.** The six new unit suites
+are `admin-media-ingestion`, `admin-media-status`, `transcode-job-log`,
+`transcode-temp`, `worker-health` and `worker-shutdown`; the new e2e suite is
+`admin-media-ingestion.e2e-spec.ts`.
 
 The one skipped unit suite is the Redis queue contract, which is opt-in by
 design (`npm run test:redis-contract`). The one lint warning is an unused
 `eslint-disable` directive in `src/media/r2-migration/run-r2-media-migration-cli.ts`.
 The one gate warning is the compiled-in `http://localhost:3000` development
 fallback in `src/config/configuration.ts`, which the gate reports every run by
-design.
+design. The two gate SKIPs are the full DB-backed unit suite (opt-in via
+`--with-db-tests`, because 53 of the unit suites talk to Postgres) and the
+migration-status check (which refuses to guess a database and runs only when
+`RELEASE_GATE_DATABASE_URL` is supplied explicitly — the row above records it
+passing when it was).
 
 ### Running the unit suite in parallel
 
@@ -267,6 +333,10 @@ a second clean run is the real signal. Do not point two worktrees at the same
   pushed to a remote.
 - **Do not merge the seven stale branches listed in §1.** Their content is
   already here.
+- **Do not merge `feat/admin-media-ingestion` or `feat/transcode-worker-deployment`.**
+  They were cherry-picked in; their tips are stale and merging them would
+  replay work already present. Verify by content, not by `--is-ancestor` — see
+  §1.
 - Prisma migrations are append-only and must stay monotonic; the release gate
   checks migration/schema consistency.
 - New work branches from `integration/red-panda-v1-final` and merges back into
@@ -280,3 +350,5 @@ a second clean run is the real signal. Do not point two worktrees at the same
 - [PLAY_STORE_V1_BACKEND.md](PLAY_STORE_V1_BACKEND.md) — V1 scope and catalog state
 - [PRODUCTION_DEPLOYMENT_REQUIREMENTS.md](PRODUCTION_DEPLOYMENT_REQUIREMENTS.md)
 - [PRODUCTION_HTTPS.md](PRODUCTION_HTTPS.md)
+- [admin-api-contract.md](admin-api-contract.md) — admin media ingestion, status and retry
+- [TRANSCODE_WORKER_VPS.md](TRANSCODE_WORKER_VPS.md) — worker deployment runbook

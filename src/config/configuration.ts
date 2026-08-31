@@ -1,3 +1,5 @@
+import { resolve } from 'path';
+
 export interface AppConfig {
   port: number;
   publicBaseUrl: string;
@@ -71,6 +73,17 @@ export const STORAGE_DRIVERS: readonly StorageDriver[] = ['local', 'r2'];
 export const DEFAULT_STORAGE_DRIVER: StorageDriver = 'local';
 
 /**
+ * Work unit "LOCAL SERIES COVER ARTWORK": where `StorageConfig.localRoot`
+ * points when `LOCAL_OBJECT_STORAGE_ROOT` is unset. Relative to the working
+ * directory rather than absolute, and under `storage/` — which `.gitignore`
+ * already excludes wholesale — because this directory holds GENERATED object
+ * bytes (the local stand-in for a bucket), never reviewable source assets.
+ * The reviewable originals live in the committed `assets/series-covers/`, and
+ * `npm run covers:ingest` is what copies them in.
+ */
+export const DEFAULT_LOCAL_OBJECT_STORAGE_ROOT = 'storage/local-objects';
+
+/**
  * Phase 11, work unit 11A-1: provider-agnostic S3-compatible object storage
  * config, read by `StorageModule`/`StorageService`. Named generically
  * (`OBJECT_STORAGE_*`, not `R2_*`) because the service itself is
@@ -102,6 +115,29 @@ export interface StorageConfig {
   accessKeyId: string;
   secretAccessKey: string;
   publicBaseUrl: string | undefined;
+  /**
+   * Work unit "LOCAL SERIES COVER ARTWORK": the directory that plays the
+   * role R2's bucket plays when `driver === 'local'` — object KEYS
+   * (`admin-series/<id>/cover/<uuid>`, the exact same layout
+   * `series-cover-key.util.ts` mints for R2) resolve to files underneath it,
+   * so a key is portable between the two drivers and a later R2 cutover is a
+   * file copy rather than a re-keying.
+   *
+   * DELIBERATELY NOT `AppConfig.storageRoot`. That path is the real company
+   * VIDEO library (`.env`'s `STORAGE_ROOT`, read-only as far as this app is
+   * concerned — `VideosController#streamVideo` only ever opens files under
+   * it). Ingesting artwork must never write into it, and a traversal bug
+   * here must never be able to reach it, so the two roots are separate
+   * values that no code path collapses into one.
+   *
+   * Optional, with a documented default (`<cwd>/storage/local-objects`, which
+   * `.gitignore`'s existing `/storage/` rule already excludes) — adding a
+   * REQUIRED variable would fail the boot of every existing local checkout
+   * and of `r2` deployments that have no local store at all. `r2` never reads
+   * it: `resolveSeriesCoverUrl` keeps returning presigned URLs there and
+   * `GET /series/:id/cover` refuses to serve outside the `local` driver.
+   */
+  localRoot: string;
 }
 
 /**
@@ -534,6 +570,7 @@ export default (): RootConfig => ({
     accessKeyId: process.env.OBJECT_STORAGE_ACCESS_KEY_ID ?? '',
     secretAccessKey: process.env.OBJECT_STORAGE_SECRET_ACCESS_KEY ?? '',
     publicBaseUrl: process.env.OBJECT_STORAGE_PUBLIC_BASE_URL,
+    localRoot: resolveLocalObjectStorageRoot(),
   },
   transcode: {
     enabled: process.env.TRANSCODE_ENABLED === 'true',
@@ -683,6 +720,25 @@ function parseNonNegativeIntEnv(
 
 function resolveStorageDriver(): StorageDriver {
   return process.env.STORAGE_DRIVER === 'r2' ? 'r2' : DEFAULT_STORAGE_DRIVER;
+}
+
+/**
+ * Work unit "LOCAL SERIES COVER ARTWORK": `LOCAL_OBJECT_STORAGE_ROOT`, or the
+ * documented default. `resolve()` (not a bare join) so a relative override is
+ * anchored to the working directory once, here, rather than being re-resolved
+ * against whatever `process.cwd()` happens to be at each read site.
+ *
+ * `normalizeOptionalEnv` first, for the reason its own doc gives: an
+ * empty/whitespace-only value must fall back to the default, never resolve to
+ * the working directory itself — which would turn the traversal guard's root
+ * into the whole repository.
+ */
+function resolveLocalObjectStorageRoot(): string {
+  const configured = normalizeOptionalEnv(
+    process.env.LOCAL_OBJECT_STORAGE_ROOT,
+  );
+
+  return resolve(configured ?? DEFAULT_LOCAL_OBJECT_STORAGE_ROOT);
 }
 
 /**

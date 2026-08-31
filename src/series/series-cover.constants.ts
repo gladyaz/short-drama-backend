@@ -50,3 +50,20 @@ export type AllowedSeriesCoverContentType =
  * itself permits far larger single-PUT objects.
  */
 export const MAX_SERIES_COVER_UPLOAD_BYTES = 10 * 1024 * 1024;
+
+/**
+ * Work unit "LOCAL SERIES COVER ARTWORK": `Cache-Control` for
+ * `GET /series/:id/cover`.
+ *
+ * PUBLIC because the route requires no credential and every viewer gets
+ * identical bytes, so a shared cache holding it leaks nothing.
+ *
+ * FIVE MINUTES, and deliberately NOT `immutable`. The object KEY is versioned
+ * (`buildSeriesCoverObjectKey` appends a fresh UUID per upload, so the bytes
+ * at a key never change), but this URL is not — it names the SERIES and
+ * resolves to whichever key is current. Marking it immutable would therefore
+ * pin a replaced cover in every client that had seen the old one, for as long
+ * as the cache lived. A short max-age keeps a repeat visit and a scrolling
+ * grid off the disk while bounding how long a replacement stays invisible.
+ */
+export const SERIES_COVER_CACHE_CONTROL = 'public, max-age=300';

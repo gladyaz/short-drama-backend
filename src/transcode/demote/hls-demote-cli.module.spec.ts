@@ -29,6 +29,7 @@ const DUMMY_STORAGE_CONFIG: RootConfig['storage'] = {
   accessKeyId: 'mock-access-key-id',
   secretAccessKey: 'mock-secret-access-key',
   publicBaseUrl: undefined,
+  localRoot: '/tmp/local-objects.test',
 };
 
 describe('HlsDemoteCliModule wiring', () => {

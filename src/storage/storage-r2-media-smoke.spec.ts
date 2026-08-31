@@ -486,6 +486,7 @@ function createStorageServiceFromEnv(client: S3Client): StorageService {
     // Private bucket: no public/`r2.dev`/custom-domain delivery is used or
     // required by this slice. `buildPublicUrl` is never called here.
     publicBaseUrl: undefined,
+    localRoot: '/tmp/local-objects.test',
   };
 
   const configService = {

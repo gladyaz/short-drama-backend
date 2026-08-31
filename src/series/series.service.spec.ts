@@ -1,6 +1,11 @@
+import { ConfigService } from '@nestjs/config';
 import { Test, TestingModule } from '@nestjs/testing';
 import { AppErrorCode } from '../common/errors/app-error-code';
 import { AppException } from '../common/errors/app.exception';
+import {
+  buildTestStorageConfig,
+  createConfigServiceMock,
+} from '../common/testing/config-mock.helpers';
 import { fixtureMarker } from '../common/testing/fixture-namespace.helpers';
 import {
   createPresignedGetUrlMock,
@@ -71,6 +76,18 @@ describe('SeriesService', () => {
         SeriesService,
         PrismaService,
         { provide: StorageService, useValue: storageService },
+        {
+          // Work unit "LOCAL SERIES COVER ARTWORK": `SeriesService` now reads
+          // the active storage driver so the admin read surface resolves
+          // `coverUrl` through the same driver-aware helper the public catalog
+          // uses. `r2` keeps every assertion in this file — all of which expect
+          // a presigned URL — describing the branch it was written for.
+          provide: ConfigService,
+          useValue: createConfigServiceMock({
+            app: { publicBaseUrl: 'http://localhost:3000' },
+            storage: buildTestStorageConfig({ driver: 'r2' }),
+          }),
+        },
       ],
     }).compile();
 

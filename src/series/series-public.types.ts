@@ -1,3 +1,5 @@
+import { AllowedSeriesCoverContentType } from './series-cover.constants';
+
 import { VideoResponseDto } from '../videos/video.types';
 
 /**
@@ -96,4 +98,25 @@ export interface SeriesListResponseDto {
  */
 export interface SeriesDetailPublicDto extends SeriesPublicDto {
   episodes: VideoResponseDto[];
+}
+
+/**
+ * Work unit "LOCAL SERIES COVER ARTWORK": what
+ * `PublicSeriesService.resolveLocalCoverFile` hands
+ * `SeriesPublicController#getCover` so the controller can stream artwork
+ * without itself knowing where the local object store lives or how a cover's
+ * format is determined.
+ *
+ * NOT a response DTO — none of these fields is ever serialised into a JSON
+ * body. `contentType` is narrowed to the closed upload allow-list rather than
+ * being a bare `string`, so the header this route sets can only ever be one
+ * of three real image types, as a matter of type-checking rather than
+ * reviewer vigilance.
+ */
+export interface LocalSeriesCoverFile {
+  /** Absolute path, already proven to resolve inside `StorageConfig.localRoot`. */
+  readonly absolutePath: string;
+  readonly contentType: AllowedSeriesCoverContentType;
+  /** `fstat` size of the same descriptor the format was verified on. */
+  readonly fileSize: number;
 }

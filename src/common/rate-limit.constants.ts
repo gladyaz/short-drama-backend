@@ -201,6 +201,33 @@ export const VIDEO_PLAYBACK_URL_RATE_LIMIT = 60;
 export const VIDEO_PLAYBACK_URL_RATE_TTL_MS = minutes(1);
 
 /**
+ * Work unit "LOCAL SERIES COVER ARTWORK": ceiling for
+ * `GET /series/:id/cover`, the `local` driver's public artwork route.
+ *
+ * WHY IT HAS ITS OWN, rather than inheriting the 300/min app-wide default:
+ * this is a PUBLIC, unauthenticated route that does filesystem I/O and
+ * returns a whole image per request — the same class of route
+ * `VIDEO_STREAM_RATE_LIMIT` already exists to bound, and the same reasoning
+ * applies at a smaller scale (a cover is tens of kilobytes, an episode is
+ * hundreds of megabytes, which is why this is a tighter ceiling in requests
+ * and a far looser one in bytes).
+ *
+ * 240/min is deliberately generous relative to real use. Discover renders one
+ * poster per series and the catalog has four; a cold, uncached grid is
+ * therefore four requests, and browsers additionally honour the
+ * `Cache-Control` this route sets. The ceiling exists to bound a scripted
+ * hammer, not to constrain a viewer — including several viewers behind one
+ * NAT, since `ThrottlerGuard` keys on IP.
+ *
+ * What this does NOT protect against, stated as plainly as
+ * `VIDEO_STREAM_RATE_LIMIT`'s doc states its own limits: a distributed
+ * caller with many source addresses, and total egress. It is a per-IP
+ * request ceiling and nothing more.
+ */
+export const SERIES_COVER_RATE_LIMIT = 240;
+export const SERIES_COVER_RATE_TTL_MS = minutes(1);
+
+/**
  * Work unit "ANONYMOUS FREE-EPISODE PLAYBACK" (Reviewer A, MEDIUM finding).
  * `GET /videos/:id/stream` became optional-auth in the same change that gave
  * `/videos/:id/playback` its override above, but was left on the generous

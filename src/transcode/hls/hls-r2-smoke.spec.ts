@@ -264,6 +264,7 @@ function createStorageServiceFromEnv(client: S3Client): StorageService {
     accessKeyId: process.env.OBJECT_STORAGE_ACCESS_KEY_ID!,
     secretAccessKey: process.env.OBJECT_STORAGE_SECRET_ACCESS_KEY!,
     publicBaseUrl: undefined,
+    localRoot: '/tmp/local-objects.test',
   };
 
   const configService = {

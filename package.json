@@ -24,6 +24,7 @@
     "test:e2e": "jest --config ./test/jest-e2e.json",
     "db:seed": "ts-node --compiler-options '{\"module\":\"CommonJS\"}' prisma/seed.ts",
     "media:fixtures": "ts-node --compiler-options '{\"module\":\"CommonJS\"}' scripts/generate-media-fixtures.ts",
+    "covers:ingest": "ts-node --compiler-options '{\"module\":\"CommonJS\"}' scripts/ingest-series-covers.ts",
     "media:r2-migrate": "ts-node --compiler-options '{\"module\":\"CommonJS\"}' scripts/run-r2-media-migration.ts",
     "smoke:production": "ts-node --compiler-options '{\"module\":\"CommonJS\"}' scripts/production-smoke-test.ts",
     "production:preflight": "ts-node --compiler-options '{\"module\":\"CommonJS\"}' scripts/production-preflight.ts",

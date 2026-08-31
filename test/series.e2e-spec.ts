@@ -5,6 +5,7 @@ import { App } from 'supertest/types';
 import { AppModule } from './../src/app.module';
 import { AppExceptionFilter } from './../src/common/filters/app-exception.filter';
 import { PrismaService } from './../src/prisma/prisma.service';
+import { expectedSeriesCoverUrl } from './../src/common/testing/series-cover-expectation.helpers';
 import { StorageService } from './../src/storage/storage.service';
 import { e2eSuiteBootBudgetMs } from './../src/common/testing/e2e-boot-budget.helpers';
 import {
@@ -1221,7 +1222,7 @@ describe('Series admin CRUD (e2e)', () => {
       );
     });
 
-    it('persists Series.coverImageKey only after verification succeeds, and returns a signed coverUrl', async () => {
+    it('persists Series.coverImageKey only after verification succeeds, and returns a usable coverUrl', async () => {
       const id = `${completePrefix}-success`;
       const key = await initUpload(id);
       mockHeadObjectOnce(coverSizeBytes, coverContentType);
@@ -1234,7 +1235,12 @@ describe('Series admin CRUD (e2e)', () => {
 
       const body = response.body as SeriesWithCoverDto;
       expect(body.coverImageKey).toBe(key);
-      expect(body.coverUrl).toContain(encodeURIComponent(key));
+      // Exact, and correct under either storage driver — see
+      // `expectedSeriesCoverUrl`. `coverImageKey` above is the durable answer
+      // this route persists; `coverUrl` is the derived, driver-specific way a
+      // client actually fetches it, and only the `r2` branch puts the key in
+      // the URL at all.
+      expect(body.coverUrl).toBe(expectedSeriesCoverUrl(app, id, key));
 
       const persisted = await prisma.series.findUnique({ where: { id } });
       expect(persisted?.coverImageKey).toBe(key);
@@ -1630,7 +1636,13 @@ describe('Series admin CRUD (e2e)', () => {
 
       const body = response.body as SeriesWithCoverDto;
       expect(body.archivedAt).not.toBeNull();
-      expect(body.coverUrl).toContain('archived-detail-uuid');
+      expect(body.coverUrl).toBe(
+        expectedSeriesCoverUrl(
+          app,
+          id,
+          'admin-series/x/cover/archived-detail-uuid',
+        ),
+      );
     });
   });
 

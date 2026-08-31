@@ -37,6 +37,7 @@ const TEST_STORAGE_CONFIG: RootConfig['storage'] = {
   accessKeyId: 'mock-access-key-id',
   secretAccessKey: 'mock-secret-access-key',
   publicBaseUrl: 'https://media.example.test',
+  localRoot: '/tmp/local-objects.test',
 };
 
 function buildFakeConfigService(
@@ -557,6 +558,7 @@ describe('StorageService', () => {
       const svc = new StorageService(
         buildFakeConfigService({
           publicBaseUrl: 'https://media.example.test/',
+          localRoot: '/tmp/local-objects.test',
         }),
         mockClient as unknown as S3Client,
       );
@@ -626,6 +628,7 @@ describe('StorageService', () => {
         const svc = new StorageService(
           buildFakeConfigService({
             publicBaseUrl: undefined,
+            localRoot: '/tmp/local-objects.test',
             accessKeyId: SENTINEL,
             secretAccessKey: SENTINEL,
             bucket: SENTINEL,

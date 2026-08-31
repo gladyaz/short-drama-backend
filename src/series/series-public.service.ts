@@ -1,3 +1,5 @@
+import { open } from 'fs/promises';
+import type { FileHandle } from 'fs/promises';
 import { HttpStatus, Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
@@ -5,6 +7,7 @@ import {
   ContentAccessMode,
   DEFAULT_CONTENT_ACCESS_MODE,
   RootConfig,
+  StorageConfig,
 } from '../config/configuration';
 import { readContentAccessMode } from '../config/content-access-mode.util';
 import { AppErrorCode } from '../common/errors/app-error-code';
@@ -19,7 +22,17 @@ import {
   toVideoRecord,
   toVideoResponseDto,
 } from '../videos/video-response.util';
-import { resolveSeriesCoverUrl } from './series-cover-url.util';
+import {
+  COVER_MAGIC_BYTE_LENGTH,
+  resolveLocalCoverPath,
+  sniffSeriesCoverContentType,
+} from './local-series-cover.util';
+import { isValidSeriesCoverObjectKey } from './series-cover-key.util';
+import {
+  resolveSeriesCoverUrl,
+  SeriesCoverUrlContext,
+} from './series-cover-url.util';
+import { LocalSeriesCoverFile } from './series-public.types';
 import {
   SeriesDetailPublicDto,
   SeriesListResponseDto,
@@ -95,6 +108,14 @@ export class PublicSeriesService {
    * fact serving to everyone.
    */
   private readonly contentAccessMode: ContentAccessMode;
+  /**
+   * Work unit "LOCAL SERIES COVER ARTWORK": the active storage driver and the
+   * origin this API is reachable on, read ONCE at construction (this service
+   * is a singleton) and handed to `resolveSeriesCoverUrl` for every row —
+   * never re-read per series, and never read from `process.env` below.
+   */
+  private readonly coverUrlContext: SeriesCoverUrlContext;
+  private readonly storageConfig: StorageConfig;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -104,6 +125,11 @@ export class PublicSeriesService {
   ) {
     this.appConfig = this.configService.get('app', { infer: true })!;
     this.contentAccessMode = readContentAccessMode(this.configService);
+    this.storageConfig = this.configService.get('storage', { infer: true })!;
+    this.coverUrlContext = {
+      driver: this.storageConfig.driver,
+      publicBaseUrl: this.appConfig.publicBaseUrl,
+    };
   }
 
   /**
@@ -196,6 +222,69 @@ export class PublicSeriesService {
   }
 
   /**
+   * Work unit "LOCAL SERIES COVER ARTWORK": everything
+   * `SeriesPublicController#getCover` needs to stream one series's artwork
+   * off the local object store, or `null` when there is nothing truthful to
+   * serve. `null` — never a placeholder, a redirect, or a generated image —
+   * is what lets the app fall back to the branded initial tile it already
+   * shows for a series with no cover.
+   *
+   * Every one of the five ways this returns `null` is deliberate:
+   *
+   *  1. `driver !== 'local'`. This route is the LOCAL driver's cover surface
+   *     and nothing else. Under `r2` the authoritative `coverUrl` is a
+   *     presigned bucket URL and no client is pointed here, so serving local
+   *     files would at best shadow the real answer and at worst expose bytes
+   *     a production deployment never meant this process to hand out. The
+   *     check is explicit rather than implied by an empty directory.
+   *  2. No such series, or an archived one. `list`/`findById` already hide
+   *     archived series; their artwork must not remain independently
+   *     fetchable afterwards.
+   *  3. No `coverImageKey`. The row is authoritatively without artwork.
+   *  4. A `coverImageKey` this series' own upload flow could not have minted
+   *     (`isValidSeriesCoverObjectKey`). Only the exact
+   *     `admin-series/<id>/cover/<uuid>` shape is servable, which is what
+   *     makes a traversal structurally impossible here rather than merely
+   *     guarded against — and it also means a key belonging to a DIFFERENT
+   *     series can never be served under this series' id.
+   *  5. The file is missing, unreadable, or its leading bytes are not one of
+   *     `ALLOWED_SERIES_COVER_CONTENT_TYPES`. A cover that is not provably a
+   *     JPEG/PNG/WebP is not served at all.
+   *
+   * The caller cannot distinguish these, by design: all five answer 404.
+   */
+  async resolveLocalCoverFile(
+    id: string,
+  ): Promise<LocalSeriesCoverFile | null> {
+    if (this.storageConfig.driver !== 'local') {
+      return null;
+    }
+
+    const series = await this.prisma.series.findFirst({
+      where: { id, archivedAt: null },
+      select: { id: true, coverImageKey: true },
+    });
+
+    if (
+      !series?.coverImageKey ||
+      !isValidSeriesCoverObjectKey(series.id, series.coverImageKey)
+    ) {
+      return null;
+    }
+
+    const absolutePath = resolveLocalCoverPath(
+      this.storageConfig.localRoot,
+      series.coverImageKey,
+    );
+
+    if (absolutePath === null) {
+      return null;
+    }
+
+    return readLocalCoverFile(absolutePath);
+  }
+
+  /**
    * Batched (one query, not N) lookup of every qualifying episode across
    * `seriesIds`, grouped by `seriesId` — avoids an N+1 query in `list`.
    */
@@ -232,7 +321,8 @@ export class PublicSeriesService {
       title: series.title,
       coverUrl: await resolveSeriesCoverUrl(
         this.storageService,
-        series.coverImageKey,
+        this.coverUrlContext,
+        series,
       ),
       ...computeSeriesAggregate(
         episodes,
@@ -240,6 +330,52 @@ export class PublicSeriesService {
         this.contentAccessMode,
       ),
     };
+  }
+}
+
+/**
+ * Opens `absolutePath`, confirms it is a regular file whose leading bytes are
+ * a permitted cover format, and returns the handle-free facts the controller
+ * needs to stream it.
+ *
+ * The size comes from `fstat` on the SAME open descriptor the magic bytes were
+ * read from, not from a separate `stat` on the path — so the `Content-Length`
+ * this route advertises always describes the exact file whose type was
+ * verified, even if the path is replaced between the two operations.
+ *
+ * Any filesystem error resolves to `null` rather than propagating: a missing
+ * or unreadable cover is a 404, not a 500, and the caller must not be able to
+ * tell those apart. The descriptor is closed on every path.
+ */
+async function readLocalCoverFile(
+  absolutePath: string,
+): Promise<LocalSeriesCoverFile | null> {
+  let handle: FileHandle | undefined;
+
+  try {
+    handle = await open(absolutePath, 'r');
+
+    const stats = await handle.stat();
+
+    if (!stats.isFile()) {
+      return null;
+    }
+
+    const header = Buffer.alloc(COVER_MAGIC_BYTE_LENGTH);
+    const { bytesRead } = await handle.read(header, 0, header.length, 0);
+    const contentType = sniffSeriesCoverContentType(
+      header.subarray(0, bytesRead),
+    );
+
+    if (contentType === null) {
+      return null;
+    }
+
+    return { absolutePath, contentType, fileSize: stats.size };
+  } catch {
+    return null;
+  } finally {
+    await handle?.close();
   }
 }
 

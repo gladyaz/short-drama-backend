@@ -1,8 +1,10 @@
 import { HttpStatus, Injectable } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { Prisma } from '@prisma/client';
 import { AppErrorCode } from '../common/errors/app-error-code';
 import { AppException } from '../common/errors/app.exception';
 import { MediaLifecycleState } from '../media/media-lifecycle.types';
+import { RootConfig } from '../config/configuration';
 import { PrismaService } from '../prisma/prisma.service';
 import { StorageService } from '../storage/storage.service';
 import { CompleteSeriesCoverUploadDto } from './dto/complete-series-cover-upload.dto';
@@ -19,7 +21,10 @@ import {
   AllowedSeriesCoverContentType,
   MAX_SERIES_COVER_UPLOAD_BYTES,
 } from './series-cover.constants';
-import { resolveSeriesCoverUrl } from './series-cover-url.util';
+import {
+  resolveSeriesCoverUrl,
+  SeriesCoverUrlContext,
+} from './series-cover-url.util';
 import {
   CreateSeriesCoverUploadResponseDto,
   SeriesDto,
@@ -93,10 +98,32 @@ const UNIQUE_CONSTRAINT_VIOLATION = 'P2002';
  */
 @Injectable()
 export class SeriesService {
+  /**
+   * Work unit "LOCAL SERIES COVER ARTWORK": the admin read surface resolves
+   * `coverUrl` through the SAME driver-aware `resolveSeriesCoverUrl` the
+   * public catalog uses (acceptance criterion 5 of the cover-upload contract
+   * — one mechanism, not two), so it needs the same deployment context. Read
+   * once at construction; this service is a singleton.
+   *
+   * Without this, the admin dashboard under `STORAGE_DRIVER=local` would
+   * receive presigned URLs signed against empty R2 credentials: not an error,
+   * just artwork that never loads.
+   */
+  private readonly coverUrlContext: SeriesCoverUrlContext;
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly storageService: StorageService,
-  ) {}
+    configService: ConfigService<RootConfig>,
+  ) {
+    const appConfig = configService.get('app', { infer: true })!;
+    const storageConfig = configService.get('storage', { infer: true })!;
+
+    this.coverUrlContext = {
+      driver: storageConfig.driver,
+      publicBaseUrl: appConfig.publicBaseUrl,
+    };
+  }
 
   /**
    * Work unit 11E-4 (extended in 11F-1): lists `Series` rows, ordered
@@ -572,7 +599,8 @@ export class SeriesService {
       ...toSeriesDto(record),
       coverUrl: await resolveSeriesCoverUrl(
         this.storageService,
-        record.coverImageKey,
+        this.coverUrlContext,
+        record,
       ),
     };
   }

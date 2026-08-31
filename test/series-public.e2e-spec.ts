@@ -11,8 +11,8 @@ import { fixtureMarker } from './../src/common/testing/fixture-namespace.helpers
 import {
   createPresignedGetUrlMock,
   resetPresignedGetUrlMock,
-  syntheticSignedGetUrlFor,
 } from './../src/common/testing/storage-mock.helpers';
+import { expectedSeriesCoverUrl } from './../src/common/testing/series-cover-expectation.helpers';
 import type {
   SeriesDetailPublicDto,
   SeriesListResponseDto,
@@ -247,7 +247,7 @@ describe('Public series catalog (e2e)', () => {
      * derives the URL from the key, so this assertion is exact and
      * order-independent.
      */
-    it('resolves coverUrl via a presigned GET when an admin has set coverImageKey', async () => {
+    it('resolves a usable coverUrl when an admin has set coverImageKey', async () => {
       const seriesId = `${idPrefix}-list-cover`;
       const coverKey = `admin-series/${seriesId}/cover/e2e-cover-uuid`;
       await createSeriesFixture(seriesId, { coverImageKey: coverKey });
@@ -259,7 +259,13 @@ describe('Public series catalog (e2e)', () => {
 
       const body = response.body as SeriesListResponseDto;
       const item = body.items.find((i) => i.id === seriesId);
-      expect(item?.coverUrl).toBe(syntheticSignedGetUrlFor(coverKey));
+      // Exact, and correct under either storage driver — see
+      // `expectedSeriesCoverUrl`. Under `local` (this repo's own `.env`) that
+      // is this API's `/series/:id/cover` route; under `r2` it is the mocked
+      // presigned GET this suite has always asserted.
+      expect(item?.coverUrl).toBe(
+        expectedSeriesCoverUrl(app, seriesId, coverKey),
+      );
     });
 
     /**

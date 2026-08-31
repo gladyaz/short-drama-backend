@@ -15,6 +15,7 @@ function buildConfigService(
       accessKeyId: 'mock-secret-should-never-be-logged',
       secretAccessKey: 'mock-secret-should-never-be-logged',
       publicBaseUrl: undefined,
+      localRoot: '/tmp/local-objects.test',
     },
     transcode: {
       enabled: false,

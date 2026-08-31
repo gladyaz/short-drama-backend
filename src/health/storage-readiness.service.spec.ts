@@ -67,6 +67,7 @@ function buildPrivateR2Config(
     accessKeyId: FIXTURE_ACCESS_KEY_ID,
     secretAccessKey: FIXTURE_SECRET_ACCESS_KEY,
     publicBaseUrl: undefined,
+    localRoot: '/tmp/local-objects.test',
     ...overrides,
   });
 }
@@ -93,6 +94,7 @@ function buildStorageConfig(
     accessKeyId: '',
     secretAccessKey: '',
     publicBaseUrl: '',
+    localRoot: '/tmp/local-objects.test',
     ...overrides,
   };
 }

@@ -10,6 +10,10 @@ import {
 } from '../common/testing/storage-mock.helpers';
 import { DEFAULT_GET_URL_EXPIRY_SECONDS } from '../storage/storage.constants';
 import { StorageService } from '../storage/storage.service';
+import {
+  buildTestStorageConfig,
+  createConfigServiceMock,
+} from '../common/testing/config-mock.helpers';
 import { PrismaService } from '../prisma/prisma.service';
 import { PublicSeriesService } from './series-public.service';
 
@@ -129,7 +133,20 @@ describe('PublicSeriesService', () => {
         PublicSeriesService,
         PrismaService,
         EntitlementsService,
-        { provide: ConfigService, useValue: { get: () => TEST_APP_CONFIG } },
+        {
+          // Work unit "LOCAL SERIES COVER ARTWORK": key-aware, because this
+          // service now reads BOTH `app` and `storage`. The previous
+          // one-answer-for-every-key stub returned the app config for
+          // `get('storage')`, which would have made `storage.driver` read
+          // `undefined`. `r2` keeps every existing assertion in this file —
+          // all of which expect a presigned `coverUrl` — on the branch it was
+          // written for; the local branch has its own tests below.
+          provide: ConfigService,
+          useValue: createConfigServiceMock({
+            app: TEST_APP_CONFIG,
+            storage: buildTestStorageConfig({ driver: 'r2' }),
+          }),
+        },
         { provide: StorageService, useValue: storageService },
       ],
     }).compile();

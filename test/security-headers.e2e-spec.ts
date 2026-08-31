@@ -113,6 +113,50 @@ describe('Security headers + JSON body limit (e2e)', () => {
     });
   });
 
+  /**
+   * LOCAL/WEB PLAYBACK: `GET /videos/:id/stream` is the ONLY route that
+   * overrides a header `helmet()` sets, and it overrides exactly one —
+   * `Cross-Origin-Resource-Policy`. Both halves are pinned here because
+   * this is the spec that mirrors `src/main.ts`'s real `helmet()` setup;
+   * a regression in either direction is a real defect:
+   *
+   *  - dropping the media override silently breaks every cross-origin web
+   *    player (the request still returns 206, the `<video>` element just
+   *    renders nothing, with no CORS error to explain it), and
+   *  - widening it to the whole app would relax a security header globally,
+   *    which the media-route reasoning does NOT justify.
+   *
+   * See `VideosController#streamVideo` for why relaxing it on this one
+   * route is safe in production: this API carries no cookie/ambient
+   * authority, so a no-cors cross-origin embed is just an anonymous caller.
+   */
+  describe('Cross-Origin-Resource-Policy is relaxed on the media route ONLY', () => {
+    // A FREE episode from the real seeded catalog — an anonymous request is
+    // the exact case a cross-origin `<video>` embed produces.
+    const freeEpisodeId = 'video-104-01';
+
+    it('serves the media stream with Cross-Origin-Resource-Policy: cross-origin', async () => {
+      const response = await request(app.getHttpServer())
+        .get(`/videos/${freeEpisodeId}/stream`)
+        .set('Range', 'bytes=0-1023')
+        .expect(HttpStatus.PARTIAL_CONTENT);
+
+      expect(response.headers['cross-origin-resource-policy']).toBe(
+        'cross-origin',
+      );
+    });
+
+    it('leaves every OTHER route on helmet default same-origin', async () => {
+      const response = await request(app.getHttpServer())
+        .get('/health')
+        .expect(HttpStatus.OK);
+
+      expect(response.headers['cross-origin-resource-policy']).toBe(
+        'same-origin',
+      );
+    });
+  });
+
   describe('256kb JSON body limit', () => {
     it('rejects a JSON body larger than 256kb with 413', async () => {
       // Deliberately not a valid AnalyticsEventInputDto shape — the

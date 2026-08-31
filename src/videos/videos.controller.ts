@@ -126,6 +126,34 @@ export class VideosController {
 
     res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('Content-Type', 'video/mp4');
+    // The ONE header this route deliberately overrides from `helmet()`'s
+    // defaults (src/main.ts), scoped to this handler alone — the global
+    // `helmet()` call and every other route keep
+    // `Cross-Origin-Resource-Policy: same-origin` untouched.
+    //
+    // WHY IT IS REQUIRED. A `<video src=...>` on a page served from another
+    // origin (Expo Web on `http://localhost:8081`, or a future web player on
+    // a different host from the API) issues a NO-CORS request. `same-origin`
+    // CORP makes the browser discard the response before the media element
+    // ever sees it — the request succeeds with 206 on the wire and the player
+    // still shows nothing, with no CORS error to explain it. `Access-Control-
+    // Allow-Origin` does not help: CORP is a separate, stricter check.
+    //
+    // WHY IT IS SAFE, IN PRODUCTION TOO. CORP defends against a cross-origin
+    // page pulling a resource that is privileged by AMBIENT AUTHORITY — a
+    // cookie the browser attaches automatically. This API has none: the only
+    // credential it ever reads is the `Authorization` header
+    // (`jwt-auth.guard.ts`'s `request.headers.authorization`), and there is
+    // no `res.cookie`, no cookie parser and no `credentials: true` anywhere
+    // in `src/`. A no-cors media request cannot set an `Authorization`
+    // header, so a cross-origin embed reaches this handler as an ANONYMOUS
+    // caller and `enforceEntitlementGate` (already applied above, before any
+    // byte is read) answers it exactly as it answers any anonymous request:
+    // FREE content plays — which is the deliberate V1 product contract that
+    // a signed-out guest can watch it — and premium content still 403s.
+    // Relaxing CORP here therefore exposes nothing that a plain `curl` with
+    // no credentials could not already fetch.
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
 
     const start = range?.start ?? 0;
     const end = range?.end ?? fileSize - 1;

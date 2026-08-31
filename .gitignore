@@ -42,6 +42,13 @@ lerna-debug.log*
 .env.production.local
 .env.local
 
+# Local .env snapshots taken while debugging. These hold real JWT secrets and
+# must never be committed - the pattern is deliberately wider than the files
+# that exist today.
+.env.bak*
+.env.*.bak
+.env.backup*
+
 # temp directory
 .temp
 .tmp

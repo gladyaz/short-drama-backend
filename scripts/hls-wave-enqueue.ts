@@ -32,9 +32,15 @@ import { WorkerModule } from '../src/worker/worker.module';
  * never the whole wave, and never silently:
  *
  *  1. the row exists and is `published`;
- *  2. its recorded dimensions describe PORTRAIT media (short side is the
- *     width) — a landscape row is refused outright, because a wave scoped to
- *     portrait content must not quietly widen;
+ *  2. its recorded ORIENTATION is one this invocation accepts. Portrait
+ *     (short side is the width) is always accepted. Landscape is refused
+ *     UNLESS `--allow-landscape` was passed — a wave scoped to portrait
+ *     content must not quietly widen, but an operator who deliberately
+ *     names landscape ids is not fighting the tool to transcode them.
+ *     `computeRenditionLadder` has always laddered landscape correctly
+ *     (it drives on the SHORT side whichever axis that is); this gate was
+ *     the only thing refusing it, and refusing it unconditionally left
+ *     every landscape episode in the catalog permanently un-transcodable;
  *  3. the source object exists in storage at the canonical
  *     `admin-media/<id>/source` key and is non-empty;
  *  4. the row is not already mid-flight (`queued`/`running`), so a wave can
@@ -55,6 +61,7 @@ import { WorkerModule } from '../src/worker/worker.module';
  *
  *   npm run hls:wave-enqueue -- --ids=video-101-01,video-101-02 --dry-run
  *   npm run hls:wave-enqueue -- --ids=video-101-01,video-101-02
+ *   npm run hls:wave-enqueue -- --ids=video-105-01 --allow-landscape
  */
 
 interface EpisodeOutcome {
@@ -142,6 +149,12 @@ function parseIds(argv: readonly string[]): string[] {
 async function main(): Promise<void> {
   const ids = parseIds(process.argv.slice(2));
   const dryRun = process.argv.includes('--dry-run');
+  // Orientation opt-in. Absent (the default), this script behaves EXACTLY as
+  // it always has: portrait only. Present, a landscape row passes the
+  // orientation gate and nothing else about the run changes — every other
+  // preflight check, the ladder, the enqueue and the exit code are
+  // untouched.
+  const allowLandscape = process.argv.includes('--allow-landscape');
 
   if (process.env.TRANSCODE_ENABLED !== 'true') {
     throw new Error(
@@ -202,18 +215,23 @@ async function main(): Promise<void> {
         continue;
       }
 
-      // Portrait gate. `width`/`height` are the catalog's own recorded
-      // dimensions; a row with neither recorded cannot be proven portrait
-      // from the database alone, so it is refused rather than assumed.
+      // Orientation gate. `width`/`height` are the catalog's own recorded
+      // dimensions; a row with neither recorded cannot be proven to have ANY
+      // orientation from the database alone, so it is refused rather than
+      // assumed — that check is unconditional and `--allow-landscape` does
+      // not weaken it.
       if (row.width === null || row.height === null) {
-        skip('DIMENSIONS_UNKNOWN — cannot prove portrait');
+        skip('DIMENSIONS_UNKNOWN — cannot prove orientation');
         continue;
       }
-      if (row.width >= row.height) {
-        skip(`NOT_PORTRAIT (${row.width}x${row.height})`, {
-          width: row.width,
-          height: row.height,
-        });
+      if (row.width >= row.height && !allowLandscape) {
+        skip(
+          `NOT_PORTRAIT (${row.width}x${row.height}) — pass --allow-landscape to transcode it anyway`,
+          {
+            width: row.width,
+            height: row.height,
+          },
+        );
         continue;
       }
 
@@ -287,6 +305,11 @@ async function main(): Promise<void> {
           enqueued,
           wouldEnqueue,
           dryRun,
+          // Reported so a wave's own JSON record states, on its face,
+          // whether the portrait-only default was in force — a landscape
+          // generation can never look like it slipped past an unmodified
+          // gate.
+          allowLandscape,
           writes: dryRun
             ? {
                 database: 0,

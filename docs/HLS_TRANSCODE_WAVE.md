@@ -84,6 +84,32 @@ npm run build && TRANSCODE_ENABLED=true node dist/worker/main
 mutating form. There is no interactive confirmation — if the flag is absent,
 the command enqueues.
 
+### `--allow-landscape`
+
+The preflight refuses a row whose recorded dimensions are landscape, so a wave
+scoped to portrait content cannot quietly widen. That guard was correct for the
+portrait waves it was written for and wrong as an absolute: it made **every**
+landscape episode in the catalog permanently un-transcodable, including every
+remaining FREE one.
+
+Pass `--allow-landscape` to accept landscape rows for that invocation:
+
+```bash
+TRANSCODE_ENABLED=true npm run hls:wave-enqueue -- --ids=video-105-01 --allow-landscape
+```
+
+- The default is **unchanged**: without the flag, portrait-only, exactly as before.
+- It weakens nothing else. `DIMENSIONS_UNKNOWN` is still refused unconditionally —
+  a row with no recorded width/height cannot be proven to have any orientation,
+  and this flag does not pretend otherwise.
+- The run's own JSON report carries `allowLandscape`, so a landscape generation
+  can never look like it slipped past an unmodified gate.
+
+The ladder itself never needed this flag. `computeRenditionLadder` has always
+driven on the **short** side whichever axis that is, so a 1280×720 source
+correctly produces 640×360 / 960×540 / 1280×720. Only the wave gate was
+refusing them.
+
 `TRANSCODE_ENABLED` must be exactly `"true"`. Both scripts refuse to start
 otherwise rather than silently enqueueing into a no-op queue.
 

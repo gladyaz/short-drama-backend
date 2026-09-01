@@ -141,3 +141,55 @@ Each rendition also decodes independently via `ffprobe` against its own
 gateway-served variant playlist (360p/540p/720p, all 123.33 s, h264 + aac), so
 "adaptive" here means three separately-playable renditions plus an observed,
 bandwidth-driven switch — not merely the existence of a master playlist.
+
+---
+
+## 6. Android handset QA (owner-performed)
+
+Native Android needs **none** of the CORS or hls.js work above — Media3/ExoPlayer
+fetches the manifest and segments as plain HTTP. What it does need is a real
+handset: an emulator exercises the same ExoPlayer code path but not hardware
+decode, real orientation, or a real network, so an emulator run cannot promote
+this verdict past PARTIAL.
+
+Prerequisites: the backend reachable from the phone (`PUBLIC_BASE_URL` must be
+the LAN IP, not `localhost`), and the phone on the same Wi-Fi.
+
+```bash
+# 1. Backend, bound to the LAN IP the phone will use
+cd /Users/gladyaz/red-panda-backend-hls
+#    .env: PUBLIC_BASE_URL=http://<mac-lan-ip>:3010
+npm run build && node dist/main
+
+# 2. Mobile, pointed at that same host
+cd /Users/gladyaz/red-panda-mobile-hls
+#    .env: EXPO_PUBLIC_API_BASE_URL=http://<mac-lan-ip>:3010
+npx expo run:android          # a dev build; Expo Go cannot host expo-video
+
+# 3. Confirm the phone can actually reach the API before testing playback
+adb shell curl -s -o /dev/null -w '%{http_code}\n' http://<mac-lan-ip>:3010/health
+```
+
+Then, signed OUT (clean guest — clear app data first):
+
+| # | Step | Expect |
+|---|---|---|
+| 1 | Open Home | Feed loads with no sign-in prompt |
+| 2 | Let the first **series-104** episode play | Video starts, **audio plays**, no black frame |
+| 3 | Check orientation | series-104 is portrait 720×1280 — fills the frame, not letterboxed |
+| 4 | Scrub the progress bar | Seek lands and resumes |
+| 5 | Tap to pause, tap to resume | Both take effect immediately |
+| 6 | Swipe to the next episode | Previous stops, next autoplays — exactly one video playing |
+| 7 | Swipe back | Previous episode resumes, still exactly one playing |
+| 8 | Open a **series-105** episode (MP4, not transcoded) | Plays — proves the MP4 path is untouched |
+| 9 | Watch for a login screen at any point | Must never appear |
+
+To confirm it is genuinely HLS rather than the MP4 fallback, watch the request
+log while step 2 runs — a `master.m3u8` followed by a `<rung>/index.m3u8` and
+`seg_*.m4s` requests is HLS; a single long-lived request to `/source` or
+`/stream` is the fallback.
+
+To exercise the fallback deliberately, set
+`EXPO_PUBLIC_HLS_PLAYBACK_ENABLED=false` and rebuild: the same episode must
+still play, now via MP4. That is the rollback switch, and it is only real
+because the backend now ships `fallback`.

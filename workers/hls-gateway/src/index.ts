@@ -28,12 +28,35 @@
  * check failed, the token, the secret, or the requested key). A failure at
  * step 6 (object not found) returns a generic 404 with no body detail —
  * this can only ever be reached AFTER authorization already succeeded.
+ *
+ * Work unit "HLS WEB PLAYBACK" adds exactly two things around — never
+ * inside — that order, both no-ops unless `CORS_ALLOWED_ORIGINS` is
+ * configured (see `cors.ts` for the full rationale and the security
+ * rules):
+ *
+ *   0. an `OPTIONS` preflight from an ALLOW-LISTED origin is answered
+ *      before anything else, deliberately without consulting the token
+ *      (a preflight carries no credentials and reads no bytes; making its
+ *      status depend on token validity would only build a validity
+ *      oracle). Every other method, and any non-allow-listed origin, falls
+ *      straight through to the unchanged pipeline below.
+ *   7. every outgoing response — 403, 404, 200 and 206 alike, cached or
+ *      freshly read — is rebuilt through `withCors`. Applying it LAST is
+ *      what keeps the §9a cache origin-free: the entry stored in step 5's
+ *      cache is the CORS-free response, so one origin's
+ *      `Access-Control-Allow-Origin` can never be replayed to another.
  */
 
 import { resolveContentType } from './content-type';
 import { buildObjectKey, normalizeRelativePath } from './path';
 import { parseRangeHeader, resolveReturnedRange } from './range';
 import { maybeGetFromCache, maybePutInCache } from './cache';
+import {
+  buildPreflightResponse,
+  parseAllowedOrigins,
+  resolveAllowedOrigin,
+  withCors,
+} from './cors';
 import { verify } from './token';
 import type { CacheLike, Env } from './env.types';
 
@@ -129,23 +152,41 @@ export async function handleRequest(
   env: Env,
   cacheOverride?: CacheLike,
 ): Promise<Response> {
+  const allowedOrigins = parseAllowedOrigins(env.CORS_ALLOWED_ORIGINS);
+  const corsConfigured = allowedOrigins.length > 0;
+  const allowedOrigin = resolveAllowedOrigin(
+    request.headers.get('origin'),
+    allowedOrigins,
+  );
+  // Every exit below goes through this, so no early return can silently
+  // omit the CORS headers a browser needs to accept even an error response.
+  const respond = (response: Response): Response =>
+    withCors(response, allowedOrigin, corsConfigured);
+
+  if (request.method === 'OPTIONS') {
+    const preflight = buildPreflightResponse(allowedOrigin);
+    if (preflight) {
+      return preflight;
+    }
+  }
+
   const url = new URL(request.url);
   const route = parseTokenRoute(url.pathname);
   if (!route) {
-    return forbiddenResponse();
+    return respond(forbiddenResponse());
   }
 
   // Step 2: verify the token BEFORE anything else touches the path or R2.
   const verified = await verify(route.rawToken, env.HLS_TOKEN_SECRET, nowSeconds());
   if (!verified) {
-    return forbiddenResponse();
+    return respond(forbiddenResponse());
   }
 
   // Step 3: normalize the client-supplied relative path independently of
   // the token — a valid token never grants license to skip path hygiene.
   const normalizedRelativePath = normalizeRelativePath(route.rawRelativePath);
   if (!normalizedRelativePath) {
-    return forbiddenResponse();
+    return respond(forbiddenResponse());
   }
 
   // Step 4: the object key is built ONLY from the token's OWN authorized
@@ -155,7 +196,7 @@ export async function handleRequest(
   // regardless of what relative path is supplied.
   const objectKey = buildObjectKey(verified.prefix, normalizedRelativePath);
   if (!objectKey) {
-    return forbiddenResponse();
+    return respond(forbiddenResponse());
   }
 
   // Step 5: cache lookup — ONLY reachable after authorization succeeded,
@@ -172,7 +213,7 @@ export async function handleRequest(
     ? undefined
     : await maybeGetFromCache(cache, env.CACHE_ENABLED, objectKey);
   if (cached) {
-    return cached;
+    return respond(cached);
   }
 
   // Step 6: read from R2, honoring Range requests.
@@ -183,7 +224,7 @@ export async function handleRequest(
   );
 
   if (!object) {
-    return notFoundResponse();
+    return respond(notFoundResponse());
   }
 
   const headers = new Headers({
@@ -194,17 +235,14 @@ export async function handleRequest(
     // in-Worker cache layer above is off.
     'Cache-Control': 'private, max-age=0',
     'Accept-Ranges': 'bytes',
-    // CORS: none by default (design note, not yet needed) — native HLS
-    // players (AVPlayer/Media3 via expo-video) issue plain HTTP(S)
-    // requests, not `fetch()` from a web page's origin, so no
-    // Access-Control-* headers are required for the app's current mobile
-    // playback path. A FUTURE web-playback consumer of this same gateway
-    // would need an explicit, narrow origin allow-list here (e.g.
-    // `Access-Control-Allow-Origin: <the one approved web origin>`) —
-    // deliberately NEVER a blanket `*`, since responses can carry
-    // range-specific data behind what is still, underneath, private
-    // media. Not implemented here: out of this slice's scope (no web
-    // playback consumer exists yet).
+    // CORS is NOT set here. The web-playback consumer this gateway now has
+    // (hls.js in the Expo Web build) is served by `withCors` at the very
+    // end of this function instead — see `cors.ts` for why applying it
+    // there, rather than baking it into these headers, is what keeps the
+    // §9a cache free of any origin-specific header. It remains absent
+    // entirely unless `CORS_ALLOWED_ORIGINS` names an exact origin, and is
+    // never a blanket `*`: these responses carry private media behind a
+    // signed token.
   });
 
   let status = 200;
@@ -249,7 +287,9 @@ export async function handleRequest(
     await maybePutInCache(cache, env.CACHE_ENABLED, objectKey, response.clone());
   }
 
-  return response;
+  // LAST, and deliberately after the cache write above: the cached copy is
+  // the CORS-free `response`, never this per-origin rebuild.
+  return respond(response);
 }
 
 export default {

@@ -476,4 +476,177 @@ describe('handleRequest (Slice 11Q gateway handler)', () => {
       expect(full.headers.has('Content-Range')).toBe(false);
     });
   });
+  describe('work unit "HLS WEB PLAYBACK" — CORS', () => {
+    const WEB_ORIGIN = 'http://localhost:8082';
+    const OTHER_ORIGIN = 'https://evil.example.com';
+
+    function corsEnv(): Env {
+      return makeEnv({ CORS_ALLOWED_ORIGINS: WEB_ORIGIN }).env;
+    }
+
+    function corsBucketEnv(): { env: Env; bucket: FakeMediaBucket } {
+      const created = makeEnv({ CORS_ALLOWED_ORIGINS: WEB_ORIGIN });
+      created.bucket.put(
+        MASTER_KEY,
+        new TextEncoder().encode('#EXTM3U\nmaster-playlist-body'),
+      );
+      return created;
+    }
+
+    it('emits NO Access-Control-* header when CORS_ALLOWED_ORIGINS is unset — the pre-existing native-only behavior is byte-identical', async () => {
+      const response = await handleRequest(
+        requestFor(vectors.valid, 'master.m3u8', { Origin: WEB_ORIGIN }),
+        env,
+      );
+
+      expect(response.status).toBe(200);
+      expect(response.headers.get('Access-Control-Allow-Origin')).toBeNull();
+      expect(response.headers.get('Vary')).toBeNull();
+    });
+
+    it('allows an allow-listed origin to read a playlist, exposing the headers a browser HLS engine needs', async () => {
+      const { env: e } = corsBucketEnv();
+      const response = await handleRequest(
+        requestFor(vectors.valid, 'master.m3u8', { Origin: WEB_ORIGIN }),
+        e,
+      );
+
+      expect(response.status).toBe(200);
+      expect(response.headers.get('Access-Control-Allow-Origin')).toBe(WEB_ORIGIN);
+      expect(response.headers.get('Access-Control-Expose-Headers')).toContain(
+        'Content-Range',
+      );
+      expect(response.headers.get('Vary')).toBe('Origin');
+      // The body and its Content-Type are unaffected by the CORS rebuild.
+      expect(response.headers.get('Content-Type')).toBe(
+        'application/vnd.apple.mpegurl',
+      );
+      expect(await response.text()).toBe('#EXTM3U\nmaster-playlist-body');
+    });
+
+    it('refuses an origin that is not on the list — 200 for the token holder, but no allow-origin for the browser to accept', async () => {
+      const { env: e } = corsBucketEnv();
+      const response = await handleRequest(
+        requestFor(vectors.valid, 'master.m3u8', { Origin: OTHER_ORIGIN }),
+        e,
+      );
+
+      expect(response.headers.get('Access-Control-Allow-Origin')).toBeNull();
+      expect(response.headers.get('Vary')).toBe('Origin');
+    });
+
+    it('carries CORS headers on a 403 too, so a browser surfaces the real refusal instead of an opaque CORS error', async () => {
+      const response = await handleRequest(
+        requestFor(vectors.tamperedSignature, 'master.m3u8', { Origin: WEB_ORIGIN }),
+        corsEnv(),
+      );
+
+      expect(response.status).toBe(403);
+      expect(response.headers.get('Access-Control-Allow-Origin')).toBe(WEB_ORIGIN);
+    });
+
+    it('carries CORS headers on a 404 too', async () => {
+      const response = await handleRequest(
+        requestFor(vectors.valid, 'missing/segment.m4s', { Origin: WEB_ORIGIN }),
+        corsEnv(),
+      );
+
+      expect(response.status).toBe(404);
+      expect(response.headers.get('Access-Control-Allow-Origin')).toBe(WEB_ORIGIN);
+    });
+
+    it('carries CORS headers on a ranged 206, including the Content-Range the engine must read', async () => {
+      const { env: e } = corsBucketEnv();
+      const response = await handleRequest(
+        requestFor(vectors.valid, 'master.m3u8', {
+          Origin: WEB_ORIGIN,
+          Range: 'bytes=0-7',
+        }),
+        e,
+      );
+
+      expect(response.status).toBe(206);
+      expect(response.headers.get('Access-Control-Allow-Origin')).toBe(WEB_ORIGIN);
+      expect(response.headers.get('Content-Range')).toBe('bytes 0-7/28');
+    });
+
+    it('answers an allow-listed OPTIONS preflight with 204 WITHOUT touching the bucket or the token', async () => {
+      const { env: e, bucket: b } = corsBucketEnv();
+      const getSpy = vi.spyOn(b, 'get');
+
+      const response = await handleRequest(
+        new Request(`https://gateway.internal/t/${vectors.expired}/master.m3u8`, {
+          method: 'OPTIONS',
+          headers: {
+            Origin: WEB_ORIGIN,
+            'Access-Control-Request-Method': 'GET',
+            'Access-Control-Request-Headers': 'range',
+          },
+        }),
+        e,
+      );
+
+      // Deliberately an EXPIRED token: a preflight must not be a
+      // token-validity oracle, so it answers identically either way.
+      expect(response.status).toBe(204);
+      expect(response.headers.get('Access-Control-Allow-Methods')).toContain('GET');
+      expect(getSpy).not.toHaveBeenCalled();
+    });
+
+    it('does NOT answer a preflight from an unlisted origin — it falls through to the normal, unchanged pipeline', async () => {
+      const response = await handleRequest(
+        new Request(`https://gateway.internal/t/${vectors.tamperedSignature}/master.m3u8`, {
+          method: 'OPTIONS',
+          headers: { Origin: OTHER_ORIGIN },
+        }),
+        corsEnv(),
+      );
+
+      expect(response.status).toBe(403);
+      expect(response.headers.get('Access-Control-Allow-Origin')).toBeNull();
+    });
+
+    it('never stores an origin-specific header in the cache: a cache HIT for a REFUSED origin does not inherit the allowed origin\'s allow-origin', async () => {
+      const store = new Map<string, Response>();
+      const cache: CacheLike = {
+        async match(request: string) {
+          const hit = store.get(request);
+          return hit ? hit.clone() : undefined;
+        },
+        async put(request: string, response: Response) {
+          store.set(request, response);
+        },
+      };
+      const created = makeEnv({
+        CACHE_ENABLED: 'true',
+        CORS_ALLOWED_ORIGINS: WEB_ORIGIN,
+      });
+      created.bucket.put(
+        MASTER_KEY,
+        new TextEncoder().encode('#EXTM3U\nmaster-playlist-body'),
+      );
+
+      // 1. An ALLOWED origin populates the cache.
+      const first = await handleRequest(
+        requestFor(vectors.valid, 'master.m3u8', { Origin: WEB_ORIGIN }),
+        created.env,
+        cache,
+      );
+      expect(first.headers.get('Access-Control-Allow-Origin')).toBe(WEB_ORIGIN);
+
+      // 2. What was STORED carries no CORS header at all.
+      const stored = [...store.values()][0]!;
+      expect(stored.headers.get('Access-Control-Allow-Origin')).toBeNull();
+
+      // 3. A REFUSED origin hitting that same cache entry gets no
+      //    allow-origin — the poisoning shape this ordering prevents.
+      const second = await handleRequest(
+        requestFor(vectors.valid, 'master.m3u8', { Origin: OTHER_ORIGIN }),
+        created.env,
+        cache,
+      );
+      expect(second.headers.get('Access-Control-Allow-Origin')).toBeNull();
+      expect(second.headers.get('Vary')).toBe('Origin');
+    });
+  });
 });

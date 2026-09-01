@@ -100,4 +100,14 @@ export interface Env {
    * yet at all — see `wrangler.toml.example`).
    */
   CACHE_ENABLED?: string;
+  /**
+   * Work unit "HLS WEB PLAYBACK": comma-separated EXACT origins allowed to
+   * read this gateway's responses from a browser, e.g.
+   * `"http://localhost:8082,https://app.example.com"`. Absent or empty
+   * (the shipped default) means no `Access-Control-*` header is ever
+   * emitted — exactly the pre-existing behavior, which is all a native
+   * AVPlayer/Media3 consumer needs. Never accepts, and can never produce,
+   * a wildcard: see `cors.ts` for the full rules.
+   */
+  CORS_ALLOWED_ORIGINS?: string;
 }

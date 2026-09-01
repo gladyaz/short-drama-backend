@@ -47,3 +47,16 @@ bucket_name = "your-private-media-bucket-name"
 # canonical-object-identity cache layer described in src/cache.ts's doc
 # comment — it is never keyed by the raw playback token/URL.
 CACHE_ENABLED = "false"
+
+# Work unit "HLS WEB PLAYBACK": comma-separated EXACT origins allowed to read
+# this gateway's responses from a BROWSER. Absent or empty (the default) means
+# no Access-Control-* header is ever emitted — all a native AVPlayer/Media3
+# consumer needs, and byte-identical to this Worker's original behavior.
+#
+# Set it ONLY for the web origins that must actually play HLS through hls.js
+# (the Expo Web build). Matching is exact-string: no wildcards, no suffix
+# matching, no trailing slash. A literal "*" is accepted as a list ENTRY but
+# grants nothing, because no browser ever sends `Origin: *` — see src/cors.ts.
+#
+# Local Expo Web development, for example:
+# CORS_ALLOWED_ORIGINS = "http://localhost:8082,http://127.0.0.1:8082"

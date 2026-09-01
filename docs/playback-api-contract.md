@@ -148,6 +148,11 @@ either send `Bearer undefined` or give up.
     },
   ],
   "expiresAt": "2026-08-22T13:00:00.000Z",
+  "fallback": {
+    "playbackUrl": "https://…",
+    "expiresAt": "2026-08-22T12:15:00.000Z",
+    "requiresAuthHeader": false,
+  },
 }
 ```
 
@@ -171,6 +176,41 @@ not merely argued: `test/videos.e2e-spec.ts` covers guest+FREE+HLS (a token is
 really minted for an anonymous caller, for that exact row's prefix),
 guest+PREMIUM+HLS (403, zero mint calls), and a malformed credential on a FREE
 HLS row (401, zero mint calls).
+
+### `fallback` — the MP4 an HLS-ready row can still be played from
+
+Added by work unit **"HLS MP4 FALLBACK"**. Optional and additive: a client
+that ignores it behaves exactly as it did before the field existed.
+
+Slice 11R made this endpoint a strict either/or — an HLS-ready row returned
+HLS and nothing else. That left a client with no second source when it could
+not play HLS, and there are three ordinary ways that happens:
+
+1. the operator kill switch (`EXPO_PUBLIC_HLS_PLAYBACK_ENABLED=false`) is off;
+2. the runtime has no HLS engine (Chrome and Firefox have no native HLS);
+3. the player fails on the manifest at runtime.
+
+In all three the content is fine — only the container is unplayable — so the
+right answer is the progressive MP4 the same row served before it was
+transcoded. That is literally what this field is: the backend builds it with
+`VideosService#buildMp4Playback`, the **same** private helper that produces a
+non-HLS row's entire response, from the same freshly-loaded row. The three
+fields therefore mean exactly what they mean on the legacy shape, including
+`requiresAuthHeader`, so a fallback can never be more permissive than the
+`/stream` route it points at.
+
+**`expiresAt` here is the fallback's own expiry, not the HLS token's.** They
+genuinely differ (a presigned R2 GET is ~15 minutes; the gateway token is an
+hour by default). Reporting one as the other would tell a client to keep using
+a URL that has already stopped working.
+
+**Absent rather than wrong.** The field is omitted entirely when the row has no
+usable non-HLS source (`resolvePlaybackSource` fails closed — e.g. a row whose
+raw source was reclaimed after transcoding) or when presigning it fails. HLS is
+the preferred source and is returned either way, so a storage problem in the
+fallback path can never take down playback that would otherwise work. Its
+**presence is a promise that there is something to play**; a client must never
+receive a placeholder or an unverified URL here.
 
 ### Errors
 

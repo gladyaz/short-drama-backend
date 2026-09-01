@@ -945,7 +945,11 @@ describe('VideosService', () => {
       const result = await service.getPlaybackUrl(testVideos[0].id);
 
       expect(Object.keys(result).sort()).toEqual(
-        ['expiresAt', 'masterUrl', 'renditions', 'type'].sort(),
+        // `fallback` is work unit "HLS MP4 FALLBACK"'s additive field. This
+        // fixture row is local-backed, so a fallback is always buildable and
+        // therefore always present; the cases where it is legitimately
+        // ABSENT are pinned in their own describe block below.
+        ['expiresAt', 'fallback', 'masterUrl', 'renditions', 'type'].sort(),
       );
       const hlsResult =
         result as import('./video.types').HlsPlaybackResponseDto;
@@ -1174,6 +1178,159 @@ describe('VideosService', () => {
       expect(JSON.stringify(result)).not.toContain(
         TEST_HLS_GATEWAY_CONFIG.tokenSecret,
       );
+    });
+  });
+
+  /**
+   * Work unit "HLS MP4 FALLBACK". Slice 11R made `/playback` a strict
+   * EITHER/OR — an HLS-ready row returned HLS and nothing else, so a client
+   * that could not play HLS had no second source and showed "video
+   * unavailable". These tests pin the additive `fallback` field that closes
+   * that hole, and the two properties that make it safe to add: HLS stays
+   * preferred, and a non-HLS row's response is completely unchanged.
+   */
+  describe('getPlaybackUrl — MP4 fallback on an HLS response', () => {
+    const HLS_PREFIX = `admin-media/${testVideos[0].id}/hls/v1-a1-11111111-1111-1111-1111-111111111111/`;
+    const HLS_MASTER_KEY = `${HLS_PREFIX}master.m3u8`;
+    const HLS_RENDITIONS = [
+      { name: '360p', width: 360, height: 640, bandwidth: 900_000 },
+      { name: '720p', width: 720, height: 1280, bandwidth: 3_300_000 },
+    ];
+
+    async function makeHlsReady(
+      data: Record<string, unknown> = {},
+    ): Promise<void> {
+      await prisma.video.update({
+        where: { id: testVideos[0].id },
+        data: {
+          processingState: 'ready',
+          hlsMasterKey: HLS_MASTER_KEY,
+          hlsRenditions: HLS_RENDITIONS,
+          ...data,
+        },
+      });
+    }
+
+    it('a LOCAL-backed HLS-ready row carries a /stream fallback alongside the HLS master', async () => {
+      await makeHlsReady();
+
+      const result = (await service.getPlaybackUrl(
+        testVideos[0].id,
+      )) as import('./video.types').HlsPlaybackResponseDto;
+
+      expect(result.type).toBe('hls');
+      expect(result.masterUrl).toContain('/master.m3u8');
+      expect(result.fallback?.playbackUrl).toBe(
+        `http://localhost:3000/videos/${testVideos[0].id}/stream`,
+      );
+      // Episode 1 of a row with no override is FREE, and `/stream` serves
+      // free content to anonymous callers — so a guest must NOT be told to
+      // attach a token it does not have.
+      expect(result.fallback?.requiresAuthHeader).toBe(false);
+      expect(typeof result.fallback?.expiresAt).toBe('string');
+    });
+
+    it("an R2-backed HLS-ready row carries a presigned-MP4 fallback, built from the row's own objectStorageKey", async () => {
+      const expiresAt = new Date(Date.now() + 900_000);
+      storageService.createPresignedGetUrl.mockResolvedValue({
+        url: 'https://r2.example.test/signed-source.mp4',
+        key: `admin-media/${testVideos[0].id}/source`,
+        expiresAt,
+      });
+      await makeHlsReady({
+        objectStorageKey: `admin-media/${testVideos[0].id}/source`,
+      });
+
+      const result = (await service.getPlaybackUrl(
+        testVideos[0].id,
+      )) as import('./video.types').HlsPlaybackResponseDto;
+
+      expect(result.fallback).toEqual({
+        playbackUrl: 'https://r2.example.test/signed-source.mp4',
+        expiresAt: expiresAt.toISOString(),
+        requiresAuthHeader: false,
+      });
+      // The key presigned is the row's OWN source key, never anything
+      // derived from a caller-supplied value.
+      expect(storageService.createPresignedGetUrl).toHaveBeenCalledWith(
+        `admin-media/${testVideos[0].id}/source`,
+        expect.anything(),
+      );
+    });
+
+    it("reports the FALLBACK's own expiry, not the HLS token's — the two genuinely differ", async () => {
+      const presignedExpiry = new Date(Date.now() + 900_000);
+      storageService.createPresignedGetUrl.mockResolvedValue({
+        url: 'https://r2.example.test/signed-source.mp4',
+        key: `admin-media/${testVideos[0].id}/source`,
+        expiresAt: presignedExpiry,
+      });
+      await makeHlsReady({
+        objectStorageKey: `admin-media/${testVideos[0].id}/source`,
+      });
+
+      const result = (await service.getPlaybackUrl(
+        testVideos[0].id,
+      )) as import('./video.types').HlsPlaybackResponseDto;
+
+      expect(result.fallback!.expiresAt).toBe(presignedExpiry.toISOString());
+      expect(result.fallback!.expiresAt).not.toBe(result.expiresAt);
+    });
+
+    it('a PREMIUM HLS-ready local row marks the fallback requiresAuthHeader — the fallback can never be more permissive than /stream itself', async () => {
+      await makeHlsReady({ accessTierOverride: 'premium' });
+
+      const result = (await service.getPlaybackUrl(
+        testVideos[0].id,
+      )) as import('./video.types').HlsPlaybackResponseDto;
+
+      expect(result.fallback!.requiresAuthHeader).toBe(true);
+    });
+
+    it('OMITS the fallback — but still serves HLS — when the row has no non-HLS source at all', async () => {
+      // A row whose raw source has been reclaimed after transcoding.
+      // `resolvePlaybackSource` fails closed for it, which is correct when it
+      // is the only source being resolved and must NOT be fatal here.
+      await makeHlsReady({ storageKey: '', objectStorageKey: null });
+
+      const result = (await service.getPlaybackUrl(
+        testVideos[0].id,
+      )) as import('./video.types').HlsPlaybackResponseDto;
+
+      expect(result.type).toBe('hls');
+      expect(result.masterUrl).toContain('/master.m3u8');
+      expect(result.renditions).toHaveLength(2);
+      expect(result.fallback).toBeUndefined();
+      expect('fallback' in result).toBe(false);
+    });
+
+    it('OMITS the fallback — but still serves HLS — when presigning the MP4 throws', async () => {
+      storageService.createPresignedGetUrl.mockRejectedValue(
+        new Error('storage provider unavailable'),
+      );
+      await makeHlsReady({
+        objectStorageKey: `admin-media/${testVideos[0].id}/source`,
+      });
+
+      const result = (await service.getPlaybackUrl(
+        testVideos[0].id,
+      )) as import('./video.types').HlsPlaybackResponseDto;
+
+      expect(result.type).toBe('hls');
+      expect(result.masterUrl).toContain('/master.m3u8');
+      expect(result.fallback).toBeUndefined();
+    });
+
+    it("leaves a NON-HLS row's response completely unchanged — no fallback field is retrofitted onto the legacy shape", async () => {
+      const result = await service.getPlaybackUrl(testVideos[0].id);
+
+      expect(Object.keys(result).sort()).toEqual([
+        'expiresAt',
+        'playbackUrl',
+        'requiresAuthHeader',
+      ]);
+      expect('fallback' in result).toBe(false);
+      expect('type' in result).toBe(false);
     });
   });
 

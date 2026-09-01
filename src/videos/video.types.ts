@@ -177,6 +177,42 @@ export interface HlsRenditionPlaybackDto {
   url: string;
 }
 
+/**
+ * Work unit "HLS MP4 FALLBACK": the progressive-MP4 source a client may use
+ * when it cannot, or will not, play the HLS `masterUrl` above.
+ *
+ * Slice 11R shipped `/playback` as a strict EITHER/OR: an HLS-ready row
+ * returned only HLS, so a client whose HLS engine failed (or whose
+ * `EXPO_PUBLIC_HLS_PLAYBACK_ENABLED` kill switch was off) had no second
+ * source and fell straight to "video unavailable" — the mobile client's own
+ * `hls-playback-flag.ts` says so explicitly, and names "the backend
+ * additionally exposing an authorized MP4 rendition" as the missing piece.
+ * This is that piece.
+ *
+ * Deliberately the SAME three fields as `VideoPlaybackResponseDto`, built by
+ * the SAME private helper on the same freshly-loaded row, so the fallback a
+ * client gets for an HLS-ready row is byte-identical to the response that
+ * row would have produced before it was transcoded. There is no second
+ * MP4-URL rule to drift.
+ *
+ * OPTIONAL, and absent rather than wrong: it is omitted entirely when the
+ * row has no usable non-HLS source (`resolvePlaybackSource` fails closed) or
+ * when presigning it fails. An HLS-ready row is still served — HLS is the
+ * preferred source and its availability never depends on this field — so a
+ * storage hiccup in the fallback path can never take down playback that
+ * would otherwise work.
+ *
+ * `expiresAt` is this fallback URL's OWN expiry, not the HLS token's. The
+ * two genuinely differ (a presigned R2 GET is minutes; the gateway token is
+ * an hour), and reporting one as the other would tell the client to keep
+ * using a URL that has already stopped working.
+ */
+export interface Mp4PlaybackFallbackDto {
+  playbackUrl: string;
+  expiresAt: string;
+  requiresAuthHeader: boolean;
+}
+
 export interface HlsPlaybackResponseDto {
   type: 'hls';
   /** Gateway-relative URL: `<HLS_GATEWAY_BASE_URL>/t/<token>/master.m3u8`. */
@@ -185,4 +221,11 @@ export interface HlsPlaybackResponseDto {
   renditions: HlsRenditionPlaybackDto[];
   /** ISO-8601 — when the single token covering both masterUrl and every rendition url expires. */
   expiresAt: string;
+  /**
+   * Work unit "HLS MP4 FALLBACK": the MP4 source to use if HLS cannot be
+   * played. Additive and OPTIONAL — a client that ignores it behaves
+   * exactly as it did before this field existed. See
+   * `Mp4PlaybackFallbackDto`.
+   */
+  fallback?: Mp4PlaybackFallbackDto;
 }

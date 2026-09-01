@@ -1,4 +1,4 @@
-import { Injectable, HttpStatus } from '@nestjs/common';
+import { Injectable, HttpStatus, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { existsSync, statSync } from 'fs';
 import {
@@ -31,10 +31,12 @@ import { parseHlsRenditions } from '../transcode/hls-rendition-summary.util';
 import {
   HlsPlaybackResponseDto,
   HlsRenditionPlaybackDto,
+  Mp4PlaybackFallbackDto,
   VideoPlaybackResponseDto,
   VideoRecord,
   VideoResponseDto,
 } from './video.types';
+import { redactSensitiveText } from '../common/logging/redact';
 import { resolveSafeStoragePath } from './storage-path.util';
 import { resolvePlaybackSource } from './playback-source.util';
 import { toVideoRecord, toVideoResponseDto } from './video-response.util';
@@ -47,6 +49,7 @@ export interface StreamableVideo {
 
 @Injectable()
 export class VideosService {
+  private readonly logger = new Logger(VideosService.name);
   private readonly appConfig: AppConfig;
   private readonly hlsGatewayConfig: HlsGatewayConfig;
   /**
@@ -209,9 +212,39 @@ export class VideosService {
 
     const hlsResponse = this.tryBuildHlsPlaybackResponse(record);
     if (hlsResponse) {
-      return hlsResponse;
+      // Work unit "HLS MP4 FALLBACK": HLS stays the PREFERRED source and is
+      // returned whether or not a fallback could be built — `tryBuildMp4Fallback`
+      // resolves to `undefined` rather than throwing, so nothing about the
+      // HLS branch's success depends on the MP4 branch working.
+      const fallback = await this.tryBuildMp4Fallback(record);
+      return fallback ? { ...hlsResponse, fallback } : hlsResponse;
     }
 
+    return this.buildMp4Playback(record);
+  }
+
+  /**
+   * Work unit "HLS MP4 FALLBACK": THE one place a progressive-MP4 playback
+   * response is built, for BOTH the legacy (non-HLS) branch of
+   * `getPlaybackUrl` and the `fallback` field of an HLS response.
+   *
+   * Extracted verbatim from `getPlaybackUrl`'s former inline body — every
+   * rule below (R2-wins precedence via `resolvePlaybackSource`, the
+   * content-derived `requiresAuthHeader`, the synthetic-vs-real `expiresAt`)
+   * is unchanged, and a non-HLS row's response is byte-identical to what it
+   * was before the extraction. That identity is the point: the MP4 URL an
+   * HLS-ready row falls back to is produced by the same code, from the same
+   * row, as the MP4 URL it served before it was transcoded, so the two can
+   * never disagree.
+   */
+  private async buildMp4Playback(record: {
+    id: string;
+    storageKey: string;
+    objectStorageKey: string | null;
+    accessTierOverride: string | null;
+    episodeNumber: number;
+  }): Promise<VideoPlaybackResponseDto> {
+    const id = record.id;
     const source = resolvePlaybackSource(record);
 
     if (source.kind === 'local') {
@@ -268,6 +301,59 @@ export class VideosService {
       expiresAt: signed.expiresAt.toISOString(),
       requiresAuthHeader: false,
     };
+  }
+
+  /**
+   * Work unit "HLS MP4 FALLBACK": the same MP4 response as
+   * `buildMp4Playback`, but as a BEST-EFFORT value for an HLS-ready row —
+   * `undefined` instead of a throw whenever it cannot be produced.
+   *
+   * Two distinct things can go wrong, and both are non-fatal HERE
+   * specifically because the caller already holds a working HLS response:
+   *
+   *  - the row genuinely has no non-HLS source. `resolvePlaybackSource`
+   *    fails CLOSED by design (`MEDIA_PLAYBACK_SOURCE_UNAVAILABLE`), which
+   *    is the right answer when it is the ONLY source being resolved, and
+   *    the wrong one here: an HLS-ready row with no surviving MP4 is a row
+   *    that plays perfectly over HLS. Reachable in practice — a future
+   *    retention/cleanup pass that drops raw sources once a row is
+   *    transcoded produces exactly this state.
+   *  - presigning fails (a storage outage, an expired credential). Again
+   *    the HLS branch is unaffected: the gateway reads R2 through its own
+   *    Worker binding, not through these S3 credentials, so it keeps
+   *    serving while this call is failing.
+   *
+   * In both cases the field is simply ABSENT. It is never emitted with a
+   * placeholder, an empty string, or a URL this method could not verify it
+   * had actually built — a client must be able to treat the field's
+   * presence as a promise that there is something there to play.
+   *
+   * A genuinely unexpected error is still swallowed here, which is a
+   * deliberate trade: this is an optional enrichment of an
+   * already-successful response, and letting it fail the request would make
+   * playback STRICTLY less reliable than before the field existed. It is
+   * logged at `warn` so the condition is visible rather than silent.
+   */
+  private async tryBuildMp4Fallback(record: {
+    id: string;
+    storageKey: string;
+    objectStorageKey: string | null;
+    accessTierOverride: string | null;
+    episodeNumber: number;
+  }): Promise<Mp4PlaybackFallbackDto | undefined> {
+    try {
+      const { playbackUrl, expiresAt, requiresAuthHeader } =
+        await this.buildMp4Playback(record);
+      return { playbackUrl, expiresAt, requiresAuthHeader };
+    } catch (error) {
+      this.logger.warn(
+        redactSensitiveText(
+          `No MP4 fallback could be built for HLS-ready media "${record.id}"; ` +
+            `serving HLS without one: ${error instanceof Error ? error.message : String(error)}`,
+        ),
+      );
+      return undefined;
+    }
   }
 
   /**

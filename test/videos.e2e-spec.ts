@@ -1307,7 +1307,68 @@ describe('Videos (e2e)', () => {
       expect(body.masterUrl).toMatch(
         /^https:\/\/hls-gateway\.e2e-test\.internal\/t\/[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\/master\.m3u8$/,
       );
-      expect(mockStorageService.createPresignedGetUrl).not.toHaveBeenCalled();
+      // Work unit "HLS MP4 FALLBACK" (c728ba4): an HLS-ready row now ALSO
+      // presigns its progressive source so the response can carry an MP4
+      // fallback. That call is ADDITIVE — every HLS assertion above still
+      // holds — so this asserts the call's exact shape rather than merely
+      // that "a call happened": once only, for THIS row's own object key,
+      // at the standard 900s expiry. The mock resolves `undefined` here, so
+      // no `fallback` key appears, and the 4-key shape asserted above is the
+      // "fallback unavailable" case: HLS is served regardless.
+      expect(mockStorageService.createPresignedGetUrl).toHaveBeenCalledTimes(1);
+      expect(mockStorageService.createPresignedGetUrl).toHaveBeenCalledWith(
+        'r2/hls-fixture-fallback/source.mp4',
+        { expiresInSeconds: 900 },
+      );
+    });
+
+    it('an HLS-ready row whose source CAN be presigned carries the MP4 fallback alongside — HLS still preferred', async () => {
+      const { id } = await createHlsFixture({});
+      mockStorageService.createPresignedGetUrl.mockResolvedValueOnce({
+        url: 'https://signed.example.test/hls-fixture-fallback',
+        key: 'r2/hls-fixture-fallback/source.mp4',
+        expiresAt: new Date(Date.now() + 15 * 60 * 1000),
+      });
+
+      const response = await request(app.getHttpServer())
+        .get(`/videos/${id}/playback`)
+        .set('Authorization', `Bearer ${accessToken}`)
+        .expect(HttpStatus.OK);
+
+      const body = response.body as HlsPlaybackResponseDto & {
+        fallback?: {
+          playbackUrl: string;
+          expiresAt: string;
+          requiresAuthHeader: boolean;
+        };
+      };
+
+      // HLS remains the PREFERRED source: the fallback is an ADDITION to the
+      // HLS response, never a replacement for it.
+      expect(body.type).toBe('hls');
+      expect(body.masterUrl).toMatch(
+        /^https:\/\/hls-gateway\.e2e-test\.internal\/t\/[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\/master\.m3u8$/,
+      );
+      expect(body.renditions.length).toBeGreaterThan(0);
+
+      // ...and the fallback really is built from the presigned progressive
+      // source rather than fabricated.
+      expect(body.fallback).toBeDefined();
+      expect(body.fallback?.playbackUrl).toBe(
+        'https://signed.example.test/hls-fixture-fallback',
+      );
+      expect(typeof body.fallback?.requiresAuthHeader).toBe('boolean');
+      expect(Object.keys(body).sort()).toEqual(
+        ['expiresAt', 'fallback', 'masterUrl', 'renditions', 'type'].sort(),
+      );
+
+      // The gateway token is still the HLS authorization — a fallback must
+      // not smuggle an auth-header requirement onto the HLS response itself.
+      expect(body).not.toHaveProperty('requiresAuthHeader');
+      expect(mockStorageService.createPresignedGetUrl).toHaveBeenCalledWith(
+        'r2/hls-fixture-fallback/source.mp4',
+        { expiresInSeconds: 900 },
+      );
     });
 
     it('[TEST 13] returns ONLY the actually-produced renditions (360p/540p fixture never yields a 720p or 1080p entry)', async () => {
@@ -1417,7 +1478,7 @@ describe('Videos (e2e)', () => {
       );
     });
 
-    it('[TEST 18] mints without ever making a network call — masterUrl/rendition urls only ever combine the configured HLS_GATEWAY_BASE_URL with locally-computed strings (no fetch/StorageService call for the HLS branch)', async () => {
+    it('[TEST 18] mints the HLS urls locally — every master/rendition url only ever combines the configured HLS_GATEWAY_BASE_URL with locally-computed strings, and the only StorageService call is the additive MP4 fallback', async () => {
       const { id } = await createHlsFixture({});
 
       const response = await request(app.getHttpServer())
@@ -1429,7 +1490,31 @@ describe('Videos (e2e)', () => {
       expect(body.masterUrl.startsWith(process.env.HLS_GATEWAY_BASE_URL!)).toBe(
         true,
       );
-      expect(mockStorageService.createPresignedGetUrl).not.toHaveBeenCalled();
+      // Stronger than the master alone: EVERY rendition url must also be
+      // locally derived from the configured base, so no rendition can be the
+      // one that quietly starts coming from a signed storage URL.
+      expect(body.renditions.length).toBeGreaterThan(0);
+      for (const rendition of body.renditions) {
+        expect(
+          rendition.url.startsWith(process.env.HLS_GATEWAY_BASE_URL!),
+        ).toBe(true);
+      }
+
+      // Work unit "HLS MP4 FALLBACK" (c728ba4) made ONE storage call
+      // legitimate: presigning the progressive source for the additive
+      // `fallback` field. The point this test has always defended still
+      // holds and is now asserted precisely — that call is for the MP4
+      // source key, NOT for anything the HLS urls above are built from.
+      expect(mockStorageService.createPresignedGetUrl).toHaveBeenCalledTimes(1);
+      expect(mockStorageService.createPresignedGetUrl).toHaveBeenCalledWith(
+        'r2/hls-fixture-fallback/source.mp4',
+        { expiresInSeconds: 900 },
+      );
+      const signedUrls =
+        mockStorageService.createPresignedGetUrl.mock.calls.map(
+          ([key]: [string]) => key,
+        );
+      expect(signedUrls).not.toContain(body.masterUrl);
     });
 
     /**
@@ -1475,7 +1560,18 @@ describe('Videos (e2e)', () => {
         // token is the authorization, so there is nothing for a guest to
         // attach and nothing that could tell it to attach one.
         expect(body).not.toHaveProperty('requiresAuthHeader');
-        expect(mockStorageService.createPresignedGetUrl).not.toHaveBeenCalled();
+
+        // Work unit "HLS MP4 FALLBACK" (c728ba4): the additive MP4 presign
+        // happens for a guest too. It must stay exactly that — additive —
+        // so this pins the call's shape and re-asserts that the guest's HLS
+        // response gained no auth-header requirement from it.
+        expect(mockStorageService.createPresignedGetUrl).toHaveBeenCalledTimes(
+          1,
+        );
+        expect(mockStorageService.createPresignedGetUrl).toHaveBeenCalledWith(
+          'r2/hls-fixture-fallback/source.mp4',
+          { expiresInSeconds: 900 },
+        );
       } finally {
         mintSpy.mockRestore();
       }
